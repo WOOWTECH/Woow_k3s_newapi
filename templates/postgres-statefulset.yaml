@@ -1,8 +1,9 @@
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
-  namespace: new-api
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: new-api
     component: postgres
@@ -21,7 +22,8 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.postgres.image.pullPolicy }}
           ports:
             - containerPort: 5432
               name: postgres
@@ -41,12 +43,7 @@ spec:
             - name: postgres-data
               mountPath: /var/lib/postgresql/data
           resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
           livenessProbe:
             exec:
               command:
@@ -92,7 +89,7 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
-        storageClassName: local-path
+        storageClassName: {{ .Values.postgres.persistence.storageClassName }}
         resources:
           requests:
-            storage: 10Gi
+            storage: {{ .Values.postgres.persistence.size }}

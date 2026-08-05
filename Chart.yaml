@@ -1,0 +1,23 @@
+apiVersion: v2
+name: newapi
+description: >-
+  New API LLM gateway (QuantumNous/new-api) on K3s/Kubernetes, packaged with
+  PostgreSQL and Redis. Fronts OpenAI, Anthropic, Google Gemini and more
+  behind a single OpenAI-compatible endpoint.
+type: application
+version: 1.0.0
+appVersion: "latest"
+kubeVersion: ">=1.24.0-0"
+keywords:
+  - new-api
+  - llm
+  - gateway
+  - openai
+  - anthropic
+home: https://github.com/WOOWTECH/Woow_k3s_newapi
+sources:
+  - https://github.com/WOOWTECH/Woow_k3s_newapi
+  - https://github.com/QuantumNous/new-api
+maintainers:
+  - name: WoowTech
+    url: https://github.com/WOOWTECH

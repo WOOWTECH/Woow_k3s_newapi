@@ -1,8 +1,9 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: new-api
-  namespace: new-api
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: new-api
     component: new-api
@@ -25,7 +26,7 @@ spec:
     spec:
       initContainers:
         - name: wait-for-postgres
-          image: postgres:16-alpine
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
           command:
             - sh
             - -c
@@ -36,7 +37,7 @@ spec:
               done
               echo "PostgreSQL is ready."
         - name: wait-for-redis
-          image: redis:7-alpine
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
           command:
             - sh
             - -c
@@ -48,7 +49,8 @@ spec:
               echo "Redis is ready."
       containers:
         - name: new-api
-          image: calciumion/new-api:latest
+          image: "{{ .Values.newapi.image.repository }}:{{ .Values.newapi.image.tag }}"
+          imagePullPolicy: {{ .Values.newapi.image.pullPolicy }}
           ports:
             - containerPort: 3000
               name: http
@@ -73,12 +75,7 @@ spec:
             - name: new-api-data
               mountPath: /data
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: "1"
-              memory: 512Mi
+            {{- toYaml .Values.newapi.resources | nindent 12 }}
           livenessProbe:
             httpGet:
               path: /api/status

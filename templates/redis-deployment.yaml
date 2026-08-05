@@ -1,8 +1,9 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
-  namespace: new-api
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: new-api
     component: redis
@@ -13,7 +14,7 @@ spec:
       app: new-api
       component: redis
   strategy:
-    type: Recreate
+    type: Recreate     # single-writer for the Redis AOF PVC
   template:
     metadata:
       labels:
@@ -22,7 +23,8 @@ spec:
     spec:
       containers:
         - name: redis
-          image: redis:7-alpine
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
           ports:
             - containerPort: 6379
               name: redis
@@ -45,12 +47,7 @@ spec:
             - name: redis-data
               mountPath: /data
           resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 250m
-              memory: 256Mi
+            {{- toYaml .Values.redis.resources | nindent 12 }}
           livenessProbe:
             exec:
               command:

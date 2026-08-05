@@ -1,0 +1,103 @@
+# Default values for the newapi chart.
+# Defaults reproduce the original Kustomize deployment 1:1
+# (namespace new-api, NodePort 30300 for HTTP, local-path storage).
+
+namespace:
+  # Create the target namespace as part of the release.
+  # Set to false if the namespace is managed elsewhere.
+  create: true
+  # Original Kustomize namespace was `new-api`; preserved for resource
+  # equivalence. The chart/product name is `newapi` (no hyphen).
+  name: new-api
+
+newapi:
+  image:
+    repository: calciumion/new-api
+    tag: latest
+    # "Always" matches the original manifests' behaviour with the
+    # :latest tag (Kubernetes defaults to Always for :latest tags).
+    pullPolicy: Always
+
+  service:
+    type: NodePort
+    port: 3000
+    # Only used when type is NodePort.
+    nodePort: 30300
+
+  persistence:
+    # PVC for new-api application data (uploads, cache).
+    storageClassName: local-path
+    size: 5Gi
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+postgres:
+  image:
+    repository: postgres
+    tag: 16-alpine
+    # Explicit; matches implicit default for pinned tags.
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 5432
+
+  persistence:
+    # StatefulSet volumeClaimTemplates size.
+    storageClassName: local-path
+    size: 10Gi
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+redis:
+  image:
+    repository: redis
+    tag: 7-alpine
+    pullPolicy: IfNotPresent
+
+  service:
+    type: ClusterIP
+    port: 6379
+
+  persistence:
+    # PVC for Redis append-only file.
+    storageClassName: local-path
+    size: 2Gi
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+config:
+  # ConfigMap keys applied to postgres via envFrom and to new-api / redis
+  # via individual env references. Names/values match the original ConfigMap.
+  TZ: "Asia/Taipei"
+  POSTGRES_USER: "newapi"
+  POSTGRES_DB: "newapi"
+
+secrets:
+  # -- PostgreSQL superuser password (change before deploying)
+  #    Generate with: openssl rand -base64 24
+  postgresPassword: "password"
+  # -- new-api → PostgreSQL DSN. Must match postgresPassword above.
+  #    Container-to-container connections do NOT need ?sslmode=disable here
+  #    because the Kustomize baseline omits it; upstream defaults to disable.
+  sqlDsn: "postgres://newapi:password@postgres:5432/newapi"
+  # -- new-api → Redis connection string
+  redisConnString: "redis://redis:6379"

@@ -1,0 +1,34 @@
+---
+# PVC for Redis append-only data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data-pvc
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: new-api
+    component: redis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.redis.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size }}
+---
+# PVC for new-api application data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: new-api-data-pvc
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: new-api
+    component: new-api
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.newapi.persistence.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.newapi.persistence.size }}
