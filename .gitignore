@@ -1,0 +1,17 @@
+# Real secrets must never be committed - only examples/secrets.example.yaml.
+# Patterns are anchored to the repo root (leading /) on purpose: an unanchored
+# "secret.yaml" would also match templates/secret.yaml and keep the chart's
+# own Secret template out of git.
+.env
+.env.*
+*.env
+/secret.yaml
+/secrets.yaml
+/*-secrets.yaml
+/*.secret.yaml
+/*secrets.values.yaml
+/*.local.yaml
+!/templates/secret.yaml
+
+# Packaged charts
+*.tgz

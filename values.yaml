@@ -1,14 +1,25 @@
 # Default values for the newapi chart.
-# Defaults reproduce the original Kustomize deployment 1:1
-# (namespace new-api, NodePort 30300 for HTTP, local-path storage).
+# Defaults reproduce the original Kustomize deployment's shape 1:1 (namespace
+# new-api, NodePort 30300 for HTTP, local-path storage) EXCEPT for secrets:
+# secrets.create now defaults to false (see below), so a fresh install needs
+# either secrets.create=true with real values, or a pre-created Secret
+# `new-api-secret` (see examples/secrets.example.yaml).
 
 namespace:
   # Create the target namespace as part of the release.
   # Set to false if the namespace is managed elsewhere.
+  # Never rendered when it equals the release namespace (-n): Helm keeps its
+  # release record there, so it is created with --create-namespace instead
+  # and can never be deleted by `helm uninstall`.
   create: true
   # Original Kustomize namespace was `new-api`; preserved for resource
   # equivalence. The chart/product name is `newapi` (no hyphen).
   name: new-api
+
+# Add `helm.sh/resource-policy: keep` to the Namespace, both PVCs and the
+# chart-created Secret, so `helm uninstall` never deletes new-api's uploads,
+# the Postgres database or Redis's AOF file.
+keepOnUninstall: true
 
 newapi:
   image:
@@ -92,12 +103,21 @@ config:
   POSTGRES_DB: "newapi"
 
 secrets:
-  # -- PostgreSQL superuser password (change before deploying)
-  #    Generate with: openssl rand -base64 24
-  postgresPassword: "password"
-  # -- new-api → PostgreSQL DSN. Must match postgresPassword above.
-  #    Container-to-container connections do NOT need ?sslmode=disable here
-  #    because the Kustomize baseline omits it; upstream defaults to disable.
-  sqlDsn: "postgres://newapi:password@postgres:5432/newapi"
-  # -- new-api → Redis connection string
-  redisConnString: "redis://redis:6379"
+  # false (default): the Secret `new-api-secret` already exists (created from
+  #   examples/secrets.example.yaml) and the chart never renders it, so a
+  #   `helm upgrade` can never overwrite a real password with an empty value.
+  # true: render the Secret from the values below (fresh installs, tests).
+  #   Every key below is required() when create=true - no weak default
+  #   password ships in this file.
+  create: false
+  # PostgreSQL superuser password. Letters, digits only recommended
+  # (generate with `openssl rand -hex 24`): a `/` from `openssl rand -base64`
+  # breaks SQL_DSN's postgres:// URL parsing about 4 times in 10.
+  postgresPassword: ""
+  # SQL_DSN and REDIS_CONN_STRING are NOT set here: the chart computes them
+  # from postgresPassword and config.POSTGRES_USER/POSTGRES_DB (Redis has no
+  # password), so there is only one password to keep in sync, not two.
+
+tests:
+  # `helm test` smoke pod: /api/status (readiness) and Postgres tables. Read-only.
+  enabled: true

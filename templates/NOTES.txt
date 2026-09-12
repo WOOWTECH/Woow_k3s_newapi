@@ -1,0 +1,21 @@
+new-api is deployed in namespace {{ .Values.namespace.name }}.
+
+Check rollout status:
+  kubectl -n {{ .Values.namespace.name }} rollout status deploy/new-api
+
+{{- if eq .Values.newapi.service.type "NodePort" }}
+Open http://<node-ip>:{{ .Values.newapi.service.nodePort }} (default admin
+login `root` / `123456` - change it immediately).
+{{- else }}
+Reach new-api at http://new-api.{{ .Values.namespace.name }}.svc.cluster.local:{{ .Values.newapi.service.port }}
+(service type {{ .Values.newapi.service.type }}; no NodePort).
+{{- end }}
+
+Run the read-only smoke test:
+  helm test {{ .Release.Name }} -n {{ .Values.namespace.name }} --logs
+
+{{- if not .Values.secrets.create }}
+
+secrets.create is false: this release expects an existing Secret
+`new-api-secret` in {{ .Values.namespace.name }}. See examples/secrets.example.yaml.
+{{- end }}
