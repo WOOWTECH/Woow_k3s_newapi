@@ -102,7 +102,10 @@ helm install newapi . -n $NS --create-namespace \
 
 ```bash
 kubectl -n new-api rollout status deploy/new-api --timeout=5m
-helm test newapi -n new-api --logs
+helm test newapi -n new-api
+# The test pod has two containers, so `helm test --logs` needs one named:
+kubectl -n new-api logs newapi-smoke -c api-status
+kubectl -n new-api logs newapi-smoke -c db-tables
 ```
 
 Open `http://<node-ip>:30300` (default admin login `root` / `123456` —
@@ -134,7 +137,7 @@ sets them (the Secret always computes both from `postgresPassword`).
 ```bash
 kubectl get pods -n new-api                    # postgres, redis, new-api all Running/Ready
 curl http://<node-ip>:30300/api/status         # {"success":true, ...}
-helm test newapi -n new-api --logs             # /api/status + confirms new-api's own tables exist
+helm test newapi -n new-api                    # /api/status + confirms new-api's own tables exist
 scripts/check-drift.sh -f ~/secure/newapi-secret.values.yaml   # repo vs release vs live objects
 ```
 

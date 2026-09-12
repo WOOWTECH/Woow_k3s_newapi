@@ -98,7 +98,10 @@ helm install newapi . -n $NS --create-namespace \
 
 ```bash
 kubectl -n new-api rollout status deploy/new-api --timeout=5m
-helm test newapi -n new-api --logs
+helm test newapi -n new-api
+# 測試 pod 有兩個 container,`helm test --logs` 要指定一個名稱才看得到:
+kubectl -n new-api logs newapi-smoke -c api-status
+kubectl -n new-api logs newapi-smoke -c db-tables
 ```
 
 開啟 `http://<node-ip>:30300`(預設管理員 `root` / `123456`,請立即修改)。
@@ -129,7 +132,7 @@ helm test newapi -n new-api --logs
 ```bash
 kubectl get pods -n new-api                    # postgres、redis、new-api 全部 Running/Ready
 curl http://<node-ip>:30300/api/status         # {"success":true, ...}
-helm test newapi -n new-api --logs             # /api/status + 確認 new-api 自己的資料表已建立
+helm test newapi -n new-api                    # /api/status + 確認 new-api 自己的資料表已建立
 scripts/check-drift.sh -f ~/secure/newapi-secret.values.yaml   # 倉庫 vs release vs 實際物件
 ```
 
