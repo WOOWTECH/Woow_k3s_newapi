@@ -1,0 +1,73 @@
+{{- /*
+`helm test` smoke pod, read-only:
+  - api-status:  GET http://new-api:<port>/api/status returns HTTP 200 with
+    JSON {"success": true, ...}
+  - db-tables:   psql against the postgres Service confirms new-api's own
+    migrations created its schema (checked via information_schema, not by
+    guessing table names, so it does not go stale as upstream evolves)
+Both containers must exit 0 for the Pod to reach phase Succeeded.
+*/ -}}
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-smoke
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: new-api
+    app.kubernetes.io/component: smoke-test
+  annotations:
+    helm.sh/hook: test
+    # Kept until the next `helm test` so `helm test --logs` can always read it.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  containers:
+    - name: api-status
+      image: curlimages/curl:8.10.1
+      command: [sh, -c]
+      args:
+        - |
+          set -eu
+          body=$(curl -sS -o /tmp/body -w '%{http_code}' \
+            http://new-api:{{ .Values.newapi.service.port }}/api/status)
+          echo "HTTP $body"; cat /tmp/body; echo
+          [ "$body" = "200" ]
+          grep -q '"success":true' /tmp/body
+          echo "API-STATUS OK"
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { cpu: 200m, memory: 64Mi }
+    - name: db-tables
+      image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+      command: [sh, -c]
+      args:
+        - |
+          set -eu
+          n=$(psql -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+            "select count(*) from information_schema.tables where table_schema='public'")
+          echo "public tables: $n"
+          [ "$n" -gt 0 ]
+          psql -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc \
+            "select string_agg(table_name, ', ') from information_schema.tables where table_schema='public'"
+          echo "DB-TABLES OK"
+      env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: new-api-secret
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: new-api-config
+              key: POSTGRES_USER
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: new-api-config
+              key: POSTGRES_DB
+      resources:
+        requests: { cpu: 10m, memory: 32Mi }
+        limits: { cpu: 200m, memory: 128Mi }
+{{- end }}

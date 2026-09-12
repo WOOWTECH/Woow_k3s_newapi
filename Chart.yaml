@@ -5,7 +5,7 @@ description: >-
   PostgreSQL and Redis. Fronts OpenAI, Anthropic, Google Gemini and more
   behind a single OpenAI-compatible endpoint.
 type: application
-version: 1.0.0
+version: 2.0.0
 appVersion: "latest"
 kubeVersion: ">=1.24.0-0"
 keywords:
