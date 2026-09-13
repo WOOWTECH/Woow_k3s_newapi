@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "newapi.ns" . }}
   labels:
     app: new-api
     component: redis

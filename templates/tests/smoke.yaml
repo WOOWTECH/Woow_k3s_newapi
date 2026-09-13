@@ -12,7 +12,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: {{ .Release.Name }}-smoke
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "newapi.ns" . }}
   labels:
     app: new-api
     app.kubernetes.io/component: smoke-test

@@ -14,7 +14,10 @@ namespace:
   create: true
   # Original Kustomize namespace was `new-api`; preserved for resource
   # equivalence. The chart/product name is `newapi` (no hyphen).
-  name: new-api
+  # EMPTY BY DEFAULT so `-n` controls placement. A non-empty value here
+  # silently overrides `-n`, which is how a rehearsal once wrote Helm
+  # ownership annotations onto a live production Deployment.
+  name: ""
 
 # Add `helm.sh/resource-policy: keep` to the Namespace, both PVCs and the
 # chart-created Secret, so `helm uninstall` never deletes new-api's uploads,
