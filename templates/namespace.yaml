@@ -3,12 +3,12 @@ Namespace. One that equals the release namespace is skipped: Helm keeps its
 release record there, so it is created with --create-namespace instead - so
 `helm uninstall` can never delete the namespace the release lives in.
 */ -}}
-{{- if and .Values.namespace.create (ne .Values.namespace.name .Release.Namespace) }}
+{{- if and .Values.namespace.create (ne (include "newapi.ns" .) .Release.Namespace) }}
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ .Values.namespace.name }}
+  name: {{ include "newapi.ns" . }}
   labels:
     app: new-api
     managed-by: helm

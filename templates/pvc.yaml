@@ -4,7 +4,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: redis-data-pvc
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "newapi.ns" . }}
   labels:
     app: new-api
     component: redis
@@ -22,7 +22,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: new-api-data-pvc
-  namespace: {{ .Values.namespace.name }}
+  namespace: {{ include "newapi.ns" . }}
   labels:
     app: new-api
     component: new-api
