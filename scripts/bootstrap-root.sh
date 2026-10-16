@@ -6,12 +6,14 @@
 # Usage: scripts/bootstrap-root.sh <base-url> [credentials-file]
 #   base-url          e.g. http://127.0.0.1:3300 (kubectl port-forward)
 #   credentials-file  default ~/.config/newapi/root-credentials (mode 0600)
-# Env: NEWAPI_ROOT_USER (default woowroot, max 12 chars)
+# Env: NEWAPI_ROOT_USER (required, max 12 chars). No default: this repo is
+#      mirrored publicly, so the production admin name must not live here.
 set -euo pipefail
 
 base=${1:?usage: bootstrap-root.sh <base-url> [credentials-file]}
 creds=${2:-$HOME/.config/newapi/root-credentials}
-user=${NEWAPI_ROOT_USER:-woowroot}
+user=${NEWAPI_ROOT_USER:?set NEWAPI_ROOT_USER (max 12 chars)}
+[ "${#user}" -le 12 ] || { echo "NEWAPI_ROOT_USER must be at most 12 characters" >&2; exit 1; }
 
 status=$(curl -fsS "$base/api/setup")
 if printf '%s' "$status" | grep -q '"status":true'; then
