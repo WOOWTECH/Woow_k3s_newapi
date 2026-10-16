@@ -24,14 +24,33 @@ jobs:
           set -euo pipefail
           helm lint ./chart
           helm lint ./chart -f deploy/woow-k3s.yaml
+          helm lint ./chart -f deploy/woow-k3s-stg.yaml
           helm template newapi ./chart -n new-api -f deploy/woow-k3s.yaml > /tmp/rendered.yaml
-          grep -c '^kind:' /tmp/rendered.yaml
+          helm template newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml > /tmp/rendered-stg.yaml
+          grep -c '^kind:' /tmp/rendered.yaml /tmp/rendered-stg.yaml
 
       - name: Images are pinned by digest
         run: |
           set -euo pipefail
-          bad=$(grep -E '^\s+image: ' /tmp/rendered.yaml | grep -v '@sha256:' || true)
-          if [ -n "$bad" ]; then echo "unpinned images:"; echo "$bad"; exit 1; fi
+          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml; do
+            bad=$(grep -E '^\s+image: ' "$f" | grep -v '@sha256:' || true)
+            if [ -n "$bad" ]; then echo "unpinned images in $f:"; echo "$bad"; exit 1; fi
+          done
+
+      # newapi-proxy (templates/proxy.yaml): off in prod until NA-05, on in stg.
+      - name: newapi-proxy component
+        run: |
+          set -euo pipefail
+          if grep -q '^  name: newapi-proxy$' /tmp/rendered.yaml; then
+            echo "newapi-proxy must stay disabled in deploy/woow-k3s.yaml for now"; exit 1
+          fi
+          for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
+            awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
+              /tmp/rendered-stg.yaml || { echo "stg render lacks the newapi-proxy $kind"; exit 1; }
+          done
+          if grep -q 'newapi-proxy@sha256:0\{64\}' /tmp/rendered-stg.yaml; then
+            echo "::warning::deploy/woow-k3s-stg.yaml still has the placeholder proxy digest"
+          fi
 
       - name: Scripts parse
         run: |
