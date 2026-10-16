@@ -20,5 +20,13 @@
   "SelfUseModeEnabled": false,
   "DrawingEnabled": false,
   "TaskPluginEnabled": false,
-  "ServerAddress": "https://newapi.woowtech.io"
+  "ServerAddress": "https://newapi.woowtech.io",
+  "GroupRatio": {
+    "default": 1,
+    "internal": 1
+  },
+  "UserUsableGroups": {
+    "default": "預設"
+  },
+  "_comment_groups": "default = sellable models; internal = ChatGPT-subscription test channel, NOT user-selectable (only accounts whose own group is internal). Model ratios = LiteLLM cost; put markup on GroupRatio.default."
 }
