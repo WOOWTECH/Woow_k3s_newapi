@@ -1,0 +1,70 @@
+{{- if .Values.cloudflared.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "newapi.fullname" . }}-cloudflared
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cloudflared
+spec:
+  replicas: {{ .Values.cloudflared.replicas }}
+  selector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "cloudflared") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "newapi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: cloudflared
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- include "newapi.affinity" . | nindent 6 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "cloudflared") | nindent 14 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        {{- include "newapi.podSecurity" . | nindent 8 }}
+      containers:
+        - name: cloudflared
+          image: {{ include "newapi.image" .Values.cloudflared.image }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.cloudflared.tokenSecret }}
+                  key: token
+          ports:
+            - name: metrics
+              containerPort: 2000
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          securityContext:
+            {{- include "newapi.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.cloudflared.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "newapi.fullname" . }}
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: newapi
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    newapi.woowtech.io/serves-relay: "true"
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+{{- range $role := list "master" "slave" }}
+{{- $replicas := ternary 1 ($.Values.slave.replicas | int) (eq $role "master") }}
+{{- if or (eq $role "master") (gt $replicas 0) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "newapi.fullname" $ }}-{{ $role }}
+  labels:
+    {{- include "newapi.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $role }}
+spec:
+  replicas: {{ $replicas }}
+  {{- if eq $role "master" }}
+  # Migrations have no lock: never run two masters, even during an upgrade.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "newapi.selector" (list $ $role) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "newapi.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $role }}
+        newapi.woowtech.io/serves-relay: "true"
+      annotations:
+        checksum/env: {{ include "newapi.appEnv" $ | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 130
+      {{- include "newapi.affinity" $ | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ $.Values.newapi.runAsUser }}
+        runAsGroup: {{ $.Values.newapi.runAsUser }}
+        fsGroup: {{ $.Values.newapi.runAsUser }}
+        {{- include "newapi.podSecurity" $ | nindent 8 }}
+      initContainers:
+        # new-api exits on the first refused DB connection; on a fresh
+        # install Postgres is still in initdb, so wait instead of crashlooping.
+        - name: wait-for-postgres
+          image: {{ include "newapi.image" $.Values.postgres.image }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - until pg_isready -q -h {{ include "newapi.fullname" $ }}-postgres -U newapi -d newapi; do sleep 2; done
+          securityContext:
+            {{- include "newapi.containerSecurity" $ | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      containers:
+        - name: new-api
+          image: {{ include "newapi.image" $.Values.newapi.image }}
+          imagePullPolicy: {{ $.Values.newapi.image.pullPolicy }}
+          # Empty --log-dir disables the never-rotated ./logs/oneapi-*.log file;
+          # stdout still gets everything.
+          args: ["--log-dir="]
+          env:
+            - name: NODE_TYPE
+              value: {{ $role }}
+            {{- include "newapi.appEnv" $ | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+          startupProbe:
+            httpGet:
+              path: /api/status
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            {{- include "newapi.containerSecurity" $ | nindent 12 }}
+          resources:
+            {{- toYaml $.Values.newapi.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+{{- end }}
+{{- end }}

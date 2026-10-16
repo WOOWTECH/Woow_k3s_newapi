@@ -1,0 +1,18 @@
+apiVersion: v2
+name: newapi
+description: >-
+  New API (QuantumNous/new-api) LLM gateway on woow-k3s, outside the PaaS:
+  new-api master + PostgreSQL + Valkey + Cloudflare Tunnel connector,
+  default-deny NetworkPolicies and a daily pg_dump.
+type: application
+# 3.x = Gitea rewrite (woow-paas/Woow_k3s_newapi). 2.x was the GitHub
+# WOOWTECH/Woow_k3s_newapi chart (latest image, NodePort), retired 2026-10-04.
+version: 3.0.0
+appVersion: "v1.0.0-rc.44"
+home: https://git-prod.woowtech.io/woow-paas/Woow_k3s_newapi
+sources:
+  - https://github.com/QuantumNous/new-api
+annotations:
+  # Upstream is AGPL-3.0 with NOTICE section 7(b) attribution; this chart
+  # only deploys the unmodified upstream image.
+  woowtech.io/upstream-license: AGPL-3.0-only

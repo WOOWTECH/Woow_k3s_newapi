@@ -1,0 +1,16 @@
+# Production values for woow-k3s (release newapi, namespace new-api).
+#   helm upgrade --install newapi ./chart -n new-api --create-namespace -f deploy/woow-k3s.yaml
+publicUrl: https://newapi.woowtech.io
+
+networkPolicy:
+  upstreams:
+    # WoowTech's own LiteLLM in the PaaS (workspace 37, service 203).
+    # Its namespace carries the matching ingress allow
+    # (deploy/litellm-from-newapi-ingress.yaml).
+    - name: litellm-svc203
+      namespace: paas-ws-32e92be2
+      podLabels:
+        app.kubernetes.io/instance: svc-a8389061
+        app.kubernetes.io/name: litellm
+        app.kubernetes.io/component: app
+      port: 4000

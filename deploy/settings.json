@@ -1,0 +1,32 @@
+{
+  "_comment": "Production options for newapi.woowtech.io. Apply with scripts/newapi_admin.py apply-settings deploy/settings.json. Accounts come from the PaaS only, so every self-service sign-up path and free-credit path is off (GHSA-8r8v: free seed balance made the billing overflow exploitable at scale).",
+  "RegisterEnabled": false,
+  "PasswordRegisterEnabled": false,
+  "EmailVerificationEnabled": false,
+  "GitHubOAuthEnabled": false,
+  "LinuxDOOAuthEnabled": false,
+  "TelegramOAuthEnabled": false,
+  "WeChatAuthEnabled": false,
+  "QuotaForNewUser": 0,
+  "QuotaForInviter": 0,
+  "QuotaForInvitee": 0,
+  "checkin_setting.enabled": false,
+  "performance_setting.monitor_enabled": false,
+  "RetryTimes": 2,
+  "AutomaticDisableChannelEnabled": true,
+  "AutomaticEnableChannelEnabled": true,
+  "LogConsumeEnabled": true,
+  "DemoSiteEnabled": false,
+  "SelfUseModeEnabled": false,
+  "DrawingEnabled": false,
+  "TaskPluginEnabled": false,
+  "ServerAddress": "https://newapi.woowtech.io",
+  "GroupRatio": {
+    "default": 1,
+    "internal": 1
+  },
+  "UserUsableGroups": {
+    "default": "預設"
+  },
+  "_comment_groups": "default = sellable models; internal = ChatGPT-subscription test channel, NOT user-selectable (only accounts whose own group is internal). Model ratios = LiteLLM cost; put markup on GroupRatio.default."
+}

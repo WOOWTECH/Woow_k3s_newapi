@@ -1,0 +1,11 @@
+new-api {{ .Chart.AppVersion }} is installing in namespace {{ .Release.Namespace }}.
+
+FIRST RUN: the setup wizard (POST /api/setup) makes whoever calls it first
+the root user. Finish it through a port-forward BEFORE the public hostname
+gets a DNS record:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "newapi.fullname" . }} 3300:3000
+  scripts/bootstrap-root.sh http://127.0.0.1:3300
+
+Public URL (after DNS): {{ .Values.publicUrl }}
+Backups: CronJob {{ include "newapi.fullname" . }}-pg-backup ({{ .Values.backup.schedule }} Asia/Taipei)

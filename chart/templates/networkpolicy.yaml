@@ -1,0 +1,217 @@
+{{- $fn := include "newapi.fullname" . -}}
+# Default deny in both directions for every pod of this release.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-default-deny
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-allow-dns
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# new-api (master + slaves): in from cloudflared, the helm test pod and the
+# listed in-cluster clients; out to its DB, Valkey, listed in-cluster
+# upstreams and the public internet (never private ranges).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-app
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      newapi.woowtech.io/serves-relay: "true"
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "cloudflared") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "test") | nindent 14 }}
+        {{- range .Values.networkPolicy.clients }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 3000 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "postgres") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "valkey") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 6379 }
+    {{- range .Values.networkPolicy.upstreams }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .port }} }
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.networkPolicy.privateCidrs | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-postgres
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "postgres") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              newapi.woowtech.io/serves-relay: "true"
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "backup") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-valkey
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "valkey") | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              newapi.woowtech.io/serves-relay: "true"
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-backup
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "backup") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "postgres") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-test
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "test") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              newapi.woowtech.io/serves-relay: "true"
+      ports:
+        - { protocol: TCP, port: 3000 }
+{{- if .Values.cloudflared.enabled }}
+---
+# cloudflared: out to Cloudflare's edge (7844 QUIC/TCP, 443 for API) and to
+# new-api; nothing comes in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-cloudflared
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "cloudflared") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              newapi.woowtech.io/serves-relay: "true"
+      ports:
+        - { protocol: TCP, port: 3000 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.networkPolicy.privateCidrs | nindent 14 }}
+      ports:
+        - { protocol: UDP, port: 7844 }
+        - { protocol: TCP, port: 7844 }
+        - { protocol: TCP, port: 443 }
+{{- end }}
