@@ -33,3 +33,33 @@ networkPolicy:
         app.kubernetes.io/name: litellm
         app.kubernetes.io/component: app
       port: 4000
+
+# newapi-proxy for the stg sandboxes (AI-models design §1.4.1; LLM-01a).
+proxy:
+  enabled: true
+  image:
+    # PLACEHOLDER until build-newapi-proxy has pushed the first image: the stg
+    # deployment step replaces tag and digest with the pushed <sha> and its
+    # sha256 digest (this all-zero digest can never be pulled).
+    tag: ""
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
+  imagePullSecrets:
+    - name: newapi-proxy-registry
+  # Sandbox prefixes: "ws" + two lowercase letters + 10 digits (design N14).
+  usernameRegex: '^ws[a-z]{2}\d{10}$'
+  # Sandbox blocks 1-31 only (198.18.0.0 + 256 + block*4096 + id).
+  tenantIpRange: 198.18.17.0-198.19.255.255
+  # Filled in from the newapi-proxy-pats Secret's expiry at deploy time.
+  apExpiresAt: ""
+  opExpiresAt: ""
+  clients:
+    # Odoo pods of dev sandboxes only: not their agent-runtime, nginx or
+    # pgadmin pods, nothing in paas-ws-stg-* or paas-stg-system.
+    - name: sandbox-odoo
+      namespaceSelector:
+        matchLabels:
+          dev-sandbox.io/managed: "true"
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: odoo
