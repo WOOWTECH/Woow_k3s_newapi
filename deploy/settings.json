@@ -28,5 +28,13 @@
   "UserUsableGroups": {
     "default": "預設"
   },
-  "_comment_groups": "default = sellable models; internal = ChatGPT-subscription test channel, NOT user-selectable (only accounts whose own group is internal). Model ratios = LiteLLM cost; put markup on GroupRatio.default."
+  "_comment_groups": "default = sellable models; internal = ChatGPT-subscription test channel, NOT user-selectable (only accounts whose own group is internal). Model ratios = LiteLLM cost; put markup on GroupRatio.default.",
+  "TopupGroupRatio": {
+    "default": 1
+  },
+  "GroupGroupRatio": {},
+  "HeaderNavModules": {
+    "rankings": false
+  },
+  "_comment_nav": "Rankings is public without login and lists every model's usage, internal ones included; keep it off (backend /api/rankings then returns 403)."
 }
