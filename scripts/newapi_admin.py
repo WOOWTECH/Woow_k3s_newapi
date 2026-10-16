@@ -76,6 +76,11 @@ def main():
         for key, value in settings.items():
             if key.startswith("_"):
                 continue
+            # Object options are stored as JSON strings; the server formats
+            # anything else with Go's %v (map[...]), which some keys accept
+            # silently and then ignore.
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False)
             d = c.req("PUT", "/api/option/", {"key": key, "value": value})
             ok = d.get("success")
             failed += not ok
