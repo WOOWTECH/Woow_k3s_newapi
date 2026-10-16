@@ -18,6 +18,12 @@ Usage:
       --root-creds ~/.config/newapi-stg/root-credentials \
       --svc-user wpsvc-stg --svc-creds ~/.config/newapi-stg/service-account \
       --namespace new-api-stg --secret newapi-proxy-pats --label stg
+
+Rotation without an outage (docs/OPERATIONS.md): run it again WITHOUT
+--rotate (new AP/OP next to the old ones, Secret replaced), restart
+newapi-proxy, then run it once more with --revoke-stale: that only revokes
+this label's AP/OP PATs other than the ones whose token_hint is in the
+Secret's annotations, and refuses when the current one is not found.
 """
 import argparse
 import base64
@@ -93,24 +99,64 @@ class Session:
             raise SystemExit(f"create PAT {name} failed: {d.get('message') or d.get('code')}")
         return d["data"]["token"], d["data"]["item"]
 
-    def revoke_named(self, prefix):
-        """Revoke this account's PATs whose name starts with prefix (rotation)."""
+    def revoke_named(self, prefix, keep_hint=None):
+        """Revoke this account's PATs whose name starts with prefix (rotation).
+
+        With keep_hint, the PAT whose token_hint equals it is kept, and nothing
+        is revoked unless exactly one such PAT exists (never the live one).
+        """
         existing = self.req("GET", "/api/user/access_tokens").get("data") or []
         items = existing.get("items", existing) if isinstance(existing, dict) else existing
+        mine = [it for it in items if str(it.get("name", "")).startswith(prefix)]
+        if keep_hint is not None:
+            current = [it for it in mine if it.get("token_hint") == keep_hint]
+            if len(current) != 1:
+                raise SystemExit(f"{self.username}: the PAT named in the Secret is not unique among {prefix}*; "
+                                 "refusing to revoke anything")
+            mine = [it for it in mine if it is not current[0]]
         n = 0
-        for it in items:
-            if str(it.get("name", "")).startswith(prefix):
-                p = self.proof("access_token.revoke", {"token_id": it["id"]})
-                d = self.req("DELETE", f"/api/user/access_tokens/{it['id']}", proof=p)
-                if not d.get("success"):
-                    raise SystemExit(f"revoke PAT {it['id']} failed: {d.get('message') or d.get('code')}")
-                n += 1
+        for it in mine:
+            p = self.proof("access_token.revoke", {"token_id": it["id"]})
+            d = self.req("DELETE", f"/api/user/access_tokens/{it['id']}", proof=p)
+            if not d.get("success"):
+                raise SystemExit(f"revoke PAT {it['id']} failed: {d.get('message') or d.get('code')}")
+            n += 1
         return n
 
     def logout(self):
         if self.sid:
             self.req("DELETE", f"/api/user/sessions/{self.sid}")
             self.sid = None
+
+
+def secret_annotation(namespace, secret, key):
+    """One annotation value of the Secret (never printed by this script)."""
+    path = "{.metadata.annotations.woowtech\\.io/" + key + "}"
+    out = subprocess.run(["kubectl", "-n", namespace, "get", "secret", secret, "-o", f"jsonpath={path}"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    if not out:
+        raise SystemExit(f"{namespace}/{secret} has no woowtech.io/{key} annotation; refusing to guess")
+    return out
+
+
+def revoke_stale(a):
+    """Rotation, last step: the proxy already runs on the PATs in the Secret."""
+    keep = {k: secret_annotation(a.namespace, a.secret, f"{k}-hint") for k in ("ap", "op")}
+    rc = read_creds(a.root_creds)
+    root = Session(a.base, rc["username"], rc["password"])
+    root.login()
+    try:
+        sc = read_creds(os.path.expanduser(a.svc_creds))
+        s = Session(a.base, sc["username"], sc["password"])
+        s.login()
+        try:
+            n_ap = s.revoke_named(f"woow-paas-ap-{a.label}-", keep_hint=keep["ap"])
+        finally:
+            s.logout()
+        n_op = root.revoke_named(f"woow-paas-op-{a.label}-", keep_hint=keep["op"])
+    finally:
+        root.logout()
+    print(f"revoked {n_ap} stale AP and {n_op} stale OP PAT(s); kept the ones in {a.namespace}/{a.secret}")
 
 
 def main():
@@ -122,10 +168,16 @@ def main():
     ap.add_argument("--namespace", required=True)
     ap.add_argument("--secret", required=True)
     ap.add_argument("--label", required=True)
-    ap.add_argument("--rotate", action="store_true", help="revoke this label's existing AP/OP PATs first")
+    ap.add_argument("--rotate", action="store_true",
+                    help="revoke this label's existing AP/OP PATs first (outage until the proxy restarts; "
+                         "prefer a plain run, a proxy restart, then --revoke-stale)")
+    ap.add_argument("--revoke-stale", action="store_true",
+                    help="only revoke this label's AP/OP PATs other than the ones now in --secret")
     a = ap.parse_args()
     if len(a.svc_user) > 12:
         sys.exit("new-api usernames are at most 12 characters")
+    if a.revoke_stale:
+        return revoke_stale(a)
 
     rc = read_creds(a.root_creds)
     root = Session(a.base, rc["username"], rc["password"])
