@@ -19,6 +19,18 @@ jobs:
           sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm || mv /tmp/linux-amd64/helm /usr/local/bin/helm
           helm version
 
+      # newapi-proxy digest placeholder: a hard failure, not a warning. The
+      # chart refuses it too (templates/proxy.yaml); this says why up front.
+      # The real <sha> + digest from build-newapi-proxy must be committed
+      # before the PR can go green (never patched in with helm --set).
+      - name: No placeholder image digests
+        run: |
+          set -euo pipefail
+          if grep -nE 'digest: *"?sha256:0{64}"?' deploy/*.yaml; then
+            echo "::error::deploy values still hold the all-zero placeholder digest: dispatch build-newapi-proxy and commit the tag + digest it printed"
+            exit 1
+          fi
+
       - name: Lint and render
         run: |
           set -euo pipefail
@@ -48,13 +60,18 @@ jobs:
             awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
               /tmp/rendered-stg.yaml || { echo "stg render lacks the newapi-proxy $kind"; exit 1; }
           done
-          if grep -q 'newapi-proxy@sha256:0\{64\}' /tmp/rendered-stg.yaml; then
-            echo "::warning::deploy/woow-k3s-stg.yaml still has the placeholder proxy digest"
+          if grep -q 'newapi-proxy[^@]*@sha256:0\{64\}' /tmp/rendered-stg.yaml; then
+            echo "::error::rendered stg values carry the placeholder proxy digest"; exit 1
           fi
+
+      # The chart's fail() guards (digest, client selectors, username regex):
+      # unsafe values must keep failing, the real shapes must keep rendering.
+      - name: newapi-proxy chart guards
+        run: scripts/chart-guards.sh
 
       - name: Scripts parse
         run: |
           set -euo pipefail
           for f in scripts/*.sh; do bash -n "$f"; done
-          python3 -m py_compile scripts/newapi_admin.py
+          for f in scripts/*.py; do python3 -m py_compile "$f"; done
           python3 -c 'import json; json.load(open("deploy/settings.json"))'
