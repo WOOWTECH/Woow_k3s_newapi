@@ -1,0 +1,4 @@
+{
+  "_comment": "Staging overrides applied after deploy/settings.json.",
+  "ServerAddress": "https://newapi-stg.woowtech.io"
+}

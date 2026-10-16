@@ -44,6 +44,8 @@ tunnel_id() {
 
 case $cmd in
 tunnel)
+  tmp_manifest=$(mktemp)
+  chmod 600 "$tmp_manifest"
   id=$(tunnel_id)
   if [ -z "$id" ]; then
     id=$(cf POST "/accounts/$acct/cfd_tunnel" --data "{\"name\":\"$name\",\"config_src\":\"cloudflare\"}" |
@@ -62,7 +64,15 @@ print(json.dumps({"config":{"ingress":[
   cf GET "/accounts/$acct/cfd_tunnel/$id/token" |
     python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["result"])' |
     kubectl -n "$ns" create secret generic "$secret" --from-file=token=/dev/stdin \
-      --dry-run=client -o yaml | kubectl -n "$ns" apply -f - > /dev/null
+      --dry-run=client -o yaml > "$tmp_manifest"
+  # replace/create, never apply: apply would copy the token into the
+  # last-applied-configuration annotation.
+  if kubectl -n "$ns" get secret "$secret" > /dev/null 2>&1; then
+    kubectl -n "$ns" replace -f "$tmp_manifest" > /dev/null
+  else
+    kubectl -n "$ns" create -f "$tmp_manifest" > /dev/null
+  fi
+  rm -f "$tmp_manifest"
   echo "secret $ns/$secret updated"
   ;;
 dns)
