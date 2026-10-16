@@ -148,6 +148,12 @@ spec:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
               newapi.woowtech.io/serves-relay: "true"
+        {{- if .Values.proxy.enabled }}
+        # newapi-proxy's replay record; its ACL user may only SET its own keys.
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
+        {{- end }}
       ports:
         - { protocol: TCP, port: 6379 }
 ---
@@ -196,6 +202,7 @@ spec:
               {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
     {{- end }}
 {{- if .Values.cloudflared.enabled }}
 ---

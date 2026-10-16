@@ -58,6 +58,24 @@ spec:
             - volatile-lru
             - --dir
             - /data
+            {{- if .Values.proxy.enabled }}
+            # newapi-proxy's replay record (templates/proxy.yaml): its own ACL
+            # user that may only SET keys under newapi-proxy:replay:* and PING;
+            # it can neither read nor change new-api's sessions, caches or
+            # rate-limit counters. new-api keeps the default user (requirepass).
+            # Turning the proxy on or off changes these args: Valkey restarts
+            # once (Recreate; cache only, the DB is authoritative).
+            - --user
+            - newapi-proxy
+            - "on"
+            - ">$(PROXY_VALKEY_PASSWORD)"
+            - resetkeys
+            - "~newapi-proxy:replay:*"
+            - resetchannels
+            - -@all
+            - +set
+            - +ping
+            {{- end }}
           env:
             - name: REDIS_PASSWORD
               valueFrom:
@@ -69,6 +87,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "newapi.secretName" . }}
                   key: REDIS_PASSWORD
+            {{- if .Values.proxy.enabled }}
+            - name: PROXY_VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "newapi.secretName" . }}
+                  key: PROXY_VALKEY_PASSWORD
+            {{- end }}
           ports:
             - name: redis
               containerPort: 6379
