@@ -71,7 +71,9 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 
 - 進：只有 cloudflared、同 ns 的 `newapi-proxy`（`proxy.enabled` 時）與 helm test pod 能連 `newapi:3000`；`networkPolicy.clients` 可加叢集內客戶端。
 - 出：DB、Valkey、`networkPolicy.upstreams`（目前 LiteLLM svc203）、公網 80/443；私網（10/8、172.16/12、192.168/16、100.64/10、169.254/16）一律擋，防管理員把渠道 base URL 指到內網。
-- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 與同 ns 的 `newapi-proxy` 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 是安全的。`newapi-proxy` 一律把 XFF 覆寫成單一合成 IP（198.18.0.0/15：`.0.1` AP、`.0.2` 健康檢查、`.0.3` OP、`.0.4` break-glass，其餘是 PaaS 租戶；對照表在 PaaS），所以 new-api 記到 PaaS 來的 IP 都是合成 IP，限流也按租戶計。
+- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 與同 ns 的 `newapi-proxy` 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 是安全的。`newapi-proxy` 一律把 XFF 覆寫成單一合成 IP（198.18.0.0/15：`.0.1` AP、`.0.2` anon、`.0.3` OP、`.0.4` break-glass、`.0.5` 代理自己的 readiness，其餘是 PaaS 租戶；對照表在 PaaS），所以 new-api 記到 PaaS 來的 IP 都是合成 IP，限流也按租戶計。
+- Valkey：只收 new-api（預設使用者，`requirepass`）與 `newapi-proxy`（`proxy.enabled` 時；ACL 使用者 `newapi-proxy`，只能 `SET` `newapi-proxy:replay:*` 與 `PING`，讀不到 new-api 的 session、快取與限流計數）。
+- 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。
 - 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
 
 ## 已知限制
@@ -128,39 +130,115 @@ scripts/bootstrap_service_account.py --base http://127.0.0.1:3301 --root-creds ~
 
 | 物件 | 說明 |
 |---|---|
-| Deployment `newapi-proxy` | 2 replica、`maxUnavailable: 0`；readiness＝`/readyz`（打得通 new-api 的 `/api/status` 才 Ready）、liveness＝`/healthz`；uid 65532、root FS 唯讀 |
+| Deployment `newapi-proxy` | 2 replica、`maxUnavailable: 0`；8080 簽章代理、8081 管理埠；readiness＝`:8081/readyz`（new-api 的 `/api/status` 與 Valkey 都通才 Ready）、liveness＝`:8081/healthz`；`terminationGracePeriodSeconds: 60`（preStop 5＋代理的關機等待 40）；uid 65532、root FS 唯讀 |
 | PodDisruptionBudget `newapi-proxy` | `minAvailable: 1` |
-| Service `newapi-proxy:8080` | Odoo 端 `newapi_proxy_url` 指這裡（stg：`http://newapi-proxy.new-api-stg.svc.cluster.local:8080`） |
-| NetworkPolicy `newapi-proxy` | 進：`proxy.clients` 每一項都是「namespaceSelector **且** podSelector」，外加 helm test pod，8080；出：new-api 3000＋鏡射 ingress 來源（k3s 內建 enforcer 會把部分回包當成新的 egress），DNS 走 release 共用的 allow-dns |
-| ConfigMap `newapi-proxy` | 前綴 regex、租戶 IP 範圍、加額度每小時總量、in-flight 上限、免費模型、AP／OP 到期日、break-glass |
+| Service `newapi-proxy` | `8080`（Odoo 端 `newapi_proxy_url`，stg：`http://newapi-proxy.new-api-stg.svc.cluster.local:8080`）、`8081`（`/readyz`、`/healthz`、`/metrics`；PaaS 健康檢查讀 `:8081/readyz`） |
+| NetworkPolicy `newapi-proxy` | 進：`proxy.clients` 每一項都是「非空的 namespaceSelector **且** 非空、指定 `app.kubernetes.io/component` 的 podSelector」（chart 會擋太寬的），外加 helm test pod，8080 與 8081；出：new-api 3000、Valkey 6379＋鏡射 ingress 來源（只到 32768–60999 這段 ephemeral port；k3s 內建 enforcer 會把部分回包當成新的 egress），DNS 走 release 共用的 allow-dns |
+| ConfigMap `newapi-proxy` | 前綴 regex、租戶 IP 範圍、加額度每小時總量、in-flight 上限、連線上限、免費模型、AP／OP 到期日、break-glass、Valkey 位址 |
+| Valkey ACL 使用者 `newapi-proxy` | 跨 replica 的重放紀錄；密碼由 chart 產生在 `newapi-secrets` 的 `PROXY_VALKEY_PASSWORD`。**打開或關掉 proxy 會改 Valkey 的啟動參數，Valkey 重啟一次**（Recreate；只是快取，DB 才是權威：使用者要重新登入 new-api 後台、限流計數歸零）。確認：`kubectl -n <ns> exec deploy/newapi-valkey -- valkey-cli ACL USERS` 列得出 `newapi-proxy` |
 
 ### Secret（值不進 repo、不進任何檔案或 log）
 
-一律從 stdin `kubectl create`／`replace`，**不要 `kubectl apply`**（會把值複製進 `last-applied-configuration` 註解），也不要 `get -o yaml` 印出來。
+一律從 stdin 或 0600 暫存檔 `kubectl create`／`replace`，**不要 `kubectl apply`**（會把值複製進 `last-applied-configuration` 註解），也不要 `get -o yaml`、`-o jsonpath={.data…}` 印到終端機（下面的指令都只在 pipe 或變數裡流動）。**代理不會察覺 Secret 改了**：env 只在 pod 啟動時讀，改完一定要 `kubectl -n <ns> rollout restart deploy/newapi-proxy`。
 
 | Secret | key | 內容 |
 |---|---|---|
-| `newapi-proxy-pats` | `ap`、`op` | 服務帳號 AP 與 root 的 `option:read` OP（stg 由 `scripts/bootstrap_service_account.py` 寫入，到期日在 annotation） |
-| `newapi-proxy-hmac` | `web`、`cron` | 代理端簽章金鑰，各自是 `kid:secret[,kid:secret]`（現用在前、下一把在後；kid `[A-Za-z0-9_-]{1,64}`、secret `[A-Za-z0-9_-]{32,256}`；兩組的 kid 與 secret 都不能重複）。Odoo 端拿同樣的值：stg 放 `paas-stg-system/paas-stg-newapi-proxy-client`（key `web`、`cron`），prod 放 `fleet-local/paas-odoo-fleet-secrets` |
+| `newapi-proxy-pats` | `ap`、`op` | 服務帳號 AP 與 root 的 `option:read` OP（stg 由 `scripts/bootstrap_service_account.py` 寫入，到期日與 token hint 在 annotation） |
+| `newapi-proxy-hmac` | `web`、`cron` | 代理端簽章金鑰，各自是 `kid:secret[,kid:secret]`（代理接受清單內任一把；kid `[A-Za-z0-9_-]{1,64}`、secret `[A-Za-z0-9_-]{32,256}`；兩組的 kid 與 secret 都不能重複） |
+| Odoo 端複本 | `web`、`cron` | 同樣的金鑰，**Odoo 用清單的第一把簽**：stg `paas-stg-system/paas-stg-newapi-proxy-client`，prod `fleet-local/paas-odoo-fleet-secrets`（key 名由 LLM-17 定） |
 | `newapi-proxy-registry` | `.dockerconfigjson` | 拉 `jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy` 的唯讀憑證（`proxy.imagePullSecrets`） |
+| `newapi-secrets` | `PROXY_VALKEY_PASSWORD` | chart 產生、永久保留（同一個 Secret 的其他 key 見〈機密資料放哪裡〉） |
 
-產生新金鑰的寫法（值不顯示，只短暫落在 0600 暫存檔、建完 Secret 立刻刪除），例：
+**第一次建立簽章金鑰**（兩端同一組值；值只短暫落在 0600 暫存檔，建完立刻刪除）：
 
 ```bash
 k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
 umask 077; f=$(mktemp)
 { printf 'web='; k web-$(date +%Y%m%d); printf '\ncron='; k cron-$(date +%Y%m%d); printf '\n'; } > "$f"
-kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
-  | kubectl -n new-api-stg create -f -      # 已存在就把最後的 create 換成 replace
-# Odoo 端複本用同一個檔案建，然後立刻刪檔
+kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f"
+kubectl -n paas-stg-system create secret generic paas-stg-newapi-proxy-client --from-env-file="$f"   # Odoo 端複本
+shred -u "$f" 2>/dev/null || rm -f "$f"
+kubectl -n new-api-stg rollout restart deploy/newapi-proxy && kubectl -n new-api-stg rollout status deploy/newapi-proxy
+```
+
+**拉 image 的憑證**（JCR 唯讀帳號；密碼從鍵盤讀、不進 history 與 argv）：
+
+```bash
+umask 077; f=$(mktemp)
+read -rp 'JCR 唯讀帳號: ' u; read -rsp 'JCR 唯讀密碼: ' pw; echo
+printf '{"auths":{"jcr-prod.woowtech.io":{"auth":"%s"}}}' "$(printf '%s:%s' "$u" "$pw" | base64 -w0)" > "$f"; unset pw
+kubectl -n new-api-stg create secret generic newapi-proxy-registry --type=kubernetes.io/dockerconfigjson \
+  --from-file=.dockerconfigjson="$f"
 shred -u "$f" 2>/dev/null || rm -f "$f"
 ```
 
-stg 與 prod 的簽章金鑰、AP、OP 必須全部不同（NA-05 驗收）。
+stg 與 prod 的簽章金鑰、AP、OP、Valkey 密碼必須全部不同（NA-05 驗收）。
 
-### 升版與輪替
+### 升版
 
-- 新 image：PaaS repo 的 `build-newapi-proxy` workflow（develop／main 自動，或在分支手動 dispatch）只推 `newapi-proxy:<commit sha>`，job log 最後印出 digest；把 `proxy.image.tag`（sha）與 `proxy.image.digest` 改進 `deploy/woow-k3s*.yaml`，走本 repo 的 PR，再 `helm upgrade`。chart 拒絕沒有 digest、或 tag 不是 40 位 sha 的設定。
-- 簽章金鑰輪替：先把新金鑰加到 `newapi-proxy-hmac` 對應 key 的**後面**（代理接受清單內任一把）並重啟代理 → Odoo 改用新金鑰簽 → 拿掉舊金鑰再重啟一次。
-- AP／OP 到期日寫進 `proxy.apExpiresAt`／`proxy.opExpiresAt`（unix 秒或 `YYYY-MM-DD`），`/readyz` 回剩餘天數，PaaS 健康檢查在剩 14 天時告警。
-- break-glass：只有負責人以 `helm upgrade --set proxy.breakGlassUntil=<unix 秒>` 開啟，最多 24 小時（chart 與代理都會擋），用完設回空字串。
+- 新 image：PaaS repo 的 `build-newapi-proxy` workflow（develop／main 自動，或在分支手動 dispatch）只推 `newapi-proxy:<commit sha>`，job log 最後印出 digest；把 `proxy.image.tag`（sha）與 `proxy.image.digest` **commit 進** `deploy/woow-k3s*.yaml`，走本 repo 的 PR，再 `helm upgrade -f deploy/woow-k3s*.yaml`。不要用 `--set` 補 digest：git 和叢集會對不上，下一個照檔案跑 `helm upgrade` 的人會滾回拉不到的 image（`maxUnavailable: 0`，rollout 卡住）、AP／OP 到期日也會被清空。
+- chart 拒絕沒有 digest、全 0 的佔位 digest、或 tag 不是 40 位 sha 的設定；CI 也一樣（佔位 digest 是錯誤，不是警告）。
+- PaaS 的 develop 一律用 merge commit：feature branch 的 image 只給 stg 驗收用；**合併後 stg 與 prod 都改釘 develop 合併 commit 的 sha 與 digest**。
+
+### 輪替：AP／OP（180 天，或疑似外洩時立刻）
+
+順序是「先有新的、再換、最後才撤舊的」，中途代理一直拿得到有效的 PAT。stg 經 port-forward 時所有呼叫都算 127.0.0.1 的同一個 CT 桶（20 次／20 分），先看 `kubectl -n new-api-stg exec deploy/newapi-valkey -- valkey-cli GET rateLimit:v2:ip:CT:127.0.0.1` 與 `TTL`；第 1 步與第 5 步各約 6–7 格，必要時分兩個視窗做。
+
+1. 建新 PAT 並換掉 Secret（**不要**加 `--rotate`：它會先撤舊的，代理重啟前就斷線）：
+
+   ```bash
+   kubectl -n new-api-stg port-forward svc/newapi 3301:3000 &
+   scripts/bootstrap_service_account.py --base http://127.0.0.1:3301 --root-creds ~/.config/newapi-stg/root-credentials \
+     --svc-user wpsvc-stg --svc-creds ~/.config/newapi-stg/service-account \
+     --namespace new-api-stg --secret newapi-proxy-pats --label stg
+   ```
+
+2. `kubectl -n new-api-stg rollout restart deploy/newapi-proxy && kubectl -n new-api-stg rollout status deploy/newapi-proxy`
+3. 把新的到期日寫進 `deploy/woow-k3s-stg.yaml` 的 `proxy.apExpiresAt`／`proxy.opExpiresAt`（Secret annotation `woowtech.io/ap-expires-at`、`woowtech.io/op-expires-at`，unix 秒；到期日不是機密，只讀這兩個 annotation，不要整包印 annotation——裡面還有 token hint），走 PR 後 `helm upgrade`。
+4. 確認：`:8081/readyz` 的 `ap_days_left`／`op_days_left` 約 180，`ready:true`；以 CRON 金鑰打一次 AP `GET /api/user/<服務帳號 id>` 是 200。
+5. 撤舊的：同第 1 步的指令加 `--revoke-stale`（只撤這個 label 底下、token hint 和 Secret 裡不同的 AP／OP；找不到現用的那把就整個拒絕，不會撤到現用的）。
+
+prod（NA-05）：root 有 2FA，第 1、5 步在瀏覽器做（建 PAT、從 stdin `kubectl replace` Secret、撤舊 PAT），第 2–4 步相同。
+
+### 輪替：簽章金鑰（WEB／CRON）
+
+代理接受清單內任一把、Odoo 只用第一把簽，所以先讓代理認得新的、再讓 Odoo 改用新的、最後拿掉舊的；整個過程不停機。值只在變數與 0600 暫存檔裡：
+
+```bash
+k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
+cur() { kubectl -n "$1" get secret "$2" -o jsonpath="{.data.$3}" | base64 -d; }
+umask 077; f=$(mktemp); stamp=$(date +%Y%m%d%H%M)
+nw=$(k web-$stamp); nc=$(k cron-$stamp)
+# 1. 代理端：現用在前、新的在後
+{ printf 'web=%s,%s\n' "$(cur new-api-stg newapi-proxy-hmac web)" "$nw"
+  printf 'cron=%s,%s\n' "$(cur new-api-stg newapi-proxy-hmac cron)" "$nc"; } > "$f"
+kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
+  | kubectl -n new-api-stg replace -f -
+kubectl -n new-api-stg rollout restart deploy/newapi-proxy && kubectl -n new-api-stg rollout status deploy/newapi-proxy
+# 2. Odoo 端：新的放第一把（Odoo 用它簽），舊的留在後面
+{ printf 'web=%s,%s\n' "$nw" "$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)"
+  printf 'cron=%s,%s\n' "$nc" "$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)"; } > "$f"
+kubectl -n paas-stg-system create secret generic paas-stg-newapi-proxy-client --from-env-file="$f" --dry-run=client -o yaml \
+  | kubectl -n paas-stg-system replace -f -
+shred -u "$f" 2>/dev/null || rm -f "$f"; unset nw nc
+```
+
+3. 重啟所有讀這份金鑰的 Odoo（env 只在啟動時讀）：prod `kubectl -n paas-system rollout restart deploy/paas-odoo-platform deploy/paas-odoo-platform-cron`（`fleet-local/paas-odoo-fleet-secrets` 改完要先讓 Fleet 重新部署，細節在 LLM-17）；stg 是每個開了 LLM 的沙盒 Odoo（LLM-01b 的 `WOOW_LLM_SANDBOX` 沙盒）——rollout restart 它的 Odoo deployment，或重建沙盒。
+4. 等舊 kid 不再出現（access log 每行都有 `kid`）：`kubectl -n new-api-stg logs -l app.kubernetes.io/component=proxy --since=10m --prefix | grep -c '"kid":"<舊 kid>"'` 連續幾分鐘都是 0。
+5. 代理端拿掉舊的（新的那把就是 Odoo 端清單的第一把），再重啟一次：
+
+   ```bash
+   umask 077; f=$(mktemp)
+   { printf 'web=%s\n' "$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)"
+     printf 'cron=%s\n' "$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)"; } > "$f"
+   kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
+     | kubectl -n new-api-stg replace -f -
+   shred -u "$f" 2>/dev/null || rm -f "$f"
+   kubectl -n new-api-stg rollout restart deploy/newapi-proxy && kubectl -n new-api-stg rollout status deploy/newapi-proxy
+   ```
+
+   Odoo 端的舊值留著無害（不會拿來簽），下次輪替時自然被擠掉。
+
+### break-glass
+
+只有負責人以 `helm upgrade --set proxy.breakGlassUntil=<unix 秒>` 開啟，最多 24 小時（chart 與代理都會擋），用完設回空字串（`helm upgrade -f deploy/woow-k3s*.yaml` 即恢復）。
