@@ -4,7 +4,8 @@
 WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 
 - 主 repo：Gitea `woow-paas/Woow_k3s_newapi`（改動一律送 Gitea PR）
-- 舊版：GitHub `WOOWTECH/Woow_k3s_newapi`（chart 2.x，`latest`＋NodePort，2026-10-04 已下線）
+- GitHub `WOOWTECH/Woow_k3s_newapi` 是 Gitea 的**單向公開鏡像**（`.gitea/workflows/mirror-to-github.yml` 推 main＋tag），不要在 GitHub 提交或開 PR
+- 舊版 chart 2.x（`latest`＋NodePort，2026-10-04 已下線）留在歷史裡：tag `legacy-v2.1.0`
 
 ## 架構
 
@@ -27,7 +28,7 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 1. `kubectl create ns new-api`
 2. `scripts/cf-tunnel.sh tunnel`（建 tunnel＋ingress＋connector Secret，**不建 DNS**）
 3. `helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait`
-4. port-forward 後 `scripts/bootstrap-root.sh http://127.0.0.1:3300`（`/api/setup` 先到先得，一定要在 DNS 之前）
+4. port-forward 後 `NEWAPI_ROOT_USER=<管理員帳號> scripts/bootstrap-root.sh http://127.0.0.1:3300`（`/api/setup` 先到先得，一定要在 DNS 之前）
 5. `scripts/newapi_admin.py --base http://127.0.0.1:3300 apply-settings deploy/settings.json`
 6. `scripts/cf-tunnel.sh dns`（公開網址生效）
 

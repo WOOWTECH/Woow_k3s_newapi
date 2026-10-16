@@ -23,7 +23,7 @@ export CF_API_TOKEN_FILE=/path/to/token   # 0600，用完刪
 scripts/cf-tunnel.sh tunnel                # tunnel woow-k3s-new-api + ingress + Secret
 helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait
 kubectl -n new-api port-forward svc/newapi 3300:3000 &
-NEWAPI_PUBLIC_URL=https://newapi.woowtech.io scripts/bootstrap-root.sh http://127.0.0.1:3300
+NEWAPI_ROOT_USER=<管理員帳號> NEWAPI_PUBLIC_URL=https://newapi.woowtech.io scripts/bootstrap-root.sh http://127.0.0.1:3300
 scripts/newapi_admin.py --base http://127.0.0.1:3300 apply-settings deploy/settings.json
 helm test newapi -n new-api
 scripts/cf-tunnel.sh dns                   # 這一步之後網址才對外
