@@ -35,9 +35,10 @@ spec:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
 ---
-# new-api (master + slaves): in from cloudflared, the helm test pod and the
-# listed in-cluster clients; out to its DB, Valkey, listed in-cluster
-# upstreams and the public internet (never private ranges).
+# new-api (master + slaves): in from cloudflared, the helm test pod, the
+# newapi-proxy pods (when enabled) and the listed in-cluster clients; out to
+# its DB, Valkey, listed in-cluster upstreams and the public internet (never
+# private ranges).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -58,6 +59,12 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "newapi.selector" (list . "test") | nindent 14 }}
+        {{- if .Values.proxy.enabled }}
+        # newapi-proxy (same namespace): the PaaS path, see templates/proxy.yaml
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
+        {{- end }}
         {{- range .Values.networkPolicy.clients }}
         - namespaceSelector:
             matchLabels:
@@ -141,6 +148,12 @@ spec:
             matchLabels:
               app.kubernetes.io/instance: {{ .Release.Name }}
               newapi.woowtech.io/serves-relay: "true"
+        {{- if .Values.proxy.enabled }}
+        # newapi-proxy's replay record; its ACL user may only SET its own keys.
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
+        {{- end }}
       ports:
         - { protocol: TCP, port: 6379 }
 ---
@@ -182,6 +195,15 @@ spec:
               newapi.woowtech.io/serves-relay: "true"
       ports:
         - { protocol: TCP, port: 3000 }
+    {{- if .Values.proxy.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8081 }
+    {{- end }}
 {{- if .Values.cloudflared.enabled }}
 ---
 # cloudflared: out to Cloudflare's edge (7844 QUIC/TCP, 443 for API) and to

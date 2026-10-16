@@ -33,3 +33,40 @@ networkPolicy:
         app.kubernetes.io/name: litellm
         app.kubernetes.io/component: app
       port: 4000
+
+# newapi-proxy for the stg sandboxes (AI-models design §1.4.1; LLM-01a).
+proxy:
+  enabled: true
+  image:
+    # Built by woow_paas_platform build-newapi-proxy run 20952 (workflow_dispatch
+    # on feat/llm-01a-newapi-proxy, commit 232eeab7), the digest that job
+    # printed. Feature-branch image for the LLM-01a stg acceptance only: after
+    # the proxy PR merges, re-pin to the develop merge commit's image
+    # (extra/newapi-proxy/README.md). Change it here, in git — never with
+    # helm --set, or the next `helm upgrade -f deploy/woow-k3s-stg.yaml` rolls
+    # back to a different image.
+    tag: 232eeab7683da2e52af937f464de8f7628b467fb
+    digest: sha256:52da4e80eaf4b0cf38ba1b24fb684d37ab627c7d424f9e56fe15dd58a4a856fd
+  # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
+  imagePullSecrets:
+    - name: newapi-proxy-registry
+  # Sandbox prefixes: "ws" + two lowercase letters + 10 digits (design N14).
+  usernameRegex: '^ws[a-z]{2}\d{10}$'
+  # Sandbox blocks 1-31 only (198.18.0.0 + 256 + block*4096 + id).
+  tenantIpRange: 198.18.17.0-198.19.255.255
+  # Expiry of the AP / OP now in Secret newapi-proxy-pats (its
+  # woowtech.io/ap-expires-at / op-expires-at annotations, unix seconds; dates
+  # are not secret). /readyz reports days left; PaaS alerts at 14 (DESIGN §7.3).
+  # Update together with every PAT rotation (docs/OPERATIONS.md).
+  apExpiresAt: "1807713552"
+  opExpiresAt: "1807713552"
+  clients:
+    # Odoo pods of dev sandboxes only: not their agent-runtime, nginx or
+    # pgadmin pods, nothing in paas-ws-stg-* or paas-stg-system.
+    - name: sandbox-odoo
+      namespaceSelector:
+        matchLabels:
+          dev-sandbox.io/managed: "true"
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: odoo

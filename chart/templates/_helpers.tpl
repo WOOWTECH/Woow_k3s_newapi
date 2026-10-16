@@ -101,3 +101,15 @@ capabilities:
   value: {{ $v | quote }}
 {{- end }}
 {{- end -}}
+
+{{/* proxy epoch values ("" | unix seconds | YYYY-MM-DD). Helm reads big YAML
+integers as float64; print them as plain integers, never 1.8e+09. */}}
+{{- define "newapi.proxyEpoch" -}}
+{{- if kindIs "float64" . -}}
+{{ int64 . }}
+{{- else if or (kindIs "int64" .) (kindIs "int" .) -}}
+{{ . }}
+{{- else -}}
+{{ default "" . }}
+{{- end -}}
+{{- end -}}

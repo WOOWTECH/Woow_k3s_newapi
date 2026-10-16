@@ -110,6 +110,97 @@ backup:
   storageClassName: longhorn
   size: 20Gi
 
+# newapi-proxy: the only in-cluster path from the PaaS Odoo pods to new-api
+# (code: woow_paas_platform extra/newapi-proxy; AI-models design §1.4). It
+# verifies Odoo's HMAC signature, whitelists every route and body, holds the
+# AP/OP service-account PATs and overwrites X-Forwarded-For with a synthetic
+# per-tenant IP. Off by default; site values turn it on and pin the digest.
+# Ports: 8080 signed proxy, 8081 /healthz /readyz /metrics. Enabling it also
+# adds the Valkey ACL user newapi-proxy (replay records shared by all
+# replicas), which restarts Valkey once.
+proxy:
+  enabled: false
+  # Two replicas + PodDisruptionBudget minAvailable 1. More than one replica
+  # needs the shared replay record: the chart always wires Valkey.
+  replicas: 2
+  image:
+    # Pushed by woow_paas_platform .gitea/workflows/build-newapi-proxy.yml.
+    repository: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy
+    # The 40-hex commit sha the image was built from (never latest); optional.
+    tag: ""
+    # Required when enabled: sha256:<64 hex>, as printed by the build job
+    # (the all-zero placeholder is refused).
+    digest: ""
+    pullPolicy: IfNotPresent
+  # jcr-prod is private: a dockerconfigjson Secret in the release namespace.
+  imagePullSecrets: []
+  # Secrets are never in values: create them with kubectl create/replace from
+  # stdin (docs/OPERATIONS.md). patsSecret keys: ap, op (service-account
+  # PATs). hmacSecret keys: web, cron, each "kid:secret[,kid:secret]" (current
+  # key first, next key after it for rotation).
+  patsSecret: newapi-proxy-pats
+  hmacSecret: newapi-proxy-hmac
+  # PaaS usernames this environment may create, log in, search and credit.
+  # Must be ^w<lowercase letter> followed only by [a-z0-9], simple [a-z0-9-]
+  # classes, \d and {n,m} counts, ending in $ (no ".", "*", "+", "|", groups):
+  # the chart and the proxy both refuse anything wider.
+  usernameRegex: '^wp\d{10}$'
+  # Synthetic client IPs accepted for identity "user" (prod block 0).
+  tenantIpRange: 198.18.1.0-198.19.255.255
+  # Platform-wide add_quota cap per sliding hour, in points (1 point =
+  # 15,625 quota); every replica gets an equal share. 0 blocks add_quota.
+  addQuotaHourlyCapPoints: 100000
+  # Concurrent upstream calls per identity; more get 503 busy at once.
+  inflight:
+    user: 32
+    ap: 8
+    op: 2
+    anon: 2
+    bg: 2
+  # Models a free-trial (group free) key may be limited to.
+  freeModels: qwen3-4b-aicoder,qwen3-4b-cluster1
+  # AP / OP expiry ("" | unix seconds | YYYY-MM-DD); /readyz reports days left.
+  apExpiresAt: ""
+  opExpiresAt: ""
+  # Break-glass identity bg: off unless set to unix seconds at most 24 h ahead
+  # (owner only, helm upgrade). Every bg call is audited.
+  breakGlassUntil: ""
+  # Upstream read timeout when the caller sends no X-Woow-Read-Timeout.
+  defaultReadTimeout: 10
+  # uvicorn limit_concurrency on 8080 (connections + in-flight tasks); the
+  # in-flight caps above add up to 46. Request headers must arrive within 5 s
+  # and the body within 5 s more, so slow senders cannot hold these slots.
+  maxConnections: 128
+  logLevel: info
+  # Pods allowed to call the proxy: NetworkPolicy ingress on 8080 and 8081,
+  # mirrored on egress (ephemeral ports only). Each entry needs BOTH a
+  # non-empty namespaceSelector and a non-empty podSelector that pins
+  # app.kubernetes.io/component (matchLabels, or matchExpressions "In"); the
+  # chart refuses anything wider. Prod:
+  #  - name: paas-odoo
+  #    namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: paas-system
+  #    podSelector:
+  #      matchLabels:
+  #        app.kubernetes.io/instance: paas-odoo-platform
+  #      matchExpressions:
+  #        - key: app.kubernetes.io/component
+  #          operator: In
+  #          values: [server, cron]
+  clients: []
+  # Memory worst case (extra/newapi-proxy/README.md): ~50 MiB base + bodies
+  # being read (128 connections x ~0.5 MiB) + responses (46 in flight x 2 x
+  # 1 MiB cap) ~= 210 MiB; 384Mi leaves room, so an OOM never turns an
+  # in-flight add_quota into "outcome unknown".
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 384Mi
+
 networkPolicy:
   # In-cluster upstreams new-api may call (e.g. a LiteLLM service). The
   # target namespace needs a matching ingress allow for new-api.

@@ -19,23 +19,59 @@ jobs:
           sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm || mv /tmp/linux-amd64/helm /usr/local/bin/helm
           helm version
 
+      # newapi-proxy digest placeholder: a hard failure, not a warning. The
+      # chart refuses it too (templates/proxy.yaml); this says why up front.
+      # The real <sha> + digest from build-newapi-proxy must be committed
+      # before the PR can go green (never patched in with helm --set).
+      - name: No placeholder image digests
+        run: |
+          set -euo pipefail
+          if grep -nE 'digest: *"?sha256:0{64}"?' deploy/*.yaml; then
+            echo "::error::deploy values still hold the all-zero placeholder digest: dispatch build-newapi-proxy and commit the tag + digest it printed"
+            exit 1
+          fi
+
       - name: Lint and render
         run: |
           set -euo pipefail
           helm lint ./chart
           helm lint ./chart -f deploy/woow-k3s.yaml
+          helm lint ./chart -f deploy/woow-k3s-stg.yaml
           helm template newapi ./chart -n new-api -f deploy/woow-k3s.yaml > /tmp/rendered.yaml
-          grep -c '^kind:' /tmp/rendered.yaml
+          helm template newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml > /tmp/rendered-stg.yaml
+          grep -c '^kind:' /tmp/rendered.yaml /tmp/rendered-stg.yaml
 
       - name: Images are pinned by digest
         run: |
           set -euo pipefail
-          bad=$(grep -E '^\s+image: ' /tmp/rendered.yaml | grep -v '@sha256:' || true)
-          if [ -n "$bad" ]; then echo "unpinned images:"; echo "$bad"; exit 1; fi
+          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml; do
+            bad=$(grep -E '^\s+image: ' "$f" | grep -v '@sha256:' || true)
+            if [ -n "$bad" ]; then echo "unpinned images in $f:"; echo "$bad"; exit 1; fi
+          done
+
+      # newapi-proxy (templates/proxy.yaml): off in prod until NA-05, on in stg.
+      - name: newapi-proxy component
+        run: |
+          set -euo pipefail
+          if grep -q '^  name: newapi-proxy$' /tmp/rendered.yaml; then
+            echo "newapi-proxy must stay disabled in deploy/woow-k3s.yaml for now"; exit 1
+          fi
+          for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
+            awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
+              /tmp/rendered-stg.yaml || { echo "stg render lacks the newapi-proxy $kind"; exit 1; }
+          done
+          if grep -q 'newapi-proxy[^@]*@sha256:0\{64\}' /tmp/rendered-stg.yaml; then
+            echo "::error::rendered stg values carry the placeholder proxy digest"; exit 1
+          fi
+
+      # The chart's fail() guards (digest, client selectors, username regex):
+      # unsafe values must keep failing, the real shapes must keep rendering.
+      - name: newapi-proxy chart guards
+        run: scripts/chart-guards.sh
 
       - name: Scripts parse
         run: |
           set -euo pipefail
           for f in scripts/*.sh; do bash -n "$f"; done
-          python3 -m py_compile scripts/newapi_admin.py
+          for f in scripts/*.py; do python3 -m py_compile "$f"; done
           python3 -c 'import json; json.load(open("deploy/settings.json"))'
