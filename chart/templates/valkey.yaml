@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "newapi.fullname" . }}-valkey
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "newapi.selector" (list . "valkey") | nindent 4 }}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "newapi.fullname" . }}-valkey
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: valkey
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "valkey") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "newapi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: valkey
+    spec:
+      automountServiceAccountToken: false
+      {{- include "newapi.affinity" . | nindent 6 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        {{- include "newapi.podSecurity" . | nindent 8 }}
+      containers:
+        - name: valkey
+          image: {{ include "newapi.image" .Values.valkey.image }}
+          imagePullPolicy: IfNotPresent
+          command: ["valkey-server"]
+          args:
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - {{ .Values.valkey.maxmemory | quote }}
+            - --maxmemory-policy
+            - volatile-lru
+            - --dir
+            - /data
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "newapi.secretName" . }}
+                  key: REDIS_PASSWORD
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "newapi.secretName" . }}
+                  key: REDIS_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["valkey-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            {{- include "newapi.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.valkey.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}

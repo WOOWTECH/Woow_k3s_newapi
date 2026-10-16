@@ -1,0 +1,41 @@
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "newapi.fullname" . }}-smoke
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  {{- include "newapi.affinity" . | nindent 2 }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    {{- include "newapi.podSecurity" . | nindent 4 }}
+  containers:
+    - name: smoke
+      # Reuse the app image (has wget) so the test pulls nothing new.
+      image: {{ include "newapi.image" .Values.newapi.image }}
+      command:
+        - sh
+        - -c
+        - |
+          set -eu
+          # Retry: NetworkPolicy allow rules for a new pod take a few seconds.
+          for i in $(seq 1 30); do
+            if out=$(wget -qO- http://{{ include "newapi.fullname" . }}:3000/api/status); then
+              echo "$out" | grep -q '"success":true' && { echo "status ok"; exit 0; }
+            fi
+            sleep 2
+          done
+          echo "new-api /api/status did not answer success:true" >&2
+          exit 1
+      securityContext:
+        {{- include "newapi.containerSecurity" . | nindent 8 }}
+{{- end }}

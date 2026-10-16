@@ -1,0 +1,82 @@
+# new-api 維運手冊
+
+適用：release `newapi`、namespace `new-api`、網址 <https://newapi.woowtech.io>。
+
+## 機密資料放哪裡
+
+| 東西 | 位置 | 注意 |
+|---|---|---|
+| `SESSION_SECRET`、`CRYPTO_SECRET`、DB／Valkey 密碼 | Secret `newapi-secrets`（chart 第一次安裝產生，`resource-policy: keep`） | 換 `SESSION_SECRET` 會讓所有人登出 |
+| Cloudflare connector token | Secret `newapi-cloudflared`（`scripts/cf-tunnel.sh tunnel` 寫入） | 不進 repo |
+| root 帳密 | 安裝者本機 `~/.config/newapi/root-credentials`（0600） | 第一次登入後到個人設定開 2FA |
+| Cloudflare API token | 只在執行 `cf-tunnel.sh` 時以 `CF_API_TOKEN_FILE` 指向的暫存檔 | 用完刪檔 |
+
+**new-api 把使用者 API key、渠道（上游）key、TOTP secret 都以明文存在 DB。** 備份 PVC
+`newapi-backup` 與任何 `pg_dump` 檔都要當機密資料處理。
+
+## 第一次安裝
+
+```bash
+kubectl create ns new-api
+kubectl label ns new-api app.kubernetes.io/part-of=woow-k3s-newapi
+export CF_API_TOKEN_FILE=/path/to/token   # 0600，用完刪
+scripts/cf-tunnel.sh tunnel                # tunnel woow-k3s-new-api + ingress + Secret
+helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait
+kubectl -n new-api port-forward svc/newapi 3300:3000 &
+NEWAPI_PUBLIC_URL=https://newapi.woowtech.io scripts/bootstrap-root.sh http://127.0.0.1:3300
+scripts/newapi_admin.py --base http://127.0.0.1:3300 apply-settings deploy/settings.json
+helm test newapi -n new-api
+scripts/cf-tunnel.sh dns                   # 這一步之後網址才對外
+kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放行 new-api
+```
+
+`/api/setup` 是匿名、先到先得：**DNS 必須在 bootstrap-root.sh 之後才建。**
+
+## 設定即程式碼
+
+`deploy/settings.json` 是正式站的系統選項。改設定請改這個檔再 `apply-settings`，
+不要只在後台點。目前重點：
+
+- 關閉所有自助註冊與第三方登入（帳號只由 PaaS 開）
+- 新使用者、邀請、簽到贈額全部為 0／關閉（GHSA-8r8v 計費溢位要先有餘額才打得動）
+- 關閉效能保護（它讀整台節點的 CPU／記憶體／磁碟，節點忙時會讓所有請求 503）
+- 重試 2 次、自動停用／恢復渠道
+- 關閉 JS 任務外掛（外掛讀得到渠道 key）
+
+## 升版
+
+1. 看上游 release notes 與 <https://github.com/QuantumNous/new-api/security/advisories>
+2. `scripts/verify-image.sh vX.Y.Z` → 把 tag＋digest 寫進 `chart/values.yaml`
+3. 先手動備份：`kubectl -n new-api create job --from=cronjob/newapi-pg-backup pre-upgrade-$(date +%m%d)`
+4. 送 Gitea PR，合併後 `helm upgrade ... --wait`；master 是 Recreate，會停約 10–30 秒
+5. `helm test newapi -n new-api`，並用一把測試 key 打 `/v1/chat/completions`
+
+只有最新版收安全修補，請至少每月升一次。
+
+## 備份與還原
+
+- CronJob `newapi-pg-backup` 每天 03:45（台北），`/backups/newapi-*.dump`，保留 `backup.keepDays` 天。
+- 還原（會覆蓋現有資料，先停 master）：
+
+```bash
+kubectl -n new-api scale deploy/newapi-master --replicas=0
+kubectl -n new-api exec -it newapi-postgres-0 -- sh -c \
+  'pg_restore -U newapi -d newapi --clean --if-exists /path/to/newapi-XXXX.dump'
+kubectl -n new-api scale deploy/newapi-master --replicas=1
+```
+
+dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛 `newapi-backup` 的 pod 複製過去。
+
+## 網路
+
+- 進：只有 cloudflared（與 helm test pod）能連 `newapi:3000`；`networkPolicy.clients` 可加叢集內客戶端。
+- 出：DB、Valkey、`networkPolicy.upstreams`（目前 LiteLLM svc203）、公網 80/443；私網（10/8、172.16/12、192.168/16、100.64/10、169.254/16）一律擋，防管理員把渠道 base URL 指到內網。
+- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 的真實 IP 是安全的。
+- 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
+
+## 已知限制
+
+- 沒有 `/metrics`；`/api/status` 不檢查 DB。
+- `/v1/messages/count_tokens` 回 404。
+- 每個模型都要先設價格（倍率），否則請求被拒。
+- 兌換碼、儲值、邀請返利要先在後台確認「金流合規條款」才能開。
