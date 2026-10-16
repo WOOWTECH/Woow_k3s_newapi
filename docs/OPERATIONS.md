@@ -94,3 +94,30 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 - 模型倍率＝LiteLLM 成本（倍率 1＝US$2／百萬 token），加價放在 `GroupRatio.default`。
 - 固定倍率不會跟著 OpenRouter 浮動價走（實測 DeepSeek V4.1 Flash 少收 56%）；要定期重算或把加價抓寬。
 - 帳號只由管理員建立；加額度用 `POST /api/user/manage {"action":"add_quota","mode":"add"}`（有稽核紀錄）。
+
+## staging（new-api-stg，2026-10-17 起）
+
+給 PaaS「AI 模型」分頁在 stg 實測用。與正式站同版、同 chart、同一份 `deploy/settings.json`，再疊 `deploy/settings-stg.json`。
+
+```bash
+kubectl create ns new-api-stg && kubectl label ns new-api-stg app.kubernetes.io/part-of=woow-k3s-newapi
+helm upgrade --install newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait
+kubectl apply -f deploy/litellm-from-newapi-stg-ingress.yaml
+kubectl -n new-api-stg port-forward svc/newapi 3301:3000 &
+NEWAPI_ROOT_USER=<root 名稱> scripts/bootstrap-root.sh http://127.0.0.1:3301 ~/.config/newapi-stg/root-credentials
+scripts/newapi_admin.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials apply-settings deploy/settings.json
+scripts/newapi_admin.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials apply-settings deploy/settings-stg.json
+scripts/apply_pricing.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials
+# LiteLLM 金鑰在 LiteLLM pod 內產生後直接 pipe 進 create_channels.py（不落地）：
+#   ... | scripts/create_channels.py --base http://127.0.0.1:3301 --creds ... --label stg --key-alias newapi-stg-litellm
+scripts/bootstrap_service_account.py --base http://127.0.0.1:3301 --root-creds ~/.config/newapi-stg/root-credentials \
+  --svc-user wpsvc-stg --svc-creds ~/.config/newapi-stg/service-account \
+  --namespace new-api-stg --secret newapi-proxy-pats --label stg
+```
+
+- 沒有公開網址（cloudflared 關閉）；呼叫一律走叢集內或 port-forward。
+- 上游：LiteLLM 金鑰 `newapi-stg-litellm`（US$1 預算，40 個付費模型＋2 個 Qwen）。
+- 服務帳號 `wpsvc-stg`（role 10，channel 權限關閉）；PAT 在 Secret `new-api-stg/newapi-proxy-pats`（key `ap`、`op`，180 天到期，到期日在 annotation）。
+- stg 的 root 不開 2FA，好讓 `bootstrap_service_account.py` 用密碼取得 step-up proof；正式站的 root 有 2FA，這幾步要在瀏覽器做。
+- **Secret 一律用 create／replace 寫入，不要 `kubectl apply`**：apply 會把整個物件（含 token）複製進 `last-applied-configuration` 註解。
+- 經 port-forward 時 new-api 看到的來源 IP 都是 127.0.0.1，登入、verify、建 PAT 共用同一個 20 次／20 分的桶。

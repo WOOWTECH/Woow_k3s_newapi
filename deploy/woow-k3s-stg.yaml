@@ -1,0 +1,35 @@
+# Staging values for woow-k3s (release newapi, namespace new-api-stg).
+# Used by the PaaS "AI 模型" tab on staging; no public hostname yet
+# (cloudflared off), callers reach it in-cluster.
+#   helm upgrade --install newapi ./chart -n new-api-stg --create-namespace -f deploy/woow-k3s-stg.yaml
+publicUrl: https://newapi-stg.woowtech.io
+
+cloudflared:
+  enabled: false
+
+postgres:
+  size: 5Gi
+
+backup:
+  size: 5Gi
+  keepDays: 7
+
+newapi:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      cpu: "1"
+      memory: 768Mi
+
+networkPolicy:
+  upstreams:
+    # Same LiteLLM as production (svc203), through a separate small-budget key.
+    - name: litellm-svc203
+      namespace: paas-ws-32e92be2
+      podLabels:
+        app.kubernetes.io/instance: svc-a8389061
+        app.kubernetes.io/name: litellm
+        app.kubernetes.io/component: app
+      port: 4000
