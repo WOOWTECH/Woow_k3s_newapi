@@ -38,14 +38,13 @@ networkPolicy:
 proxy:
   enabled: true
   image:
-    # Built by woow_paas_platform build-newapi-proxy run 20952 (workflow_dispatch
-    # on feat/llm-01a-newapi-proxy, commit 232eeab7), the digest that job
-    # printed. Feature-branch image for the LLM-01a stg acceptance only: after
-    # the proxy PR merges, re-pin to the develop merge commit's image
-    # (extra/newapi-proxy/README.md). Change it here, in git — never with
-    # helm --set, or the next `helm upgrade -f deploy/woow-k3s-stg.yaml` rolls
-    # back to a different image.
-    tag: 232eeab7683da2e52af937f464de8f7628b467fb
+    # Built by woow_paas_platform build-newapi-proxy on develop after PR #1764
+    # merged (run 21004, merge commit 59b03479). The digest equals the
+    # feature-branch build that passed the LLM-01a stg acceptance (232eeab7,
+    # run 20952): the build is reproducible. Change it here, in git — never
+    # with helm --set, or the next `helm upgrade -f deploy/woow-k3s-stg.yaml`
+    # rolls back to a different image.
+    tag: 59b03479ef833b1b62260692431a03782bb7b47c
     digest: sha256:52da4e80eaf4b0cf38ba1b24fb684d37ab627c7d424f9e56fe15dd58a4a856fd
   # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
   imagePullSecrets:
