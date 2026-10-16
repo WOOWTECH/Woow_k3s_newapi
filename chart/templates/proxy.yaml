@@ -1,0 +1,258 @@
+{{- /*
+newapi-proxy: the only in-cluster path from the PaaS Odoo pods to new-api
+(code: woow_paas_platform extra/newapi-proxy; AI-models design §1.4, ticket
+LLM-01a). It verifies Odoo's HMAC signature, whitelists and canonicalises
+every request, injects the AP/OP service-account PATs it alone holds and
+overwrites X-Forwarded-For with a synthetic per-tenant IP.
+*/ -}}
+{{- if .Values.proxy.enabled }}
+{{- $fn := include "newapi.fullname" . -}}
+{{- $p := .Values.proxy -}}
+{{- $img := $p.image -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" (default "" $img.digest)) }}
+{{- fail "proxy.image.digest must be sha256:<64 hex> (the digest build-newapi-proxy printed)" }}
+{{- end }}
+{{- if and $img.tag (not (regexMatch "^[0-9a-f]{40}$" $img.tag)) }}
+{{- fail "proxy.image.tag must be empty or the 40-hex commit sha (never latest)" }}
+{{- end }}
+{{- if not $p.clients }}
+{{- fail "proxy.clients must list the Odoo pods allowed to call the proxy" }}
+{{- end }}
+{{- range $p.clients }}
+{{- if not (and .name .namespaceSelector .podSelector) }}
+{{- fail "each proxy.clients entry needs name, namespaceSelector and podSelector (never a whole namespace)" }}
+{{- end }}
+{{- end }}
+{{- if not (and $p.patsSecret $p.hmacSecret) }}
+{{- fail "proxy.patsSecret and proxy.hmacSecret are required" }}
+{{- end }}
+{{- if not (regexMatch "^\\^.*\\$$" (default "" $p.usernameRegex)) }}
+{{- fail "proxy.usernameRegex must be anchored with ^ and $" }}
+{{- end }}
+{{- $until := include "newapi.proxyEpoch" $p.breakGlassUntil }}
+{{- if $until }}
+{{- if not (regexMatch "^[0-9]{1,12}$" $until) }}
+{{- fail "proxy.breakGlassUntil must be unix seconds" }}
+{{- end }}
+{{- if gt (atoi $until) (add (now | unixEpoch) 86400) }}
+{{- fail "proxy.breakGlassUntil may be at most 24 hours ahead" }}
+{{- end }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fn }}-proxy
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+data:
+  PROXY_UPSTREAM_URL: "http://{{ $fn }}:3000"
+  PROXY_USERNAME_REGEX: {{ $p.usernameRegex | quote }}
+  PROXY_TENANT_IP_RANGE: {{ $p.tenantIpRange | quote }}
+  PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: {{ $p.addQuotaHourlyCapPoints | int64 | toString | quote }}
+  PROXY_REPLICAS: {{ $p.replicas | int | toString | quote }}
+  PROXY_INFLIGHT_USER: {{ $p.inflight.user | int | toString | quote }}
+  PROXY_INFLIGHT_AP: {{ $p.inflight.ap | int | toString | quote }}
+  PROXY_INFLIGHT_OP: {{ $p.inflight.op | int | toString | quote }}
+  PROXY_INFLIGHT_ANON: {{ $p.inflight.anon | int | toString | quote }}
+  PROXY_INFLIGHT_BG: {{ $p.inflight.bg | int | toString | quote }}
+  PROXY_FREE_MODELS: {{ $p.freeModels | quote }}
+  PROXY_AP_EXPIRES_AT: {{ include "newapi.proxyEpoch" $p.apExpiresAt | quote }}
+  PROXY_OP_EXPIRES_AT: {{ include "newapi.proxyEpoch" $p.opExpiresAt | quote }}
+  PROXY_BREAK_GLASS_UNTIL: {{ $until | quote }}
+  PROXY_DEFAULT_READ_TIMEOUT: {{ $p.defaultReadTimeout | int | toString | quote }}
+  PROXY_LOG_LEVEL: {{ $p.logLevel | quote }}
+  PROXY_PORT: "8080"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fn }}-proxy
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "newapi.selector" (list . "proxy") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fn }}-proxy
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ $p.replicas | int }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Readiness = upstream reachable, so a new pod only takes traffic once
+      # it can actually serve; never drop below the current capacity.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "proxy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "newapi.labels" . | nindent 8 }}
+        app.kubernetes.io/component: proxy
+      annotations:
+        checksum/config: {{ toYaml $p | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      {{- with $p.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "newapi.affinity" . | nindent 6 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "proxy") | nindent 14 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        {{- include "newapi.podSecurity" . | nindent 8 }}
+      containers:
+        - name: proxy
+          image: "{{ $img.repository }}{{ if $img.tag }}:{{ $img.tag }}{{ end }}@{{ $img.digest }}"
+          imagePullPolicy: {{ $img.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ $fn }}-proxy
+          env:
+            # Values never live in git or values files: these Secrets are
+            # created with kubectl create/replace from stdin (docs/OPERATIONS.md).
+            - name: PROXY_AP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.patsSecret }}
+                  key: ap
+            - name: PROXY_OP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.patsSecret }}
+                  key: op
+            - name: PROXY_AUTH_WEB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.hmacSecret }}
+                  key: web
+            - name: PROXY_AUTH_CRON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $p.hmacSecret }}
+                  key: cron
+          ports:
+            - name: http
+              containerPort: 8080
+          # /readyz answers 200 only when new-api's /api/status does (k3s
+          # NetworkPolicy takes a few seconds to admit a new pod).
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                # Keep serving while the endpoint is removed from the Service.
+                command: ["sleep", "5"]
+          securityContext:
+            {{- include "newapi.containerSecurity" . | nindent 12 }}
+          resources:
+            {{- toYaml $p.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 16Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fn }}-proxy
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "proxy") | nindent 6 }}
+---
+# In: only the listed Odoo pods (namespace AND pod selector, never a whole
+# namespace) and the helm test pod, on 8080. Out: new-api 3000 (DNS comes from
+# the release-wide allow-dns policy) plus a mirror of the ingress sources:
+# k3s' embedded enforcer treats some reply packets as fresh egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-proxy
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "proxy") | nindent 6 }}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        {{- range $p.clients }}
+        # {{ .name }}
+        - namespaceSelector:
+            {{- toYaml .namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .podSelector | nindent 12 }}
+        {{- end }}
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "test") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              newapi.woowtech.io/serves-relay: "true"
+      ports:
+        - { protocol: TCP, port: 3000 }
+    - to:
+        {{- range $p.clients }}
+        - namespaceSelector:
+            {{- toYaml .namespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml .podSelector | nindent 12 }}
+        {{- end }}
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "test") | nindent 14 }}
+{{- end }}

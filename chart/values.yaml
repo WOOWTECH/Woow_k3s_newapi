@@ -110,6 +110,78 @@ backup:
   storageClassName: longhorn
   size: 20Gi
 
+# newapi-proxy: the only in-cluster path from the PaaS Odoo pods to new-api
+# (code: woow_paas_platform extra/newapi-proxy; AI-models design §1.4). It
+# verifies Odoo's HMAC signature, whitelists every route and body, holds the
+# AP/OP service-account PATs and overwrites X-Forwarded-For with a synthetic
+# per-tenant IP. Off by default; site values turn it on and pin the digest.
+proxy:
+  enabled: false
+  # Two replicas + PodDisruptionBudget minAvailable 1.
+  replicas: 2
+  image:
+    # Pushed by woow_paas_platform .gitea/workflows/build-newapi-proxy.yml.
+    repository: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy
+    # The 40-hex commit sha the image was built from (never latest); optional.
+    tag: ""
+    # Required when enabled: sha256:<64 hex>, as printed by the build job.
+    digest: ""
+    pullPolicy: IfNotPresent
+  # jcr-prod is private: a dockerconfigjson Secret in the release namespace.
+  imagePullSecrets: []
+  # Secrets are never in values: create them with kubectl create/replace from
+  # stdin (docs/OPERATIONS.md). patsSecret keys: ap, op (service-account
+  # PATs). hmacSecret keys: web, cron, each "kid:secret[,kid:secret]" (current
+  # key first, next key after it for rotation).
+  patsSecret: newapi-proxy-pats
+  hmacSecret: newapi-proxy-hmac
+  # PaaS usernames this environment may create, log in, search and credit.
+  usernameRegex: '^wp\d{10}$'
+  # Synthetic client IPs accepted for identity "user" (prod block 0).
+  tenantIpRange: 198.18.1.0-198.19.255.255
+  # Platform-wide add_quota cap per sliding hour, in points (1 point =
+  # 15,625 quota); every replica gets an equal share. 0 blocks add_quota.
+  addQuotaHourlyCapPoints: 100000
+  # Concurrent upstream calls per identity; more get 503 busy at once.
+  inflight:
+    user: 32
+    ap: 8
+    op: 2
+    anon: 2
+    bg: 2
+  # Models a free-trial (group free) key may be limited to.
+  freeModels: qwen3-4b-aicoder,qwen3-4b-cluster1
+  # AP / OP expiry ("" | unix seconds | YYYY-MM-DD); /readyz reports days left.
+  apExpiresAt: ""
+  opExpiresAt: ""
+  # Break-glass identity bg: off unless set to unix seconds at most 24 h ahead
+  # (owner only, helm upgrade). Every bg call is audited.
+  breakGlassUntil: ""
+  # Upstream read timeout when the caller sends no X-Woow-Read-Timeout.
+  defaultReadTimeout: 10
+  logLevel: info
+  # Pods allowed to call the proxy: NetworkPolicy ingress on 8080, mirrored on
+  # egress. Each entry needs BOTH selectors, never a whole namespace. Prod:
+  #  - name: paas-odoo
+  #    namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: paas-system
+  #    podSelector:
+  #      matchLabels:
+  #        app.kubernetes.io/instance: paas-odoo-platform
+  #      matchExpressions:
+  #        - key: app.kubernetes.io/component
+  #          operator: In
+  #          values: [server, cron]
+  clients: []
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
 networkPolicy:
   # In-cluster upstreams new-api may call (e.g. a LiteLLM service). The
   # target namespace needs a matching ingress allow for new-api.

@@ -28,14 +28,25 @@ spec:
         - |
           set -eu
           # Retry: NetworkPolicy allow rules for a new pod take a few seconds.
+          ok=0
           for i in $(seq 1 30); do
             if out=$(wget -qO- http://{{ include "newapi.fullname" . }}:3000/api/status); then
-              echo "$out" | grep -q '"success":true' && { echo "status ok"; exit 0; }
+              echo "$out" | grep -q '"success":true' && { echo "status ok"; ok=1; break; }
             fi
             sleep 2
           done
-          echo "new-api /api/status did not answer success:true" >&2
-          exit 1
+          [ "$ok" = 1 ] || { echo "new-api /api/status did not answer success:true" >&2; exit 1; }
+          {{- if .Values.proxy.enabled }}
+          # newapi-proxy is Ready only when it reaches new-api; /readyz says so.
+          ok=0
+          for i in $(seq 1 30); do
+            if out=$(wget -qO- http://{{ include "newapi.fullname" . }}-proxy:8080/readyz); then
+              echo "$out" | grep -q '"ready":true' && { echo "proxy ready"; ok=1; break; }
+            fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "newapi-proxy /readyz did not answer ready:true" >&2; exit 1; }
+          {{- end }}
       securityContext:
         {{- include "newapi.containerSecurity" . | nindent 8 }}
 {{- end }}
