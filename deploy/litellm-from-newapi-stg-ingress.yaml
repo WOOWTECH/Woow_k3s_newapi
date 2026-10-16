@@ -1,5 +1,5 @@
 # Applied in the LiteLLM namespace (not part of the Helm release); staging new-api.
-#   kubectl apply -f deploy/litellm-from-newapi-ingress.yaml
+#   kubectl apply -f deploy/litellm-from-newapi-stg-ingress.yaml
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

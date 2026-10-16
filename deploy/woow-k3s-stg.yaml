@@ -38,9 +38,13 @@ networkPolicy:
 proxy:
   enabled: true
   image:
-    # PLACEHOLDER until build-newapi-proxy has pushed the first image: the stg
-    # deployment step replaces tag and digest with the pushed <sha> and its
-    # sha256 digest (this all-zero digest can never be pulled).
+    # PLACEHOLDER — the chart and CI refuse this all-zero digest on purpose, so
+    # this branch cannot be deployed or merged before it is replaced. Order:
+    # push the woow_paas_platform branch, dispatch build-newapi-proxy on it,
+    # then commit the printed <sha> (tag) and sha256 digest here, in git —
+    # never with helm --set, or the next `helm upgrade -f deploy/woow-k3s-stg.yaml`
+    # rolls back to an image that cannot be pulled. After the proxy PR merges,
+    # re-pin to the develop merge commit's image (extra/newapi-proxy/README.md).
     tag: ""
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
   # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
@@ -50,9 +54,12 @@ proxy:
   usernameRegex: '^ws[a-z]{2}\d{10}$'
   # Sandbox blocks 1-31 only (198.18.0.0 + 256 + block*4096 + id).
   tenantIpRange: 198.18.17.0-198.19.255.255
-  # Filled in from the newapi-proxy-pats Secret's expiry at deploy time.
-  apExpiresAt: ""
-  opExpiresAt: ""
+  # Expiry of the AP / OP now in Secret newapi-proxy-pats (its
+  # woowtech.io/ap-expires-at / op-expires-at annotations, unix seconds; dates
+  # are not secret). /readyz reports days left; PaaS alerts at 14 (DESIGN §7.3).
+  # Update together with every PAT rotation (docs/OPERATIONS.md).
+  apExpiresAt: "1807713552"
+  opExpiresAt: "1807713552"
   clients:
     # Odoo pods of dev sandboxes only: not their agent-runtime, nginx or
     # pgadmin pods, nothing in paas-ws-stg-* or paas-stg-system.
