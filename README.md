@@ -17,7 +17,8 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 | `newapi-valkey` | Valkey 8.1（Redis 相容、BSD），只當快取，有密碼、不落地 |
 | `newapi-cloudflared` | Cloudflare Tunnel connector ×2（遠端管理 tunnel `woow-k3s-new-api`） |
 | `newapi-pg-backup` | 每天 03:45（台北）`pg_dump -Fc` 到備份 PVC，保留 14 天 |
-| NetworkPolicy | 全部 default-deny；new-api 只收 cloudflared，只出 DB、Valkey、LiteLLM（svc203）與公網 80/443（擋私網） |
+| `newapi-proxy` | 選用（`proxy.enabled`，預設關；stg 開）×2＋PDB：PaaS Odoo 呼叫 new-api 的唯一通道，驗 HMAC 簽章、白名單路由與 body、注入服務帳號 PAT、XFF 一律覆寫成合成 IP（程式在 `woow_paas_platform` 的 `extra/newapi-proxy/`，image 以 digest 釘住） |
+| NetworkPolicy | 全部 default-deny；new-api 只收 cloudflared 與同 ns 的 `newapi-proxy`，只出 DB、Valkey、LiteLLM（svc203）與公網 80/443（擋私網）；`newapi-proxy` 只收 `proxy.clients` 列的 Odoo pod |
 
 上游映像釘 tag＋digest，升版前用 `scripts/verify-image.sh` 驗 cosign 簽章。
 

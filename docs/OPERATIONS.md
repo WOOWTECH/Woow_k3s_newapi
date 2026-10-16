@@ -69,9 +69,9 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 
 ## 網路
 
-- 進：只有 cloudflared（與 helm test pod）能連 `newapi:3000`；`networkPolicy.clients` 可加叢集內客戶端。
+- 進：只有 cloudflared、同 ns 的 `newapi-proxy`（`proxy.enabled` 時）與 helm test pod 能連 `newapi:3000`；`networkPolicy.clients` 可加叢集內客戶端。
 - 出：DB、Valkey、`networkPolicy.upstreams`（目前 LiteLLM svc203）、公網 80/443；私網（10/8、172.16/12、192.168/16、100.64/10、169.254/16）一律擋，防管理員把渠道 base URL 指到內網。
-- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 的真實 IP 是安全的。
+- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 與同 ns 的 `newapi-proxy` 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 是安全的。`newapi-proxy` 一律把 XFF 覆寫成單一合成 IP（198.18.0.0/15：`.0.1` AP、`.0.2` 健康檢查、`.0.3` OP、`.0.4` break-glass，其餘是 PaaS 租戶；對照表在 PaaS），所以 new-api 記到 PaaS 來的 IP 都是合成 IP，限流也按租戶計。
 - 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
 
 ## 已知限制
@@ -121,3 +121,46 @@ scripts/bootstrap_service_account.py --base http://127.0.0.1:3301 --root-creds ~
 - stg 的 root 不開 2FA，好讓 `bootstrap_service_account.py` 用密碼取得 step-up proof；正式站的 root 有 2FA，這幾步要在瀏覽器做。
 - **Secret 一律用 create／replace 寫入，不要 `kubectl apply`**：apply 會把整個物件（含 token）複製進 `last-applied-configuration` 註解。
 - 經 port-forward 時 new-api 看到的來源 IP 都是 127.0.0.1，登入、verify、建 PAT 共用同一個 20 次／20 分的桶。
+
+## newapi-proxy（PaaS → new-api 的唯一通道）
+
+程式碼與線上契約在 PaaS repo（`woow_paas_platform` 的 `extra/newapi-proxy/README.md`）；本 chart 只負責部署（`chart/templates/proxy.yaml`，`proxy.*` values）。prod 目前關閉（NA-05 才開）；stg 在 `deploy/woow-k3s-stg.yaml` 打開。
+
+| 物件 | 說明 |
+|---|---|
+| Deployment `newapi-proxy` | 2 replica、`maxUnavailable: 0`；readiness＝`/readyz`（打得通 new-api 的 `/api/status` 才 Ready）、liveness＝`/healthz`；uid 65532、root FS 唯讀 |
+| PodDisruptionBudget `newapi-proxy` | `minAvailable: 1` |
+| Service `newapi-proxy:8080` | Odoo 端 `newapi_proxy_url` 指這裡（stg：`http://newapi-proxy.new-api-stg.svc.cluster.local:8080`） |
+| NetworkPolicy `newapi-proxy` | 進：`proxy.clients` 每一項都是「namespaceSelector **且** podSelector」，外加 helm test pod，8080；出：new-api 3000＋鏡射 ingress 來源（k3s 內建 enforcer 會把部分回包當成新的 egress），DNS 走 release 共用的 allow-dns |
+| ConfigMap `newapi-proxy` | 前綴 regex、租戶 IP 範圍、加額度每小時總量、in-flight 上限、免費模型、AP／OP 到期日、break-glass |
+
+### Secret（值不進 repo、不進任何檔案或 log）
+
+一律從 stdin `kubectl create`／`replace`，**不要 `kubectl apply`**（會把值複製進 `last-applied-configuration` 註解），也不要 `get -o yaml` 印出來。
+
+| Secret | key | 內容 |
+|---|---|---|
+| `newapi-proxy-pats` | `ap`、`op` | 服務帳號 AP 與 root 的 `option:read` OP（stg 由 `scripts/bootstrap_service_account.py` 寫入，到期日在 annotation） |
+| `newapi-proxy-hmac` | `web`、`cron` | 代理端簽章金鑰，各自是 `kid:secret[,kid:secret]`（現用在前、下一把在後；kid `[A-Za-z0-9_-]{1,64}`、secret `[A-Za-z0-9_-]{32,256}`；兩組的 kid 與 secret 都不能重複）。Odoo 端拿同樣的值：stg 放 `paas-stg-system/paas-stg-newapi-proxy-client`（key `web`、`cron`），prod 放 `fleet-local/paas-odoo-fleet-secrets` |
+| `newapi-proxy-registry` | `.dockerconfigjson` | 拉 `jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy` 的唯讀憑證（`proxy.imagePullSecrets`） |
+
+產生新金鑰的寫法（值不顯示，只短暫落在 0600 暫存檔、建完 Secret 立刻刪除），例：
+
+```bash
+k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
+umask 077; f=$(mktemp)
+{ printf 'web='; k web-$(date +%Y%m%d); printf '\ncron='; k cron-$(date +%Y%m%d); printf '\n'; } > "$f"
+kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
+  | kubectl -n new-api-stg create -f -      # 已存在就把最後的 create 換成 replace
+# Odoo 端複本用同一個檔案建，然後立刻刪檔
+shred -u "$f" 2>/dev/null || rm -f "$f"
+```
+
+stg 與 prod 的簽章金鑰、AP、OP 必須全部不同（NA-05 驗收）。
+
+### 升版與輪替
+
+- 新 image：PaaS repo 的 `build-newapi-proxy` workflow（develop／main 自動，或在分支手動 dispatch）只推 `newapi-proxy:<commit sha>`，job log 最後印出 digest；把 `proxy.image.tag`（sha）與 `proxy.image.digest` 改進 `deploy/woow-k3s*.yaml`，走本 repo 的 PR，再 `helm upgrade`。chart 拒絕沒有 digest、或 tag 不是 40 位 sha 的設定。
+- 簽章金鑰輪替：先把新金鑰加到 `newapi-proxy-hmac` 對應 key 的**後面**（代理接受清單內任一把）並重啟代理 → Odoo 改用新金鑰簽 → 拿掉舊金鑰再重啟一次。
+- AP／OP 到期日寫進 `proxy.apExpiresAt`／`proxy.opExpiresAt`（unix 秒或 `YYYY-MM-DD`），`/readyz` 回剩餘天數，PaaS 健康檢查在剩 14 天時告警。
+- break-glass：只有負責人以 `helm upgrade --set proxy.breakGlassUntil=<unix 秒>` 開啟，最多 24 小時（chart 與代理都會擋），用完設回空字串。
