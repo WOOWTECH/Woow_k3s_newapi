@@ -293,7 +293,7 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 | LiteLLM svc203 · API（可販售） | vLLM（62） | `default` | 40 個 OpenRouter 模型＋2 個自架 Qwen3-4B |
 | LiteLLM svc203 · ChatGPT 訂閱（內部測試） | vLLM（62） | `internal` | 22 個 `chatgpt/`、`toypark1234/`、`apporo/` 模型 |
 
-- 目標配置（DESIGN §7.2）在 `deploy/pricing/channels.json`：付費渠道只放 plan 的 27 個 API 模型，兩個 Qwen 移到 `free` 分組的「LiteLLM svc203 · 免費試用（自架 Qwen）」（`param_override` 把 `max_tokens` 限在 2048）。LiteLLM 成本 0 的 13 個模型（OpenRouter `:free`、`openrouter/free` 等）不賣，列在 plan 的 `unpriced`：倍率 0 在 rc.44 對任何分組都是免費、不計費，也不受免費分組的限流與每日上限管（NA-02 審查；要賣就先給非 0 價格，負責人決定）。stg 的付費渠道在 NA-01 時還有這 13 個（`apply-channels --dry-run` 會報 DRIFT、`verify-settings` 的 `paid-models-priced` 會失敗），要 `apply-channels --update` 才會對齊；正式站在 NA-04 以 `apply-channels --update` 套用後更新本表。
+- 目標配置（DESIGN §7.2）在 `deploy/pricing/channels.json`：付費渠道只放 plan 的 27 個 API 模型，兩個 Qwen 移到 `free` 分組的「LiteLLM svc203 · 免費試用（自架 Qwen）」（`param_override` 把 `max_tokens` 限在 2048）。LiteLLM 成本 0 的 13 個模型（OpenRouter `:free`、`openrouter/free` 等）不賣，列在 plan 的 `unpriced`：倍率 0 在 rc.44 對任何分組都是免費、不計費，也不受免費分組的限流與每日上限管（NA-02 審查；負責人 2026-10-17 決定不賣，D20；日後要賣就先在 plan 給非 0 價格再移回 `api`）。stg 的付費渠道在 NA-01 時還有這 13 個，2026-10-17 已依 D20 移除（40 → 27；之後 `apply-channels --dry-run` 兩個渠道都 ok、`paid-models-priced` 通過）；正式站在 NA-04 以 `apply-channels --update` 套用後更新本表。
 - 兩個渠道共用 LiteLLM 金鑰 `newapi-litellm`（US$5 預算）；base URL 走叢集內 `svc-a8389061-litellm.paas-ws-32e92be2.svc.cluster.local:4000`。
 - vLLM 渠道固定 6 條 `converter: none` 路由：Chat／Messages／Responses 原樣轉給 LiteLLM。
 - `internal` 不在 `UserUsableGroups`：只有自身分組是 `internal` 的帳號用得到，一般帳號建 token 也選不到。
