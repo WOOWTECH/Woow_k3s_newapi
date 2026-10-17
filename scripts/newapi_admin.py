@@ -1098,6 +1098,12 @@ def _norm_set(s):
     return sorted(x.strip() for x in (s or "").split(",") if x.strip())
 
 
+def _count_sample(names, n=5):
+    """'13 [a, b, c, d, e, ...]': the count, so a cut-off list is not read as all of it."""
+    s = sorted(names)
+    return f"{len(s)} {s[:n]}" + ("..." if len(s) > n else "")
+
+
 def channel_diff(want, have):
     diff = []
     for f in CHANNEL_FIELDS:
@@ -1114,7 +1120,7 @@ def channel_diff(want, have):
         if not eq:
             if f == "models":
                 ws, hs = set(_norm_set(w)), set(_norm_set(h))
-                diff.append(f"models +{sorted(ws - hs)[:5]} -{sorted(hs - ws)[:5]}")
+                diff.append(f"models +{_count_sample(ws - hs)} -{_count_sample(hs - ws)}")
             else:
                 diff.append(f"{f} {short(h, 60)} -> {short(w, 60)}")
     return diff

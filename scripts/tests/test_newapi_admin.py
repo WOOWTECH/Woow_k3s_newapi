@@ -962,6 +962,7 @@ class TestChannels(Base):
         self.assertEqual(rc, 1)
         self.assertIn("DRIFT", out)
         self.assertIn("qwen3-4b-aicoder", out)
+        self.assertIn("models +0 [] -2 ['qwen3-4b-aicoder', 'qwen3-4b-cluster1']", out)
         rc, out, _ = self.apply("--dry-run", target=None)
         self.assertEqual(rc, 1)
         rc, out, _ = self.apply("--update")
@@ -971,6 +972,13 @@ class TestChannels(Base):
         self.assertEqual(paid["key"], "sk-" + "P" * 22)
         self.assertEqual(na._norm_set(paid["models"]), sorted(PLAN["api"]))
         self.assertEqual(self.apply()[0], 0)
+
+    def test_model_drift_gives_the_count_when_cut(self):
+        want = {f: None for f in na.CHANNEL_FIELDS}
+        want["models"] = ",".join(f"m{i:02d}" for i in range(13))
+        have = dict(want, models="m00")
+        (line,) = na.channel_diff(want, have)
+        self.assertEqual(line, "models +12 ['m01', 'm02', 'm03', 'm04', 'm05']... -0 []")
 
     def test_duplicate_names_refused(self):
         self.apply("--key-file", self.key_file)
