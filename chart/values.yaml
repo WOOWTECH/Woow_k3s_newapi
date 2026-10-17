@@ -34,8 +34,11 @@ newapi:
   # The image has no USER; it runs fine as non-root once /data and /tmp are
   # writable emptyDirs (no SQLite, file logging disabled with --log-dir=).
   runAsUser: 65532
-  # Behind cloudflared only (NetworkPolicy): trust the pod CIDR so
-  # X-Forwarded-For from cloudflared gives the real client IP.
+  # new-api takes the client IP from X-Forwarded-For of any pod in this
+  # CIDR. Safe only because the NetworkPolicy lets nothing else in than
+  # cloudflared (real client IP), the same-namespace newapi-proxy (drops the
+  # incoming XFF and always sets a synthetic 198.18.0.0/15 IP) and the helm
+  # test pod. Every networkPolicy.clients entry can forge XFF as well.
   trustedProxies: 10.42.0.0/16
   env:
     TZ: Asia/Taipei
@@ -212,12 +215,15 @@ networkPolicy:
   #      app.kubernetes.io/name: litellm
   #      app.kubernetes.io/component: app
   #    port: 4000
-  # In-cluster clients allowed to reach new-api:3000 directly.
+  # In-cluster clients allowed to reach new-api:3000 directly. new-api trusts
+  # their X-Forwarded-For (newapi.trustedProxies is the pod CIDR), so a client
+  # here can pick any rate-limit bucket and audit IP: list only proxies that
+  # overwrite XFF themselves. The PaaS goes through newapi-proxy, never here.
   clients: []
-  #  - name: pi7
-  #    namespace: paas-ws-32e92be2
+  #  - name: xff-rewriting-proxy
+  #    namespace: <its namespace>
   #    podLabels:
-  #      app.kubernetes.io/instance: svc-08cf5049
+  #      app.kubernetes.io/instance: <its instance>
   # Private ranges new-api and cloudflared must never reach on the internet
   # egress rule (SSRF guard for admin-set channel base URLs).
   privateCidrs:

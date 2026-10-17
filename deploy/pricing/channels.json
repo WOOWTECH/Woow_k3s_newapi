@@ -1,0 +1,28 @@
+{
+ "_comment": "Channels of every new-api (prod and stg alike; AI-models DESIGN §7.2). Create with scripts/newapi_admin.py apply-channels; the LiteLLM key comes from --key-file / --key-env and is never stored here. \"models\" names a list in pricing-plan.json. Change this file (and re-run apply-channels --update, then verify-settings), not the console.",
+ "_comment_free": "free = the self-hosted Qwen trial (GroupRatio.free 0, D11). It must serve only pricing-plan.json \"local\", and those models must never sit in a paid group: a model in group free is free for everyone (verify-settings checks both through /api/pricing). The reverse holds too: a model with ModelRatio 0 is free in a paid group as well, so paid channels serve only priced models (pricing-plan.json \"unpriced\" stays out; checked offline and live). param_override caps max_tokens (starting point 2048; tune after the NA-08 load test).",
+ "type": 62,
+ "base_url": "http://svc-a8389061-litellm.paas-ws-32e92be2.svc.cluster.local:4000",
+ "channels": [
+  {
+   "name": "LiteLLM svc203 · API（可販售）",
+   "group": "default",
+   "models": "api",
+   "test_model": "openai/gpt-6-luna"
+  },
+  {
+   "name": "LiteLLM svc203 · 免費試用（自架 Qwen）",
+   "group": "free",
+   "models": "local",
+   "test_model": "qwen3-4b-aicoder",
+   "param_override": {"max_tokens": 2048}
+  },
+  {
+   "name": "LiteLLM svc203 · ChatGPT 訂閱（內部測試）",
+   "group": "internal",
+   "models": "internal",
+   "test_model": "chatgpt/gpt-6-luna",
+   "optional": true
+  }
+ ]
+}
