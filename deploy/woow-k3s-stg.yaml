@@ -40,15 +40,17 @@ proxy:
   image:
     # Built by woow_paas_platform build-newapi-proxy (workflow_dispatch run
     # 21271) on the LLM-02b feature branch feat/llm-02b-platform-foundation,
-    # head 39817d07: adds the read-only route ap.user.list (GET /api/user/,
-    # p / page_size / sort_by=id / sort_order) for the PaaS balance refresh.
-    # Every LLM-01a route is unchanged. stg pins the feature-branch build for
-    # the LLM-02b stg acceptance; once the platform PR merges, re-pin to the
-    # develop merge build (same procedure as PR #6). Previous pin, for rollback:
+    # Built by woow_paas_platform build-newapi-proxy on develop after PR #1792
+    # (LLM-02b) merged: run 21563, merge commit 8fa83621. Adds the read-only
+    # route ap.user.list (GET /api/user/, p / page_size / sort_by=id /
+    # sort_order) for the PaaS balance refresh; every LLM-01a route is
+    # unchanged. Same digest as the feature-branch build 39817d07 that passed
+    # the LLM-02b stg acceptance (reproducible build). Previous pin, for
+    # rollback:
     # 59b03479ef833b1b62260692431a03782bb7b47c@sha256:52da4e80eaf4b0cf38ba1b24fb684d37ab627c7d424f9e56fe15dd58a4a856fd
     # Change it here, in git — never with helm --set, or the next
     # `helm upgrade -f deploy/woow-k3s-stg.yaml` rolls back to a different image.
-    tag: 39817d0748f1b6c293c31c4dfe10498e3b5d17a0
+    tag: 8fa836218e85cda520abacf0ab9e29744761c187
     digest: sha256:2e6193f3a4a2b2a3e4a0f60601f77d96fcff73b953336488ce18a3e3f7d49496
   # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
   imagePullSecrets:
