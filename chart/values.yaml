@@ -81,6 +81,11 @@ valkey:
     digest: sha256:081c2f5cb575efc901aa80ff9cdbd1ec6a301682fd35e1ebb4b0990a4a4a8507
   # Cache only (sessions, token cache, rate limits); the DB is authoritative.
   maxmemory: 384mb
+  # SHA-1 of files/newapi-rate-limit.lua, a verbatim copy of new-api's
+  # common/limiter/lua/rate_limit.lua at newapi.image.tag. Valkey loads it on
+  # every start (templates/valkey.yaml). When bumping newapi.image, re-copy
+  # the file from the new tag; CI fails if this value and the file disagree.
+  rateLimitScriptSha1: f69f9466276c43292de571879e5bf5e742a68976
   resources:
     requests:
       cpu: 50m

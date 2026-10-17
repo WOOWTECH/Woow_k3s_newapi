@@ -78,6 +78,18 @@ jobs:
           for f in scripts/*.py scripts/tests/*.py tests/contract/*.py; do python3 -m py_compile "$f"; done
           for f in deploy/settings*.json deploy/pricing/*.json tests/contract/fixtures/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
 
+      # Valkey reloads new-api's token-bucket script on every start
+      # (templates/valkey.yaml): the copied file must be byte-identical to the
+      # script of the pinned new-api, or the reload restores a different SHA
+      # and the free trial 500s after a Valkey restart (NA-03 F11).
+      - name: Valkey rate-limit script matches the pin
+        run: |
+          set -euo pipefail
+          want=$(sed -n 's/^  rateLimitScriptSha1: *//p' chart/values.yaml)
+          got=$(sha1sum chart/files/newapi-rate-limit.lua | cut -d' ' -f1)
+          [ -n "$want" ] && [ "$want" = "$got" ] || { echo "::error::chart/files/newapi-rate-limit.lua sha1 $got != valkey.rateLimitScriptSha1 $want"; exit 1; }
+          echo "rate limit script sha1 $got"
+
       # newapi_admin.py against an in-process fake new-api (no network).
       - name: Admin tool unit tests
         run: python3 -m unittest discover -s scripts/tests -v
