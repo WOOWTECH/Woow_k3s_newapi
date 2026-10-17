@@ -27,6 +27,7 @@ pytestmark = pytest.mark.usefixtures("lab")
 
 #: Longest wait at the end of the run for the 1-hour UP / 15-minute JWT to expire.
 MAX_EXPIRY_WAIT = 40 * 60
+JWT_LEEWAY_S = 5  # new-api rc.44 service/auth_token.go:194 (jwt.WithLeeway)
 
 
 # --------------------------------------------------------------------------- #
@@ -748,6 +749,9 @@ def test_c25_expiry_codes(cfg, consumer, fixture_sink, contract_partial):
         pytest.skip("no expiring UP (NEWAPI_CONTRACT_SKIP_SLOW=1)")
     first_jwt = (consumer.user.login_response.data or {}).get("access_token")
     jwt_exp = (consumer.user.login_response.data or {}).get("access_expires_at") or 0
+    # rc.44 parses the JWT with jwt.WithLeeway(5 * time.Second)
+    # (service/auth_token.go:194): it is still accepted 5 s past exp.
+    jwt_exp += JWT_LEEWAY_S
     wait = jwt_exp + 3 - time.time()
     if 0 < wait <= MAX_EXPIRY_WAIT:
         time.sleep(wait)
