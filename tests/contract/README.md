@@ -125,6 +125,17 @@ cp /tmp/na03.json tests/contract/reports/<newapi tag>_<proxy sha 前 12 碼>.jso
 `last_used_at` 的 60 秒節流，以及最後等 1 小時的 UP 過期（C25，最多 40 分鐘）。
 `NEWAPI_CONTRACT_SKIP_SLOW=1` 可做快速檢查（不能當 gate）。
 
+第一次在 stg 實跑學到的兩件事（都已寫進套件）：
+
+- **port-forward 會自己死掉**：等完一個 14 分鐘的 CT 視窗後，套件的 port-forward 已經不在，之後每個測試都是
+  ConnectionRefused；`svc/` 的 port-forward 也會跟著它挑中的 pod 一起死（master Recreate、X09 殺代理 pod）。
+  所以 `kube.port_forward` 會在 kubectl 結束時用同一個本機 port 重開、每 30 秒開一次空連線保持通道，client 對
+  loopback 被拒絕的連線（請求根本沒送出）最多重試 120 秒（簽章請求 20 秒，ts 只有 30 秒有效）、GET 遇到 reset 也重試；
+  POST 遇到 reset 不重試（可能已經送到）。X09 自己的 `pod/` port-forward 不重開（它要的就是斷線）。
+- **免費渠道的 `param_override` 會蓋掉 client 的 `max_tokens`**（U18，F01 量）：`max_tokens: 1` 打「ping」，Qwen 會
+  想 352 個 token、花 22 秒，F03／F05 的時間假設（10 個 burst、每 6 秒 1 個）就全失效。`relay.chat` 預設改用
+  `/no_think Reply with the single word: ok`（2 個 token、約 0.6 秒）。
+
 ## 清理
 
 每個測試使用者在 teardown 刪除（root step-up 的硬刪除；沒給 root 帳密時退回使用者自刪＝軟刪除）；先用 UP 刪掉它的
