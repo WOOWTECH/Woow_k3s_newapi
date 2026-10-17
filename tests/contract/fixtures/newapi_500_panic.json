@@ -1,0 +1,15 @@
+{
+  "_headers": {
+    "Content-Type": "application/json"
+  },
+  "_http_status": 500,
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "error": {
+      "message": "Panic detected, error: runtime error",
+      "type": "new_api_panic"
+    }
+  }
+}

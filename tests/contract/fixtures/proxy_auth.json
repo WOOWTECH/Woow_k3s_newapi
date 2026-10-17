@@ -1,6 +1,13 @@
 {
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "auth"
+  },
   "_http_status": 401,
   "_proxy_error": "auth",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
   "body": {
     "message": "newapi-proxy: auth",
     "proxy_error": "auth",

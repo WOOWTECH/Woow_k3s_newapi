@@ -1,10 +1,17 @@
 {
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "too_large"
+  },
   "_http_status": 413,
   "_proxy_error": "too_large",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
   "body": {
     "message": "newapi-proxy: too_large",
     "proxy_error": "too_large",
-    "reason": "body",
+    "reason": "body_too_large",
     "success": false
   }
 }

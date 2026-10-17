@@ -1,6 +1,13 @@
 {
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "reset"
+  },
   "_http_status": 502,
   "_proxy_error": "reset",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
   "body": {
     "message": "newapi-proxy: reset",
     "proxy_error": "reset",

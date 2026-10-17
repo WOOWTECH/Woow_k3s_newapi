@@ -1,0 +1,6 @@
+{
+  "_source": "contract-shape",
+  "_transport": "RemoteDisconnected",
+  "after_send": true,
+  "route": "manage"
+}

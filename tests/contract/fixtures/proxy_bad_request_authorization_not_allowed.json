@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "bad_request"
+  },
+  "_http_status": 400,
+  "_proxy_error": "bad_request",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: bad_request",
+    "proxy_error": "bad_request",
+    "reason": "authorization_not_allowed",
+    "success": false
+  }
+}

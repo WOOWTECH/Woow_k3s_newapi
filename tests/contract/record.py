@@ -1,20 +1,30 @@
-"""Record de-identified response fixtures for LLM-02's newapi_client tests.
+"""De-identified response fixtures for LLM-02's ``newapi_client`` unit tests.
 
-The fixtures carry the *shape* of every response the PaaS classifies
-(DESIGN §3.4): new-api success/error envelopes and the proxy's own error
-bodies. Transport failures (``RemoteDisconnected``, ``ReadTimeout``,
-``ConnectTimeout``) are client exceptions, not bodies, so LLM-02 simulates
-those directly — only their matching proxy error *bodies* are captured here.
+Every response class the PaaS classifies (DESIGN §3.4) gets one JSON file::
 
-Usage (on stg, with the env of config.py set)::
+    {"_source": "live" | "contract-shape", "_route": "<what was called>",
+     "_http_status": 403, "_headers": {"X-Woow-Proxy-Error": "denied", ...},
+     "_raw_empty": false, "body": {...}}
+
+and the one transport case, a request the proxy had already forwarded when
+its pod was killed (X09)::
+
+    {"_source": "live", "_transport": "RemoteDisconnected", "after_send": true,
+     "route": "manage", "executed": true}
+
+``live`` fixtures are written by the contract run itself: set
+``NEWAPI_CONTRACT_RECORD_DIR`` and the tests that provoke a class (X03-X09,
+C13, C18, C23, C25, C27, F11 …) capture what new-api-stg / the proxy really
+answered, headers included. ``contract-shape`` fixtures are the classes stg
+cannot produce on demand (a Go panic, a token-enable error that needs a
+non-Redis deployment, the proxy's busy/config states); they are built here
+from the source (``proxy_reasons.py``; 〔PROV〕§1.1/§4.1) and the self-check
+refuses any proxy reason the proxy does not send.
+
+Every file is scrubbed (scrub.py) and re-scanned before it is written; a
+residue aborts (acceptance 5). Regenerate the static ones with::
 
     python3 -m tests.contract.record --out tests/contract/fixtures
-
-Live new-api/proxy responses are recorded when configured; the proxy error
-bodies are emitted from the fixed contract shape (extra/newapi-proxy/README.md
-〈回應與錯誤〉) so the set is complete even when a class is hard to provoke.
-Every file is scrubbed (scrub.py) and re-scanned for residue before writing; a
-leak aborts the run (acceptance 5).
 """
 from __future__ import annotations
 
@@ -25,112 +35,164 @@ import sys
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from tests.contract import newapi, scrub, users
-    from tests.contract.config import Config
+    from tests.contract import proxy_reasons, scrub
 else:
-    from . import newapi, scrub, users
-    from .config import Config
+    from . import proxy_reasons, scrub
 
+FIXTURE_HEADERS = ("X-Woow-Proxy-Error", "X-Woow-Proxy-Precheck", "Retry-After", "Content-Type")
 
-# Proxy error bodies are a fixed shape; emit one per class (reason is an
-# example). The PaaS classifier keys on proxy_error + HTTP status, not reason.
-PROXY_ERROR_CASES = [
-    ("proxy_bad_request", 400, "bad_request", "manage_id"),
-    ("proxy_too_large", 413, "too_large", "body"),
-    ("proxy_body_timeout", 408, "body_timeout", "body_timeout"),
-    ("proxy_auth", 401, "auth", "auth"),
-    ("proxy_policy", 403, "policy", "token_group"),
-    ("proxy_denied_reveal_window", 403, "denied", "reveal_window"),
-    ("proxy_denied_manage_target", 403, "denied", "manage_target"),
-    ("proxy_budget", 429, "budget", "add_quota_cap"),
-    ("proxy_busy_inflight", 503, "busy", "inflight"),
-    ("proxy_busy_replay_store", 503, "busy", "replay_store"),
-    ("proxy_config", 503, "config", "ap_missing"),
-    ("proxy_connect", 502, "connect", "deadline"),
-    ("proxy_reset", 502, "reset", "upstream_reset"),
-    ("proxy_timeout", 504, "timeout", "deadline"),
-    ("proxy_internal", 500, "internal", "internal"),
+# Proxy classes stg cannot produce on demand (or that LLM-02 needs even when a
+# live run skipped them): (file, kind, reason). Reasons are real codes.
+STATIC_PROXY = [
+    ("proxy_bad_request_authorization_not_allowed", "bad_request", "authorization_not_allowed"),
+    ("proxy_too_large", "too_large", "body_too_large"),
+    ("proxy_body_timeout", "body_timeout", "body_timeout"),
+    ("proxy_auth", "auth", "auth"),
+    ("proxy_policy_route", "policy", "route"),
+    ("proxy_policy_manage_mode", "policy", "manage_mode"),
+    ("proxy_denied_reveal_window", "denied", "reveal_window"),
+    ("proxy_denied_reveal_name", "denied", "reveal_name"),
+    ("proxy_denied_reveal_not_found", "denied", "reveal_not_found"),
+    ("proxy_denied_reveal_token_mismatch", "denied", "reveal_token_mismatch"),
+    ("proxy_denied_manage_target", "denied", "manage_target"),
+    ("proxy_denied_manage_not_found", "denied", "manage_not_found"),
+    ("proxy_budget", "budget", "hourly_cap"),
+    ("proxy_busy_inflight", "busy", "inflight"),
+    ("proxy_busy_replay_store", "busy", "replay_store"),
+    ("proxy_config", "config", "ap_token_missing"),
+    ("proxy_connect", "connect", "upstream_connect"),
+    ("proxy_connect_deadline", "connect", "deadline"),
+    ("proxy_reset", "reset", "upstream_reset"),
+    ("proxy_timeout", "timeout", "upstream_timeout"),
+    ("proxy_internal", "internal", "internal"),
+]
+
+# new-api answers stg cannot be made to give on demand (〔PROV〕§1.1, §4.1).
+STATIC_NEWAPI = [
+    ("newapi_500_empty_valkey_down", 500, None, {"_raw_empty": True}),
+    ("newapi_500_panic", 500, {"error": {"type": "new_api_panic", "message": "Panic detected, error: runtime error"}}, {}),
+    ("token_enable_expired_error", 200, {
+        "success": False,
+        "message": "Token has expired and cannot be enabled. Please modify the expiration time or set it to never expire",
+        "message_key": "Token has expired and cannot be enabled. Please modify the expiration time or set it to never expire",
+    }, {"_note": "needs DB status 3; a Redis deployment never writes it (C18), so stg cannot produce it"}),
+    ("token_enable_exhausted_error", 200, {
+        "success": False,
+        "message": "Token quota is exhausted and cannot be enabled. Please modify the remaining quota or set it to unlimited",
+        "message_key": "Token quota is exhausted and cannot be enabled. Please modify the remaining quota or set it to unlimited",
+    }, {"_note": "needs DB status 4; a Redis deployment never writes it (C18), so stg cannot produce it"}),
 ]
 
 
-def _write(out_dir, name, obj):
-    cleaned = scrub.scrub(obj)
+def _clean_headers(headers):
+    out = {}
+    for name in FIXTURE_HEADERS:
+        for k, v in (headers or {}).items():
+            if k.lower() == name.lower():
+                out[name] = v
+    if any(k.lower() == "x-oneapi-request-id" for k in (headers or {})):
+        out["X-Oneapi-Request-Id"] = "<request-id>"
+    return out
+
+
+def _plain(obj):
+    """Secret wrappers -> plain JSON (the scrubber then redacts by name)."""
+    return json.loads(json.dumps(obj))
+
+
+def write_fixture(out_dir, name, obj):
+    cleaned = scrub.scrub(_plain(obj))
     leak = scrub.residue(cleaned)
     if leak:
-        raise SystemExit(f"refusing to write {name}: secret residue {leak}")
+        raise SystemExit(f"refusing to write fixture {name}: secret residue {leak}")
+    os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name + ".json")
     with open(path, "w") as f:
         json.dump(cleaned, f, indent=2, sort_keys=True, ensure_ascii=False)
         f.write("\n")
-    print(f"wrote {path}")
+    return path
 
 
-def _record_proxy_errors(out_dir):
-    for name, status, kind, reason in PROXY_ERROR_CASES:
-        body = {
-            "success": False,
-            "message": f"newapi-proxy: {kind}",
-            "proxy_error": kind,
-            "reason": "auth" if kind == "auth" else reason,
-        }
-        _write(out_dir, name, {"_http_status": status, "_proxy_error": kind, "body": body})
+class FixtureSink:
+    """Live capture during a contract run (no-op when ``out_dir`` is None)."""
+
+    def __init__(self, out_dir=None):
+        self.out_dir = out_dir
+        self.written = []
+
+    @property
+    def enabled(self):
+        return bool(self.out_dir)
+
+    def capture(self, name, resp, route=None):
+        if not self.out_dir:
+            return
+        obj = {"_source": "live", "_route": route or "", "_http_status": resp.status,
+               "_headers": _clean_headers(getattr(resp, "headers", {})),
+               "_raw_empty": bool(getattr(resp, "raw_empty", False)),
+               "body": getattr(resp, "body", None) or None}
+        pe = getattr(resp, "proxy_error", None)
+        if pe:
+            obj["_proxy_error"] = pe
+        self.written.append(write_fixture(self.out_dir, name, obj))
+
+    def capture_transport(self, name, exc_type, after_send, route, executed=None):
+        if not self.out_dir:
+            return
+        obj = {"_source": "live", "_transport": exc_type, "after_send": bool(after_send), "route": route}
+        if executed is not None:
+            obj["executed"] = bool(executed)
+        self.written.append(write_fixture(self.out_dir, name, obj))
 
 
-def _record_live(out_dir, cfg):
-    if not cfg.have_newapi:
-        print("new-api not configured; skipping live capture (proxy error bodies still written)")
-        return
-    admin = newapi.Client(cfg.base, token=_read_pat(cfg.admin_pat_file))
-    base = newapi.Client(cfg.base)
-    anon = base.get("/api/status")
-    _write(out_dir, "status_ok", {"_http_status": anon.status, "body": anon.body})
-    user = users.create_test_user(admin, base, cfg.user_prefix)
+def _is_live(out_dir, name):
     try:
-        login = user.login()
-        _write(out_dir, "login_ok", {"_http_status": login.status, "body": login.body})
-        up_token, item = user.create_up(scopes=["usage:read"])
-        # create-access-token success (token already scrubbed to <redacted>)
-        _write(out_dir, "access_token_create_ok",
-               {"_http_status": 200, "body": {"success": True, "message": "",
-                                              "data": {"token": up_token, "item": item}}})
-        # add_quota success + zero-value error
-        ok = admin.post("/api/user/manage", {"id": user.id, "action": "add_quota", "mode": "add", "value": 15625})
-        _write(out_dir, "add_quota_ok", {"_http_status": ok.status, "body": ok.body,
-                                         "_request_id": ok.request_id})
-        zero = admin.post("/api/user/manage", {"id": user.id, "action": "add_quota", "mode": "add", "value": 0})
-        _write(out_dir, "add_quota_zero_error", {"_http_status": zero.status, "body": zero.body})
-        # token create + list + reveal
-        tid, created, listed = user.create_relay_token(up_token, f"wct_{user.id}_rec")
-        _write(out_dir, "token_create_ok", {"_http_status": created.status, "body": created.body})
-        listing = user.up_client(up_token).get("/api/token/?p=1&page_size=10")
-        _write(out_dir, "token_list_ok", {"_http_status": listing.status, "body": listing.body})
-        reveal = user.up_client(up_token).post(f"/api/token/{tid}/key")
-        _write(out_dir, "token_reveal_ok", {"_http_status": reveal.status, "body": reveal.body})
-        # UP on a session-only route (403 code) and a bad PAT (401 code)
-        denied = user.up_client(up_token).get("/api/user/access_tokens")
-        _write(out_dir, "session_required_error", {"_http_status": denied.status, "body": denied.body})
-        unauth = user.up_client("nap_" + "0" * 43).get("/api/user/self")
-        _write(out_dir, "unauthorized_error", {"_http_status": unauth.status, "body": unauth.body})
-        self_log = user.up_client(up_token).get("/api/log/self?type=1&p=1&page_size=5")
-        _write(out_dir, "log_self_ok", {"_http_status": self_log.status, "body": self_log.body})
-    finally:
-        user.cleanup(up_token)
+        with open(os.path.join(out_dir, name + ".json")) as f:
+            return json.load(f).get("_source") == "live"
+    except (OSError, ValueError):
+        return False
 
 
-def _read_pat(path):
-    with open(os.path.expanduser(path)) as f:
-        return f.read().strip()
+def write_static(out_dir):
+    """Write the contract-shape set; never replaces a live fixture of the same name."""
+    paths = []
+    real_write = write_fixture
+
+    def write_fixture_unless_live(d, name, obj):  # noqa: N802
+        if _is_live(d, name):
+            return os.path.join(d, name + ".json") + " (live kept)"
+        return real_write(d, name, obj)
+
+    write = write_fixture_unless_live
+    for name, kind, reason in STATIC_PROXY:
+        if not proxy_reasons.known(kind, reason):
+            raise SystemExit(f"{name}: {kind}/{reason} is not a reason the proxy sends")
+        # app.py _error(): X-Woow-Proxy-Error + no-store; Retry-After only when a
+        # pre-check relays new-api's 429 (connect *_precheck_http_429).
+        headers = {"X-Woow-Proxy-Error": kind, "Content-Type": "application/json"}
+        body = {"success": False, "message": f"newapi-proxy: {kind}", "proxy_error": kind, "reason": reason}
+        paths.append(write(out_dir, name, {
+            "_source": "contract-shape", "_route": "", "_http_status": proxy_reasons.STATUS[kind],
+            "_headers": headers, "_raw_empty": False, "_proxy_error": kind, "body": body}))
+    # the send-then-drop case LLM-02 must classify Unknown (X09 overwrites it with a live one)
+    paths.append(write(out_dir, "transport_send_then_drop_manage", {
+        "_source": "contract-shape", "_transport": "RemoteDisconnected", "after_send": True, "route": "manage"}))
+    for name, status, body, extra in STATIC_NEWAPI:
+        obj = {"_source": "contract-shape", "_route": "", "_http_status": status,
+               "_headers": {} if body is None else {"Content-Type": "application/json"},
+               "_raw_empty": body is None, "body": body}
+        obj.update(extra)
+        paths.append(write(out_dir, name, obj))
+    return paths
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "fixtures"))
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures"))
     args = ap.parse_args(argv)
-    os.makedirs(args.out, exist_ok=True)
-    cfg = Config()
-    _record_proxy_errors(args.out)
-    _record_live(args.out, cfg)
-    print("done")
+    for p in write_static(args.out):
+        print(f"wrote {p}")
+    print("static fixtures done; live ones come from a contract run with NEWAPI_CONTRACT_RECORD_DIR")
 
 
 if __name__ == "__main__":

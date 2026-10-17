@@ -1,10 +1,17 @@
 {
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "timeout"
+  },
   "_http_status": 504,
   "_proxy_error": "timeout",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
   "body": {
     "message": "newapi-proxy: timeout",
     "proxy_error": "timeout",
-    "reason": "deadline",
+    "reason": "upstream_timeout",
     "success": false
   }
 }

@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 
 SECRET_KEY_NAMES = re.compile(
-    r"(^|_)(key|token|access_token|refresh_token|proof_token|flow_token|password|"
+    r"(^|_)(key|keys|token|access_token|refresh_token|proof_token|flow_token|password|"
     r"passwd|secret|token_ref|token_hash|sig|signature|authorization)$",
     re.IGNORECASE,
 )
@@ -37,7 +37,8 @@ RESIDUE_PATTERNS = (
     ("sk-", re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}")),
     ("nap_", re.compile(r"nap_[A-Za-z0-9_-]{8,}")),
     ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
-    ("sha256", re.compile(r"(?<![A-Za-z0-9])[0-9a-f]{64}(?![A-Za-z0-9])")),
+    # a bare SHA-256 (token_ref); an image digest "sha256:<hex>" is not a secret
+    ("sha256", re.compile(r"(?<![A-Za-z0-9:])[0-9a-f]{64}(?![A-Za-z0-9])")),
     # A plaintext password value (responses never carry one; defensive). The
     # redaction sentinel is clean.
     ("password", re.compile(r'"password"\s*:\s*"(?!<redacted>")[^"]+"')),
@@ -51,9 +52,20 @@ def _scrub_string(value):
     return out
 
 
+def _redact_all(value):
+    if isinstance(value, dict):
+        return {k: _redact_all(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_all(v) for v in value]
+    return REDACTED if isinstance(value, str) and value else value
+
+
 def scrub(value, key_name=None):
     """Return a de-identified copy of a parsed-JSON value."""
     if isinstance(value, dict):
+        if key_name and SECRET_KEY_NAMES.search(key_name) and not ("key" in value and "value" in value):
+            # e.g. batch reveal {"keys": {"<id>": "<key>"}}: every string under it
+            return _redact_all(value)
         return {k: scrub(v, k) for k, v in value.items()}
     if isinstance(value, list):
         return [scrub(v, key_name) for v in value]

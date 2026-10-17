@@ -165,24 +165,85 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 1. 看上游 release notes 與 <https://github.com/QuantumNous/new-api/security/advisories>
 2. `scripts/verify-image.sh vX.Y.Z` → 把 tag＋digest 寫進 `chart/values.yaml`
 3. 審不變量與 PaaS 契約（同一個 PR）：
-   - 重看 DESIGN §7.1 的 I8 清單，以及 I2 契約〔PROV〕§6.3 列的檔案：`git diff vOLD vNEW -- router/api-router.go middleware/access_token_routes.go …`（完整清單在 §6.3 最後一段），有變更就逐條對照 C01–C27。
+   - 重看 DESIGN §7.1 的 I8 清單，以及 I2 契約〔PROV〕§6.3 的 C01–C27。在 new-api 原始碼對下面這些檔做
+     `git diff vOLD vNEW -- <檔案>`，有變更就逐條對照 C01–C27／F01–F12 與下表的代理政策：
+     - 〔PROV〕§6.3 的 21 個：`router/api-router.go`、`middleware/access_token_routes.go`、`middleware/auth.go`、
+       `middleware/rate-limit.go`、`service/access_token_scope.go`、`service/security_verification.go`、
+       `service/auth_token.go`、`service/auth_session.go`、`controller/access_token.go`、
+       `controller/secure_verification.go`、`controller/auth_session.go`、`controller/user.go`、
+       `controller/user_quota.go`、`controller/token.go`、`controller/log.go`、`controller/usedata.go`、
+       `model/token.go`、`model/log.go`、`model/user.go`、`model/user_access_token.go`、`common/init.go`
+     - 另外 4 個：`model/user_quota_adjustment.go`（`subtract` 可以扣成負數、`override` 蓋掉讀寫之間的消耗、
+       錢包上限）、`common/trusted_proxies.go`（**`TRUSTED_PROXIES` 空字串＝預設信任 127/8、10/8、172.16/12…，
+       不是「不信任」**；`none` 才是）、`middleware/model-rate-limit.go`（F03–F07、F12 的計數 key）、
+       `common/gin.go`（錯誤信封 `message_key`／`code`）
+   - 代理 body 政策依賴的 new-api 欄位與路由（`woow_paas_platform:extra/newapi-proxy/newapi_proxy/policy.py`、
+     `app.py`）；上面的 diff 動到其中任何一個，代理要一起改、一起過 gate：
+
+     | 代理規則 | 依賴的 new-api 欄位／路由 | new-api 原始碼 |
+     |---|---|---|
+     | `POST /api/user/manage` 只收 `{id, action, mode, value}`、`action=add_quota`、`mode=add`、`value` 1–156,250,000 | `ManageRequest` 的 `id/action/mode/value`；`add_quota` 分支；`subtract`／`override` 的語意 | `controller/user.go` `ManageUser`、`controller/user_quota.go`、`model/user_quota_adjustment.go` |
+     | add_quota 預檢：AP `GET /api/user/{id}` 的 `id`、`username`（前綴）、`role == 1`、`group == default`；`record not found` → `manage_not_found` | `GET /api/user/:id` 回應欄位與錯誤字串；對同級以上角色的拒絕訊息 | `controller/user.go` `GetUser`、`model/user.go` `GetUserById` |
+     | `POST /api/user/` 只收 `{username, password, display_name, role}`、`role=1`、前綴帳號、`PaaS <n>`、密碼 32–128 | 建帳號欄位；role 1 不需 proof；`group`／`remark` 被忽略；不回 id | `controller/user.go` `CreateUser`、`model/user.go`（validate） |
+     | `PUT /api/user/` 不在白名單 | 整筆覆寫四欄、改分組遞增 auth_version | `controller/user.go` `UpdateUser`、`model/user.go` `EditWithTx` |
+     | `POST /api/token/` 只收 §3.3 的 10 個欄位（含 `allow_user_quota_query:false`）、名稱 `wp_<n>_xxxx`、`group` 只能 default／free、free 只能兩個 Qwen 且 `remain_quota=1` | token 欄位名稱；`allow_user_quota_query`（main 新增、新 key 預設 true） | `controller/token.go` `AddToken`／`UpdateToken`、`model/token.go` |
+     | reveal 預檢：`GET /api/token/{id}` 的 `id`、`name`（`reveal_name`）、`created_time` 在 120 秒內（`reveal_window`）；`record not found` → `reveal_not_found` | token item 的 `id/name/created_time`；`POST /api/token/:id/key` 路由 | `controller/token.go`、`model/token.go` |
+     | login／verify／建 PAT 只收固定欄位；verify 只收 password、UP scope 子集、`expires_at` now+1h–92 天；PAT 名稱 `woow-paas-up-<n>-<YYYYMMDDHHMM>` | 三個請求的欄位與 context schema；PAT 到期至少 1 小時 | `controller/user.go` `Login`、`controller/secure_verification.go`、`service/security_verification.go`、`controller/access_token.go` |
+     | 預檢把帶 `code` 或 `message_key` 的拒絕原樣轉回（`X-Woow-Proxy-Precheck`） | 錯誤信封 | `common/gin.go`、`middleware/auth.go` |
+     | 覆寫 XFF、AP `.0.1`／OP `.0.3`／租戶合成 IP | `TRUSTED_PROXIES` 與 gin 的 ClientIP；`last_used_ip`、session `ip` | `common/trusted_proxies.go`、`middleware/auth.go`、`service/auth_session.go` |
+
    - 在同一個 PR 把 `scripts/newapi_admin.py` 的 `INVARIANTS_FOR_VERSION` 改成新版本（沒改 CI 就是紅的）。升到含 `45fbb149f`（各分組分開計數）的 release 時：契約測試先確認 Redis key 變成 `rateLimit:<uid>:free`，再照 `_comment_ratelimit` 改 `deploy/settings.json` 的限流值，並改寫 `rate-limit-group`、`rate-limit-count` 這兩個不變量與 `test_upgrade_values_fail_on_rc44`（新值在 rc.44 規則下本來就會失敗）。
    - 有任何不變量或 PaaS 依賴的值要改，先照〈PaaS 依賴的設定不變量〉通知 PaaS（PaaS 的 I8 清單一起改），約好套用時間。
 4. 先在 stg 升：`helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait`，再依序跑下面三個，**都要過才往下**：
-   - **NA-03 契約測試（升版 gate）**：`tests/contract/` 的 C01–C27、F01–F12、X01–X09 在 stg 全綠。跑法、要設的 env、限流預算見 `tests/contract/README.md`：
+   - **NA-03 契約測試（升版 gate）**：`tests/contract/` 的 C01–C27、F01–F12、X01–X09 在 stg 全綠。完整步驟、
+     每個檔案與 env 的意思見 `tests/contract/README.md`；這裡是一次 gate 的全部指令（套件自己 port-forward
+     `svc/newapi` 與 `svc/newapi-proxy`，所有 kubectl 命令都是 `-n new-api-stg`）：
 
      ```bash
-     kubectl -n new-api-stg port-forward svc/newapi 3301:3000 &
-     export NEWAPI_CONTRACT_BASE=http://127.0.0.1:3301
-     export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract  # 這次測試另建的 PAT，不要借代理的 AP/OP
-     export NEWAPI_CONTRACT_RELAY_BASE=http://127.0.0.1:3301 NEWAPI_CONTRACT_PAID_MODEL=<最便宜的付費模型>
-     export NEWAPI_CONTRACT_PSQL="kubectl -n new-api-stg exec -i newapi-postgres-0 -- psql -U newapi -d newapi -tAc"
-     export NEWAPI_CONTRACT_PROXY_BASE=http://newapi-proxy.new-api-stg.svc.cluster.local:8080 NEWAPI_CONTRACT_REPORT=/tmp/contract.json
-     pytest tests/contract        # 結尾印出每個 id 的 pass/fail/skip；report 貼進 PR（含 F10 的透支數字、C23 的耗時）
+     export NEWAPI_CONTRACT_TARGET=stg NEWAPI_CONTRACT_KUBECTL=kubectl
+     export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract       # root：user:read、user:write、log:read（不要借代理的 AP/OP）
+     export NEWAPI_CONTRACT_SETTINGS_PAT_FILE=~/.config/newapi-stg/pat-settings    # root：option:read、option:write
+     export NEWAPI_CONTRACT_ADMIN_CREDS_FILE=~/.config/newapi-stg/root-credentials # url= 必須是 stg
+     export WOOW_NEWAPI_PROXY_AUTH_CRON="$(kubectl -n paas-stg-system get secret paas-stg-newapi-proxy-client -o jsonpath='{.data.cron}' | base64 -d)"
+     export WOOW_NEWAPI_PROXY_AUTH_WEB="$(kubectl -n paas-stg-system get secret paas-stg-newapi-proxy-client -o jsonpath='{.data.web}' | base64 -d)"
+     export NEWAPI_CONTRACT_PAID_MODEL=<最便宜的付費模型> NEWAPI_CONTRACT_RECORD_DIR=tests/contract/fixtures
+
+     # (1) 主 run：不影響別人，約 60–80 分鐘（大多在等 CT 視窗與限流桶回滿）
+     NEWAPI_CONTRACT_REPORT=/tmp/na03-main.json pytest tests/contract
+     # (2) disruptive 視窗：先通知負責人並約時間——會改全站設定（F02／F05 反例／F09）、重啟 Valkey（F11）、
+     #     殺一個代理 pod（X09）、打 200 並發到共用 LiteLLM（F10）；aimodels demo 的免費試用這段時間不能用
+     NEWAPI_CONTRACT_DISRUPTIVE=1 NEWAPI_CONTRACT_F10_CONFIRM=1 NEWAPI_CONTRACT_F10_MODEL=<輸出價最高的模型> \
+       NEWAPI_CONTRACT_REPORT=/tmp/na03-disruptive.json pytest tests/contract -m disruptive
+     #     X06「上游關閉」：stg 停 1–2 分鐘
+     kubectl -n new-api-stg scale deploy/newapi-master --replicas=0
+     NEWAPI_CONTRACT_UPSTREAM_DOWN=1 NEWAPI_CONTRACT_REPORT=/tmp/na03-down.json pytest tests/contract -m upstream_down
+     kubectl -n new-api-stg scale deploy/newapi-master --replicas=1 && kubectl -n new-api-stg rollout status deploy/newapi-master
+     # (3) C23 的 429：最後、單獨跑；127.0.0.1 的 CT 桶會被打滿最多 20 分鐘（所有 port-forward 使用者都不能登入／reveal）
+     NEWAPI_CONTRACT_CT_EXHAUST=1 NEWAPI_CONTRACT_REPORT=/tmp/na03-c23.json pytest tests/contract -m ct_exhaust
+     # (4) 合併、判定、commit 進同一個升版 PR（CI 的 contract gate 找這個檔，digest 要完全一致）
+     python3 -m tests.contract.report merge /tmp/na03.json /tmp/na03-main.json /tmp/na03-disruptive.json /tmp/na03-down.json /tmp/na03-c23.json
+     python3 -m tests.contract.report check /tmp/na03.json
+     cp /tmp/na03.json tests/contract/reports/<newapi tag>_<proxy sha 前 12 碼>.json
      ```
 
-     升到含 `45fbb149f`（各分組分開計數）的版本時，先確認契約測試看到 Redis key 變成 `rateLimit:<uid>:free`（F12，設 `NEWAPI_CONTRACT_EXPECT_PERGROUP=1`），再改 `deploy/settings.json` 的限流值與不變量（見本檔〈PaaS 依賴的設定不變量〉與 `_comment_ratelimit`）。CI 每個 PR 另跑離線自檢（`python3 tests/contract/selfcheck.py`：簽章 golden vector、去敏、每個 id 都有測試）。
-   - `verify-settings deploy/settings.json deploy/settings-stg.json` exit 0（F02/F05/F09 暫改的設定要已改回）。
+     報告（PR 內文也貼摘要）有：每個 id 的狀態、new-api 版本、兩個 image 的宣告與 stg 實際 digest、總時間與 CT 等待、
+     F10 的並發數／透支點數／上游錯誤率（交給 LLM-12b、NA-08）、C23 的 CT 桶回復秒數、F11 的 500 次數、U18
+     （免費渠道 `param_override` 是否覆寫 client 的 `max_tokens`）。升到含 `45fbb149f` 的版本時加
+     `NEWAPI_CONTRACT_EXPECT_PERGROUP=1`（F12 確認 Redis key 變成 `rateLimit:<uid>:free`），再改 `deploy/settings.json`
+     的限流值與不變量（本檔〈PaaS 依賴的設定不變量〉與 `_comment_ratelimit`）。CI 每個 PR 另跑離線自檢
+     （`selfcheck.py`）與 `gate_check.py`（改了 image 釘選卻沒有對應的綠色報告就紅）。
+   - **負向對照（NA-03 驗收 2，換 new-api 版本或動到 `TRUSTED_PROXIES` 時做一次）**：`TRUSTED_PROXIES` 改成
+     `none`（**不是空字串**：rc.44 空字串會退回預設、仍信任 10.0.0.0/8，`common/trusted_proxies.go`），X01／C24 必須失敗；
+     改回後要綠。master 會 Recreate 兩次（各停 10–30 秒），放在 disruptive 視窗：
+
+     ```bash
+     kubectl -n new-api-stg set env deploy/newapi-master TRUSTED_PROXIES=none && kubectl -n new-api-stg rollout status deploy/newapi-master
+     sleep 61   # AP 的 last_used_at 每 60 秒最多寫一次：等它可以被這次的請求改寫
+     pytest tests/contract -k "x01 or c24"           # 預期 FAIL：AP 的 last_used_ip 變成代理 pod 的 10.42.x.x
+     helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait   # 改回 chart 的 10.42.0.0/16
+     pytest tests/contract -k "x01 or c24"           # 綠
+     ```
+   - `verify-settings deploy/settings.json deploy/settings-stg.json` exit 0（disruptive run 結束時套件已自動跑過一次；這裡再確認一次）。
    - `apply-channels --dry-run` exit 0。
 5. prod 先手動備份：`kubectl -n new-api create job --from=cronjob/newapi-pg-backup pre-upgrade-$(date +%m%d)`
 6. 送 Gitea PR，合併後 `helm upgrade ... --wait`；master 是 Recreate，會停約 10–30 秒
@@ -330,6 +391,12 @@ stg 與 prod 的簽章金鑰、AP、OP、Valkey 密碼必須全部不同（NA-05
 ### 升版
 
 - 新 image：PaaS repo 的 `build-newapi-proxy` workflow（develop／main 自動，或在分支手動 dispatch）只推 `newapi-proxy:<commit sha>`，job log 最後印出 digest；把 `proxy.image.tag`（sha）與 `proxy.image.digest` **commit 進** `deploy/woow-k3s*.yaml`，走本 repo 的 PR，再 `helm upgrade -f deploy/woow-k3s*.yaml`。不要用 `--set` 補 digest：git 和叢集會對不上，下一個照檔案跑 `helm upgrade` 的人會滾回拉不到的 image（`maxUnavailable: 0`，rollout 卡住）、AP／OP 到期日也會被清空。
+- **代理改版的 gate（合併 prod PR 之前）**：
+  1. 先只改 `deploy/woow-k3s-stg.yaml` 的 sha／digest，`helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait`；
+  2. 在 stg 跑〈升版〉第 4 步的 (1)–(4) 全套（X01–X09、C24 都在主 run 與 disruptive 視窗裡；gate 要每個 id 都綠，
+     所以 C23 的 429 與 X06 的上游關閉也要跑），合併後 `python3 -m tests.contract.report check` 要 `gate: open`；
+  3. 把合併報告 commit 成 `tests/contract/reports/<newapi tag>_<新 sha 前 12 碼>.json`，和 stg 的 pin 同一個 PR（CI 的 contract gate 會核對 digest）；
+  4. 之後才送改 `deploy/woow-k3s.yaml`（prod）的 PR，CI 一樣要找到同一個 sha 的綠色報告。
 - chart 拒絕沒有 digest、全 0 的佔位 digest、或 tag 不是 40 位 sha 的設定；CI 也一樣（佔位 digest 是錯誤，不是警告）。
 - PaaS 的 develop 一律用 merge commit：feature branch 的 image 只給 stg 驗收用；**合併後 stg 與 prod 都改釘 develop 合併 commit 的 sha 與 digest**。
 

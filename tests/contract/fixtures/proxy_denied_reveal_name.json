@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "denied"
+  },
+  "_http_status": 403,
+  "_proxy_error": "denied",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: denied",
+    "proxy_error": "denied",
+    "reason": "reveal_name",
+    "success": false
+  }
+}
