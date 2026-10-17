@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "internal"
+  },
+  "_http_status": 500,
+  "_proxy_error": "internal",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: internal",
+    "proxy_error": "internal",
+    "reason": "internal",
+    "success": false
+  }
+}

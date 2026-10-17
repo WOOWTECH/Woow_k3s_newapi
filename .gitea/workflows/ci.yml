@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the contract gate compares the image pins with the base
 
       - name: Install helm
         run: |
@@ -73,8 +75,8 @@ jobs:
         run: |
           set -euo pipefail
           for f in scripts/*.sh; do bash -n "$f"; done
-          for f in scripts/*.py scripts/tests/*.py; do python3 -m py_compile "$f"; done
-          for f in deploy/settings*.json deploy/pricing/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
+          for f in scripts/*.py scripts/tests/*.py tests/contract/*.py; do python3 -m py_compile "$f"; done
+          for f in deploy/settings*.json deploy/pricing/*.json tests/contract/fixtures/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
 
       # newapi_admin.py against an in-process fake new-api (no network).
       - name: Admin tool unit tests
@@ -90,3 +92,27 @@ jobs:
           set -euo pipefail
           python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json
           python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json deploy/settings-stg.json
+
+      # NA-03 contract suite: CI cannot reach new-api-stg, so it runs the
+      # offline self-check (stdlib, no pytest): the signing golden vector, the
+      # scrubber plus the acceptance-5 grep over every committed fixture (and
+      # their proxy reason codes), every id C01-C27/F01-F12/X01-X09 pinned by a
+      # marked test, the budget / settings-guard / report logic, and any
+      # committed gate report.
+      - name: Contract suite self-check (offline)
+        run: python3 tests/contract/selfcheck.py
+
+      # The upgrade gate itself: a PR that changes chart/values.yaml
+      # newapi.image or a deploy/woow-k3s*.yaml proxy.image must commit the
+      # green stg report for exactly those digests
+      # (tests/contract/reports/<tag>_<sha>.json; docs/OPERATIONS.md 〈升版〉).
+      - name: Contract gate (image bump needs a green stg report)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD~1"
+          fi
+          python3 tests/contract/gate_check.py --base-ref "$base"

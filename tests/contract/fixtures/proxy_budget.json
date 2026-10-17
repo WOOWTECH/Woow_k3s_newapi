@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "budget"
+  },
+  "_http_status": 429,
+  "_proxy_error": "budget",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: budget",
+    "proxy_error": "budget",
+    "reason": "hourly_cap",
+    "success": false
+  }
+}

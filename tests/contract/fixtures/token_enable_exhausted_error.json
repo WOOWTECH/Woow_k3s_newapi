@@ -1,0 +1,15 @@
+{
+  "_headers": {
+    "Content-Type": "application/json"
+  },
+  "_http_status": 200,
+  "_note": "needs DB status 4; a Redis deployment never writes it (C18), so stg cannot produce it",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "Token quota is exhausted and cannot be enabled. Please modify the remaining quota or set it to unlimited",
+    "message_key": "<redacted>",
+    "success": false
+  }
+}

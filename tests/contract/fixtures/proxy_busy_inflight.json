@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "busy"
+  },
+  "_http_status": 503,
+  "_proxy_error": "busy",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: busy",
+    "proxy_error": "busy",
+    "reason": "inflight",
+    "success": false
+  }
+}

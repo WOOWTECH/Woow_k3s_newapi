@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "policy"
+  },
+  "_http_status": 403,
+  "_proxy_error": "policy",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: policy",
+    "proxy_error": "policy",
+    "reason": "manage_mode",
+    "success": false
+  }
+}

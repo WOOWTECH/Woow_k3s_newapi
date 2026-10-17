@@ -1,0 +1,15 @@
+{
+  "_headers": {
+    "Content-Type": "application/json"
+  },
+  "_http_status": 200,
+  "_note": "needs DB status 3; a Redis deployment never writes it (C18), so stg cannot produce it",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "Token has expired and cannot be enabled. Please modify the expiration time or set it to never expire",
+    "message_key": "<redacted>",
+    "success": false
+  }
+}

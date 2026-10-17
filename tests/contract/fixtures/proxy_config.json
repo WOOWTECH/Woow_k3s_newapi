@@ -1,0 +1,17 @@
+{
+  "_headers": {
+    "Content-Type": "application/json",
+    "X-Woow-Proxy-Error": "config"
+  },
+  "_http_status": 503,
+  "_proxy_error": "config",
+  "_raw_empty": false,
+  "_route": "",
+  "_source": "contract-shape",
+  "body": {
+    "message": "newapi-proxy: config",
+    "proxy_error": "config",
+    "reason": "ap_token_missing",
+    "success": false
+  }
+}
