@@ -1253,6 +1253,8 @@ def cmd_call(a):
     if a.method.upper() != "GET":
         require_target(c, a, writes=True, out=sys.stderr)  # stdout stays JSON
     body = json.loads(a.json) if a.json else None
+    if a.path.rstrip("/") == "/api/option" and isinstance(body, dict) and body.get("key") in NEVER_WRITE:
+        raise Fatal(f"{body['key']} must never be written (on rc.44 it replaces the live group ratios)")
     answer = c.req(a.method.upper(), a.path, body)
     if a.raw:
         print("warning: --raw output is not redacted and may hold credentials", file=sys.stderr)

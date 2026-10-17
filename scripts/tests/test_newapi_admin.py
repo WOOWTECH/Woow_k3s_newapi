@@ -839,6 +839,13 @@ class TestCall(Base):
         self.assertIn("nap_" + "N" * 43, out)
         self.assertIn("not redacted", err)
 
+    def test_call_refuses_the_stale_group_exports(self):
+        for key in sorted(na.NEVER_WRITE):
+            rc, _, err = self.run_tool("call", "PUT", "/api/option/", json.dumps({"key": key, "value": "{}"}))
+            self.assertEqual(rc, 2, key)
+            self.assertIn("never be written", err)
+        self.assertEqual(self.writes(), [])
+
     def test_get_call_reads_without_target(self):
         rc, out, _ = self.run_tool("call", "GET", "/api/option/", target=None)
         self.assertEqual(rc, 0, out)
