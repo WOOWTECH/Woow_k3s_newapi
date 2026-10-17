@@ -168,7 +168,22 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
    - 重看 DESIGN §7.1 的 I8 清單，以及 I2 契約〔PROV〕§6.3 列的檔案：`git diff vOLD vNEW -- router/api-router.go middleware/access_token_routes.go …`（完整清單在 §6.3 最後一段），有變更就逐條對照 C01–C27。
    - 在同一個 PR 把 `scripts/newapi_admin.py` 的 `INVARIANTS_FOR_VERSION` 改成新版本（沒改 CI 就是紅的）。升到含 `45fbb149f`（各分組分開計數）的 release 時：契約測試先確認 Redis key 變成 `rateLimit:<uid>:free`，再照 `_comment_ratelimit` 改 `deploy/settings.json` 的限流值，並改寫 `rate-limit-group`、`rate-limit-count` 這兩個不變量與 `test_upgrade_values_fail_on_rc44`（新值在 rc.44 規則下本來就會失敗）。
    - 有任何不變量或 PaaS 依賴的值要改，先照〈PaaS 依賴的設定不變量〉通知 PaaS（PaaS 的 I8 清單一起改），約好套用時間。
-4. 先在 stg 升：`helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait`，跑 NA-03 契約測試、`verify-settings deploy/settings.json deploy/settings-stg.json` 與 `apply-channels --dry-run`，都 exit 0 才往下。
+4. 先在 stg 升：`helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait`，再依序跑下面三個，**都要過才往下**：
+   - **NA-03 契約測試（升版 gate）**：`tests/contract/` 的 C01–C27、F01–F12、X01–X09 在 stg 全綠。跑法、要設的 env、限流預算見 `tests/contract/README.md`：
+
+     ```bash
+     kubectl -n new-api-stg port-forward svc/newapi 3301:3000 &
+     export NEWAPI_CONTRACT_BASE=http://127.0.0.1:3301
+     export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract  # 這次測試另建的 PAT，不要借代理的 AP/OP
+     export NEWAPI_CONTRACT_RELAY_BASE=http://127.0.0.1:3301 NEWAPI_CONTRACT_PAID_MODEL=<最便宜的付費模型>
+     export NEWAPI_CONTRACT_PSQL="kubectl -n new-api-stg exec -i newapi-postgres-0 -- psql -U newapi -d newapi -tAc"
+     export NEWAPI_CONTRACT_PROXY_BASE=http://newapi-proxy.new-api-stg.svc.cluster.local:8080 NEWAPI_CONTRACT_REPORT=/tmp/contract.json
+     pytest tests/contract        # 結尾印出每個 id 的 pass/fail/skip；report 貼進 PR（含 F10 的透支數字、C23 的耗時）
+     ```
+
+     升到含 `45fbb149f`（各分組分開計數）的版本時，先確認契約測試看到 Redis key 變成 `rateLimit:<uid>:free`（F12，設 `NEWAPI_CONTRACT_EXPECT_PERGROUP=1`），再改 `deploy/settings.json` 的限流值與不變量（見本檔〈PaaS 依賴的設定不變量〉與 `_comment_ratelimit`）。CI 每個 PR 另跑離線自檢（`python3 tests/contract/selfcheck.py`：簽章 golden vector、去敏、每個 id 都有測試）。
+   - `verify-settings deploy/settings.json deploy/settings-stg.json` exit 0（F02/F05/F09 暫改的設定要已改回）。
+   - `apply-channels --dry-run` exit 0。
 5. prod 先手動備份：`kubectl -n new-api create job --from=cronjob/newapi-pg-backup pre-upgrade-$(date +%m%d)`
 6. 送 Gitea PR，合併後 `helm upgrade ... --wait`；master 是 Recreate，會停約 10–30 秒
 7. `helm test newapi -n new-api`，用一把測試 key 打 `/v1/chat/completions`，再跑 `verify-settings deploy/settings.json` 與 `apply-channels --dry-run`（exit 0），最後通知 PaaS。

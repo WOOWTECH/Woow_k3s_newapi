@@ -73,8 +73,8 @@ jobs:
         run: |
           set -euo pipefail
           for f in scripts/*.sh; do bash -n "$f"; done
-          for f in scripts/*.py scripts/tests/*.py; do python3 -m py_compile "$f"; done
-          for f in deploy/settings*.json deploy/pricing/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
+          for f in scripts/*.py scripts/tests/*.py tests/contract/*.py; do python3 -m py_compile "$f"; done
+          for f in deploy/settings*.json deploy/pricing/*.json tests/contract/fixtures/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
 
       # newapi_admin.py against an in-process fake new-api (no network).
       - name: Admin tool unit tests
@@ -90,3 +90,10 @@ jobs:
           set -euo pipefail
           python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json
           python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json deploy/settings-stg.json
+
+      # NA-03 contract suite: CI cannot reach new-api-stg, so it runs the
+      # offline self-check (stdlib, no pytest) — the signing golden vector, the
+      # fixture scrubber, and that every id C01-C27/F01-F12/X01-X09 still has a
+      # test. The green-on-stg upgrade gate itself is docs/OPERATIONS.md 〈升版〉.
+      - name: Contract suite self-check (offline)
+        run: python3 tests/contract/selfcheck.py
