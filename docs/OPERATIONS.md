@@ -163,7 +163,12 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 ## 升版
 
 1. 看上游 release notes 與 <https://github.com/QuantumNous/new-api/security/advisories>
-2. `scripts/verify-image.sh vX.Y.Z` → 把 tag＋digest 寫進 `chart/values.yaml`
+2. `scripts/verify-image.sh vX.Y.Z` → 把 tag＋digest 寫進 `chart/values.yaml`；同一個 PR 從新 tag 重新複製
+   `common/limiter/lua/rate_limit.lua` 到 `chart/files/newapi-rate-limit.lua`，並把它的 `sha1sum` 寫進
+   `valkey.rateLimitScriptSha1`（CI 會比對）。原因：new-api 的令牌桶限流器每個行程只 `SCRIPT LOAD` 一次、之後只用
+   `EVALSHA`，Valkey 重啟會清空腳本快取，免費試用等有分組次數上限的請求會一直回 500
+   `rate_limit_check_failed`，直到 new-api 重啟；chart 讓 Valkey 每次啟動都載入同一份腳本來補救（NA-03 F11，
+   上游 rc.45／main 仍是同一份腳本與同樣的寫法）
 3. 審不變量與 PaaS 契約（同一個 PR）：
    - 重看 DESIGN §7.1 的 I8 清單，以及 I2 契約〔PROV〕§6.3 的 C01–C27。在 new-api 原始碼對下面這些檔做
      `git diff vOLD vNEW -- <檔案>`，有變更就逐條對照 C01–C27／F01–F12 與下表的代理政策：

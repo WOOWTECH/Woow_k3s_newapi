@@ -13,6 +13,21 @@ spec:
       port: 6379
       targetPort: redis
 ---
+# new-api's token-bucket limiter (common/limiter, used for per-group request
+# caps such as the free trial's 10 per minute) does SCRIPT LOAD once per
+# process and then only EVALSHA. A Valkey restart empties the script cache,
+# so every capped request fails with NOSCRIPT (500 rate_limit_check_failed)
+# until new-api itself restarts. Loading the identical script after every
+# Valkey start restores the SHA new-api already holds (NA-03 F11).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "newapi.fullname" . }}-valkey-scripts
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+binaryData:
+  rate_limit.lua: {{ .Files.Get "files/newapi-rate-limit.lua" | b64enc }}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +47,8 @@ spec:
       labels:
         {{- include "newapi.labels" . | nindent 8 }}
         app.kubernetes.io/component: valkey
+      annotations:
+        checksum/valkey-scripts: {{ .Files.Get "files/newapi-rate-limit.lua" | sha256sum }}
     spec:
       automountServiceAccountToken: false
       {{- include "newapi.affinity" . | nindent 6 }}
@@ -97,6 +114,23 @@ spec:
           ports:
             - name: redis
               containerPort: 6379
+          lifecycle:
+            postStart:
+              exec:
+                # Best effort, never fails the container: wait for Valkey,
+                # load the script, log a SHA mismatch (CI pins the file).
+                command:
+                  - sh
+                  - -c
+                  - |
+                    i=0
+                    until valkey-cli ping >/dev/null 2>&1; do
+                      i=$((i+1)); [ "$i" -ge 120 ] && { echo "postStart: valkey not up, script not loaded" >&2; exit 0; }
+                      sleep 0.5
+                    done
+                    sha=$(valkey-cli -x SCRIPT LOAD < /scripts/rate_limit.lua 2>&1)
+                    [ "$sha" = {{ .Values.valkey.rateLimitScriptSha1 | quote }} ] || echo "postStart: rate limit script SHA $sha, expected {{ .Values.valkey.rateLimitScriptSha1 }}" >&2
+                    exit 0
           readinessProbe:
             exec:
               command: ["valkey-cli", "ping"]
@@ -114,6 +148,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
       volumes:
         - name: data
           emptyDir: {}
+        - name: scripts
+          configMap:
+            name: {{ include "newapi.fullname" . }}-valkey-scripts
