@@ -242,6 +242,9 @@ def test_f07_paid_success_cap(cfg, admin, relay_base, fc, slow, contract_metric)
         statuses = list(ex.map(lambda _: relay.chat(relay_base, fc.paid_key, cfg.paid_model, max_tokens=1).status,
                                range(136)))
     elapsed = time.time() - t0
+    # rc.44 keeps one success list per user for every group: the next test's
+    # wait_full must wait this burst out too, or the free key gets the paid 429.
+    fc.touched()
     ok, limited = statuses.count(200), statuses.count(429)
     other = sorted(set(statuses) - {200, 429})
     contract_metric("F07", {"ok": ok, "429": limited, "other": other, "elapsed_s": round(elapsed, 1)})

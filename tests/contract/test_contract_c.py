@@ -225,9 +225,8 @@ def test_c07_route_scope_map_admin(lab):
 # --------------------------------------------------------------------------- #
 #  C08 delete session revokes that JWT                                        #
 # --------------------------------------------------------------------------- #
-@pytest.fixture(scope="module")
-def revoked_jwt(consumer):
-    """A second session of the consumer, revoked (C08; C25 reuses the JWT)."""
+def _revoked_session(consumer):
+    """Log the consumer in a second time and revoke that session at once."""
     user = consumer.user
     r = user.lab.base.post("/api/user/login", {"username": user.username, "password": user.password})
     data = r.data or {}
@@ -236,6 +235,14 @@ def revoked_jwt(consumer):
     client = user.lab.base.with_token(jwt)
     rev = client.delete(f"/api/user/sessions/{sid}")
     return client, sid, rev
+
+
+@pytest.fixture(scope="module")
+def revoked_jwt(consumer):
+    """C08's revoked second session. C25 makes its own: it runs after the long
+    waits, when this 15-minute access token has expired and new-api answers
+    AUTH_TOKEN_EXPIRED before it looks at the session."""
+    return _revoked_session(consumer)
 
 
 @pytest.mark.contract_id("C08")
@@ -667,13 +674,13 @@ def test_c24_trusted_proxies_honour_proxy_xff(ip_observation):
 #  C25 stable error codes                                                     #
 # --------------------------------------------------------------------------- #
 @pytest.mark.contract_id("C25")
-def test_c25_error_codes(consumer, narrow_up, revoked_jwt, fixture_sink):
+def test_c25_error_codes(consumer, narrow_up, fixture_sink):
     assert consumer.up.get("/api/user/access_tokens").code == "AUTH_SESSION_REQUIRED"
     assert consumer.user.up_client(narrow_up[0]).get("/api/token/?p=1&page_size=1").code == "ACCESS_TOKEN_SCOPE_DENIED"
     bad = consumer.user.up_client("nap_" + "0" * 43).get("/api/user/self")
     assert bad.status == 401 and bad.code == "AUTH_UNAUTHORIZED", f"unknown PAT: {bad}"
     fixture_sink.capture("unauthorized_error", bad, route="user.self")
-    rev = revoked_jwt[0].get("/api/user/self")
+    rev = _revoked_session(consumer)[0].get("/api/user/self")
     assert rev.status == 401 and rev.code == "AUTH_SESSION_REVOKED", f"revoked session: {rev}"
     nojwt = consumer.user.lab.base.get("/api/user/self")
     assert nojwt.status == 401 and nojwt.code == "AUTH_UNAUTHORIZED", f"no credential: {nojwt}"
