@@ -73,5 +73,17 @@ jobs:
         run: |
           set -euo pipefail
           for f in scripts/*.sh; do bash -n "$f"; done
-          for f in scripts/*.py; do python3 -m py_compile "$f"; done
-          python3 -c 'import json; json.load(open("deploy/settings.json"))'
+          for f in scripts/*.py scripts/tests/*.py; do python3 -m py_compile "$f"; done
+          for f in deploy/settings*.json deploy/pricing/*.json; do python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$f"; done
+
+      # newapi_admin.py against an in-process fake new-api (no network).
+      - name: Admin tool unit tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      # The settings files and the channel spec must keep the invariants the
+      # PaaS depends on (scripts/newapi_admin.py INVARIANTS; DESIGN §7.1 I8).
+      - name: Settings keep the PaaS invariants
+        run: |
+          set -euo pipefail
+          python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json
+          python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json deploy/settings-stg.json
