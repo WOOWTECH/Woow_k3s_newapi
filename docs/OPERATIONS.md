@@ -8,7 +8,9 @@
 |---|---|---|
 | `SESSION_SECRET`、`CRYPTO_SECRET`、DB／Valkey 密碼 | Secret `newapi-secrets`（chart 第一次安裝產生，`resource-policy: keep`） | 換 `SESSION_SECRET` 會讓所有人登出 |
 | Cloudflare connector token | Secret `newapi-cloudflared`（`scripts/cf-tunnel.sh tunnel` 寫入） | 不進 repo |
-| root 帳密 | 安裝者本機 `~/.config/newapi/root-credentials`（0600） | 第一次登入後到個人設定開 2FA |
+| root 帳密 | 安裝者本機 `~/.config/newapi/root-credentials`（0600） | 第一次登入後到個人設定開 2FA；之後維運不再用密碼登入 |
+| 維運用 root PAT（`nap_…`） | 負責人本機 0600 檔（例：`~/.config/newapi/pat-ops`），以 `newapi_admin.py --token-file` 帶入 | 每次工作另建、只勾要用的權限、1 天到期；用完在個人設定撤掉並刪檔（〈設定即程式碼〉） |
+| `get-options --snapshot` 快照 | 負責人本機（例：`~/.config/newapi-backups/`），0600；工具拒絕寫進本 repo、不覆寫既有檔 | 沒有 token、secret、key 類的值，但有 SMTP 帳號、合規確認 IP 等，不要外流 |
 | Cloudflare API token | 只在執行 `cf-tunnel.sh` 時以 `CF_API_TOKEN_FILE` 指向的暫存檔 | 用完刪檔 |
 
 **new-api 把使用者 API key、渠道（上游）key、TOTP secret 都以明文存在 DB。** 備份 PVC
@@ -24,7 +26,11 @@ scripts/cf-tunnel.sh tunnel                # tunnel woow-k3s-new-api + ingress +
 helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait
 kubectl -n new-api port-forward svc/newapi 3300:3000 &
 NEWAPI_ROOT_USER=<管理員帳號> NEWAPI_PUBLIC_URL=https://newapi.woowtech.io scripts/bootstrap-root.sh http://127.0.0.1:3300
-scripts/newapi_admin.py --base http://127.0.0.1:3300 apply-settings deploy/settings.json
+A="scripts/newapi_admin.py --base http://127.0.0.1:3300 --creds ~/.config/newapi/root-credentials"   # 只有開 2FA 之前能用密碼
+$A apply-settings deploy/settings.json
+$A apply-pricing
+$A apply-channels --label prod --key-alias newapi-litellm --key-file <LiteLLM 金鑰的 0600 檔>   # 或 --key-file - 從 stdin
+$A verify-settings deploy/settings.json
 helm test newapi -n new-api
 scripts/cf-tunnel.sh dns                   # 這一步之後網址才對外
 kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放行 new-api
@@ -34,14 +40,102 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
 
 ## 設定即程式碼
 
-`deploy/settings.json` 是正式站的系統選項。改設定請改這個檔再 `apply-settings`，
-不要只在後台點。目前重點：
+系統選項、價格與渠道都以本 repo 為準：改設定請改檔案再套用，不要只在後台點。
+
+| 檔案 | 內容 | 套用 |
+|---|---|---|
+| `deploy/settings.json`（stg 再疊 `deploy/settings-stg.json`，後面的檔案優先） | 系統選項；`_` 開頭的 key 是註解 | `apply-settings` |
+| `deploy/pricing/pricing-plan.json` | 模型清單（`api`、`local`、`internal`）與倍率，`scripts/build_pricing.py` 由 LiteLLM 成本產生 | `apply-pricing` |
+| `deploy/pricing/channels.json` | 渠道（分組、用 plan 的哪份模型清單、免費渠道的 `param_override`）；LiteLLM 金鑰不在檔案裡 | `apply-channels` |
+
+目前重點：
 
 - 關閉所有自助註冊與第三方登入（帳號只由 PaaS 開）
 - 新使用者、邀請、簽到贈額全部為 0／關閉（GHSA-8r8v 計費溢位要先有餘額才打得動）
 - 關閉效能保護（它讀整台節點的 CPU／記憶體／磁碟，節點忙時會讓所有請求 503）
 - 重試 2 次、自動停用／恢復渠道
 - 關閉 JS 任務外掛（外掛讀得到渠道 key）
+- 加價、免費試用分組、限流與顯示單位：見〈PaaS 依賴的設定不變量〉
+
+### 用 PAT 操作（root 開了 2FA 之後唯一的方式）
+
+root 開 2FA 之後，密碼登入會停在二次驗證，`--creds` 就不能用了。`newapi_admin.py --token-file` 改用 root 的個人存取權杖（PAT），完全不走密碼登入。
+
+1. 瀏覽器以 root 登入 → 個人設定 → 存取權杖 → 新增：名稱例如 `ops-<日期>`、**1 天到期**（N21），只勾這次要用的權限：
+
+   | 指令 | 權限 |
+   |---|---|
+   | `get-options`、`verify-settings` | `option:read` |
+   | `apply-settings`、`apply-pricing` | `option:read`、`option:write` |
+   | `apply-channels` | `channel:read`、`channel:sensitive_write`（加 `--update` 時再加 `channel:write`） |
+
+2. 權杖只顯示一次，直接存成 0600 檔（不進 shell history、不印在畫面上）。工具只接受權限 0600、內容只有一行 `nap_…` 的檔案：
+
+   ```bash
+   umask 077; read -rsp 'PAT: ' t; echo; printf '%s\n' "$t" > ~/.config/newapi/pat-ops; unset t
+   ```
+
+3. port-forward 之後依序執行：
+
+   ```bash
+   kubectl -n new-api port-forward svc/newapi 3300:3000 &
+   A="scripts/newapi_admin.py --base http://127.0.0.1:3300 --token-file ~/.config/newapi/pat-ops"
+   $A get-options --snapshot ~/.config/newapi-backups/prod-before-$(date +%Y%m%d-%H%M).json   # 回滾依據
+   $A apply-settings deploy/settings.json     # stg：deploy/settings.json deploy/settings-stg.json
+   $A verify-settings deploy/settings.json    # exit 0 才算完成
+   ```
+
+4. 做完到個人設定撤掉這把 PAT（或等它 1 天後自動過期），再 `shred -u ~/.config/newapi/pat-ops`。
+
+各指令的細節：
+
+- `get-options --snapshot <檔>`：寫出 0600 的 JSON（`{key: 現值}` 加上 `_snapshot` 中繼資料），不覆寫既有檔、拒絕寫進本 repo。token、secret、key 類的值不會出現：伺服器端 GetOptions 本來就不回（`controller/option.go`），工具再依 key 名稱與值的樣子過濾一次，濾掉的 key 列在 `_snapshot.redacted`。注意 new-api 內建的 `SparkDesk-*` 模型名稱含 `sk-` 字樣，檢查金鑰外洩要用 `grep -P '(?<![A-Za-z0-9])sk-[A-Za-z0-9]{20}'`，不要只 grep `sk-`。
+- **回滾**：快照本身就是設定檔，挑要還原的 key 寫回：`$A apply-settings --only ModelRequestRateLimitCount,GroupRatio <快照>`。不給 `--only` 會被拒絕（不要把 200 多個選項整包寫回）。`apply-settings --snapshot <檔>` 會先快照、再套用。
+- `apply-pricing`：先把 `ModelRatio`、`CompletionRatio`、`CacheRatio`、`ModelPrice` 的現值存到 `~/.config/newapi-backups/pricing-before-<主機>-<時間>.json`，再把 plan 併進去（plan 以外的模型不動）；plan 裡的模型若有固定價格（`ModelPrice` 會蓋過倍率）一併移除。值都已經一樣就不寫。
+- `apply-channels`：以渠道名稱對應。不存在的就建立，這時才需要 LiteLLM 金鑰（`--key-file <0600 檔>`、`--key-file -` 從 stdin、或 `--key-env <變數名>`；金鑰不會印出、不進 repo）。已存在的比對類型、base URL、分組、模型、測試模型、`param_override`、`auto_ban`、權重、優先序，不同就列出 `DRIFT` 並 exit 1；加 `--update` 才改回檔案的樣子（只送這些欄位，金鑰不動）。`--dry-run` 只列出要做的事；`--with-internal` 才處理 ChatGPT 訂閱的內部測試渠道；同名渠道有兩個以上時拒絕動手。
+- `verify-settings`：唯讀，只發三個請求（匿名 `/api/status`、`GET /api/option/`、`GET /api/pricing`，都在 GA 桶，不吃 CT 桶）。比對設定檔每個 key 的現值、〈PaaS 依賴的設定不變量〉、plan 的倍率，以及各分組實際提供哪些模型；任何一項不符 exit 1，只印 key 名稱與值，不印任何憑證；`-v` 連通過的也列出、`--no-plan` 略過價格與渠道。`--offline` 只檢查檔案本身（CI 每個 PR 都跑）。
+- 調價（`GroupRatio` 或 plan 的倍率）一樣走 PR：改檔 → `apply-settings`／`apply-pricing` → `verify-settings`。加價屬於 PaaS 依賴的值，先照下一節通知 PaaS。
+- 密碼登入（`--creds`）只剩第一次安裝（開 2FA 之前）與 stg（root 刻意不開 2FA）能用；root 有 2FA 時工具會提示改用 `--token-file`。
+
+## PaaS 依賴的設定不變量
+
+PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，PaaS 定期讀匿名 `/api/status`（每 5 分鐘）與 OP（root 名下只有 `option:read` 的 PAT）讀到的 `GET /api/option/`（每小時），不符就 fail closed：停止開通、建金鑰、點數轉換與轉換 worker，`/api/llm/models` 顯示維護中（既有金鑰照常可用，N17）。`verify-settings` 檢查同一份清單（`scripts/newapi_admin.py` 的 `INVARIANTS`、`STATUS_C22`、`STATUS_RUNTIME`）。
+
+| 範圍 | key（rc.44 `GET /api/option/` 的實際名稱） | 必須是 | 為什麼 |
+|---|---|---|---|
+| 分組 | `UserUsableGroups` | key 剛好 `default`、`free` | `internal` 不能讓一般帳號選 |
+| | `GroupRatio` | `default` = 1.3；`free` = 0；其他分組不得為 0 | D5 加價；免費試用（D11） |
+| | `GroupGroupRatio` | `{}` | `/api/pricing` 與計費都會套用它 |
+| | `group_ratio_setting.group_special_usable_group` | `{}` | 會依使用者分組多開可選的分組 |
+| 計費 | `quota_setting.enable_free_model_pre_consume` | `false` | 還沒轉點數的帳號也能試用 |
+| | `quota_setting.trust_quota_usd` | `0` | 每個付費請求都先預扣，壓低透支 |
+| 限流（rc.44） | `ModelRequestRateLimitEnabled`、`ModelRequestRateLimitDurationMinutes` | `true`、`1` | D11 每分鐘 10 次 |
+| | `ModelRequestRateLimitCount` | `0` | rc.44 各分組共用計數，付費請求會把免費的桶補滿 |
+| | `ModelRequestRateLimitGroup` | 只覆寫 `free`，且 `free[1]` = `ModelRequestRateLimitSuccessCount` | 同上（`deploy/settings.json` 的 `_comment_ratelimit`） |
+| 帳號與贈額 | `RegisterEnabled`、`QuotaForNewUser`、`QuotaForInviter`、`QuotaForInvitee` | `false`、`0`、`0`、`0` | 帳號與額度只經 PaaS |
+| | `checkin_setting.enabled` | `false` | 簽到加的額度記成 type 4，對帳掃不到 |
+| | `payment_setting.compliance_confirmed` | `false` | 兌換碼、訂閱、儲值、邀請返利都靠它開；一般設定 API 寫不進去，只檢查不套用 |
+| 紀錄 | `LogConsumeEnabled`、`DataExportEnabled` | `true`、`true` | 用量頁、圖表、對帳 |
+| 其他 | `SelfUseModeEnabled` | `false` | 沒定價的模型要被拒絕 |
+| | `HeaderNavModules` | `rankings: false`、`pricing.requireAuth: true` | D8 |
+| | `ExposeRatioEnabled` | `false` | `/api/ratio_config` 維持 403 |
+| | `general_setting.quota_display_type`、`general_setting.custom_currency_exchange_rate` | `CUSTOM`、`32` | 錯誤訊息顯示「點」（N10） |
+
+另外檢查：
+
+- 匿名 `/api/status`（I2 契約 C22）：`quota_per_unit=500000`、`password_login_enabled=true`、`turnstile_check=false`、`password_login_encryption_enabled=false`、`enable_batch_update=false`、`enable_data_export=true`、`register_enabled=false`、`self_use_mode_enabled=false`。`verify-settings` 再比對 `quota_display_type`、`custom_currency_exchange_rate`、`checkin_enabled` 的實際生效值（選項清單不一定跟記憶體同步，例如 `DisplayInCurrencyEnabled` 只改記憶體裡的顯示類型）與 `version`。
+- `GET /api/pricing`（root 看到的）：可選分組剛好 default、free；實際倍率 default 1.3、free 0；`free` 分組只提供 plan 的兩個 Qwen，兩個 Qwen 不在任何付費分組，plan 的付費模型都由 `default` 提供（付費渠道被自動停用時這一項也會失敗）。
+- 不要讀 `group_ratio_setting.group_ratio`、`group_ratio_setting.group_group_ratio`：rc.44 啟動時匯出的是內建預設值（`{"default":1,"svip":1,"vip":1}`、`{"vip":{"edit_this":0.9}}`），不會跟著 `GroupRatio`／`GroupGroupRatio` 改；生效的是後兩者（stg 2026-10-17 實測）。
+
+**改之前先通知 PaaS**：上表任何一項（含加價、匯率、限流、分組、免費試用的模型）要改，順序是：
+
+1. 先在 PaaS（`woow_paas_platform`）開 issue／PR，讓 PaaS 端的檢查值、價目換算與畫面文案一起改，並約好套用時間；漲價要提前 7 天公告。
+2. 本 repo 在同一個 PR 改 `deploy/settings.json`（或 `deploy/pricing/`）與 `scripts/newapi_admin.py` 的不變量；CI 的 `verify-settings --offline` 會擋下只改了一半的 PR。
+3. 在約好的時間套用，`verify-settings` exit 0 之後通知 PaaS。
+
+沒先通知就改，PaaS 會在下一次檢查時把整個 AI 模型分頁轉成維護中。
+
+**升版**：伺服器的 `version` 不等於 `INVARIANTS_FOR_VERSION`（目前 `v1.0.0-rc.44`）時，`verify-settings` 一律失敗：限流的不變量只在 rc.44 驗證過。升版前先重看 DESIGN §7.1；升到含 `45fbb149f`（各分組分開計數）的 release 時，照 `_comment_ratelimit` 改限流值，並在同一個 PR 更新 `INVARIANTS_FOR_VERSION`。
 
 ## 升版
 
@@ -69,9 +163,14 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 
 ## 網路
 
-- 進：只有 cloudflared、同 ns 的 `newapi-proxy`（`proxy.enabled` 時）與 helm test pod 能連 `newapi:3000`；`networkPolicy.clients` 可加叢集內客戶端。
+- 進：只有 cloudflared、同 ns 的 `newapi-proxy`（`proxy.enabled` 時）與 helm test pod 能連 `newapi:3000`；`networkPolicy.clients` 能再加叢集內客戶端，但限制見下一點。
 - 出：DB、Valkey、`networkPolicy.upstreams`（目前 LiteLLM svc203）、公網 80/443；私網（10/8、172.16/12、192.168/16、100.64/10、169.254/16）一律擋，防管理員把渠道 base URL 指到內網。
-- `TRUSTED_PROXIES=10.42.0.0/16`：只有 cloudflared 與同 ns 的 `newapi-proxy` 連得進來，所以信任 pod 網段取 `X-Forwarded-For` 是安全的。`newapi-proxy` 一律把 XFF 覆寫成單一合成 IP（198.18.0.0/15：`.0.1` AP、`.0.2` anon、`.0.3` OP、`.0.4` break-glass、`.0.5` 代理自己的 readiness，其餘是 PaaS 租戶；對照表在 PaaS），所以 new-api 記到 PaaS 來的 IP 都是合成 IP，限流也按租戶計。
+- `TRUSTED_PROXIES=10.42.0.0/16`（`newapi.trustedProxies`）：new-api 相信 pod 網段送來的 `X-Forwarded-For`，限流與稽核都拿它當來源 IP。這樣做安全的前提是 NetworkPolicy 只讓這三種 pod 連到 `newapi:3000`（DESIGN §1.4.1）：
+  - cloudflared：把真實的 client IP 放進 XFF；
+  - 同 ns 的 `newapi-proxy`：刪掉進來的 XFF，一律覆寫成單一合成 IP（198.18.0.0/15：`.0.1` AP、`.0.2` anon、`.0.3` OP、`.0.4` break-glass、`.0.5` 代理自己的 readiness，其餘是 PaaS 租戶；合成 IP 對照表在 PaaS），所以 new-api 記到 PaaS 來的 IP 都是合成 IP，限流也按租戶計；
+  - helm test pod：只打 `/api/status`。
+
+  **`networkPolicy.clients` 加進來的客戶端同樣被信任 XFF**，可以任意冒用別人的限流桶與稽核 IP：只能加會自己覆寫 XFF 的代理。PaaS 一律走 `newapi-proxy`，Odoo 與租戶 pod 都不能加進 `clients`。
 - Valkey：只收 new-api（預設使用者，`requirepass`）與 `newapi-proxy`（`proxy.enabled` 時；ACL 使用者 `newapi-proxy`，只能 `SET` `newapi-proxy:replay:*` 與 `PING`，讀不到 new-api 的 session、快取與限流計數）。
 - 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。
 - 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
@@ -90,6 +189,7 @@ dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛
 | LiteLLM svc203 · API（可販售） | vLLM（62） | `default` | 40 個 OpenRouter 模型＋2 個自架 Qwen3-4B |
 | LiteLLM svc203 · ChatGPT 訂閱（內部測試） | vLLM（62） | `internal` | 22 個 `chatgpt/`、`toypark1234/`、`apporo/` 模型 |
 
+- 目標配置（DESIGN §7.2）在 `deploy/pricing/channels.json`：付費渠道只放 plan 的 40 個 API 模型，兩個 Qwen 移到 `free` 分組的「LiteLLM svc203 · 免費試用（自架 Qwen）」（`param_override` 把 `max_tokens` 限在 2048）。stg 已經是這個樣子；正式站在 NA-04 以 `apply-channels --update` 套用後更新本表。
 - 兩個渠道共用 LiteLLM 金鑰 `newapi-litellm`（US$5 預算）；base URL 走叢集內 `svc-a8389061-litellm.paas-ws-32e92be2.svc.cluster.local:4000`。
 - vLLM 渠道固定 6 條 `converter: none` 路由：Chat／Messages／Responses 原樣轉給 LiteLLM。
 - `internal` 不在 `UserUsableGroups`：只有自身分組是 `internal` 的帳號用得到，一般帳號建 token 也選不到。
@@ -107,14 +207,23 @@ helm upgrade --install newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml
 kubectl apply -f deploy/litellm-from-newapi-stg-ingress.yaml
 kubectl -n new-api-stg port-forward svc/newapi 3301:3000 &
 NEWAPI_ROOT_USER=<root 名稱> scripts/bootstrap-root.sh http://127.0.0.1:3301 ~/.config/newapi-stg/root-credentials
-scripts/newapi_admin.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials apply-settings deploy/settings.json
-scripts/newapi_admin.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials apply-settings deploy/settings-stg.json
-scripts/apply_pricing.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials
-# LiteLLM 金鑰在 LiteLLM pod 內產生後直接 pipe 進 create_channels.py（不落地）：
-#   ... | scripts/create_channels.py --base http://127.0.0.1:3301 --creds ... --label stg --key-alias newapi-stg-litellm
+A="scripts/newapi_admin.py --base http://127.0.0.1:3301 --creds ~/.config/newapi-stg/root-credentials"
+$A apply-settings deploy/settings.json deploy/settings-stg.json
+$A apply-pricing
+# LiteLLM 金鑰在 LiteLLM pod 內產生後直接 pipe 進來（不落地）：
+#   ... | $A apply-channels --label stg --key-alias newapi-stg-litellm --key-file -
 scripts/bootstrap_service_account.py --base http://127.0.0.1:3301 --root-creds ~/.config/newapi-stg/root-credentials \
   --svc-user wpsvc-stg --svc-creds ~/.config/newapi-stg/service-account \
   --namespace new-api-stg --secret newapi-proxy-pats --label stg
+```
+
+唯讀檢查不必登入（也不吃 CT 桶）：借代理的 OP（root 名下只有 `option:read`）放進 0600 暫存檔，用完就刪：
+
+```bash
+f=$(mktemp)   # 0600
+kubectl -n new-api-stg get secret newapi-proxy-pats -o jsonpath='{.data.op}' | base64 -d > "$f"
+scripts/newapi_admin.py --base http://127.0.0.1:3301 --token-file "$f" verify-settings deploy/settings.json deploy/settings-stg.json
+shred -u "$f" 2>/dev/null || rm -f "$f"
 ```
 
 - 沒有公開網址（cloudflared 關閉）；呼叫一律走叢集內或 port-forward。

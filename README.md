@@ -30,7 +30,7 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 2. `scripts/cf-tunnel.sh tunnel`（建 tunnel＋ingress＋connector Secret，**不建 DNS**）
 3. `helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait`
 4. port-forward 後 `NEWAPI_ROOT_USER=<管理員帳號> scripts/bootstrap-root.sh http://127.0.0.1:3300`（`/api/setup` 先到先得，一定要在 DNS 之前）
-5. `scripts/newapi_admin.py --base http://127.0.0.1:3300 apply-settings deploy/settings.json`
+5. `scripts/newapi_admin.py --base http://127.0.0.1:3300 --creds ~/.config/newapi/root-credentials apply-settings deploy/settings.json`，再 `apply-pricing`、`apply-channels`、`verify-settings`（root 開 2FA 之後一律改用 `--token-file`，見 OPERATIONS〈設定即程式碼〉）
 6. `scripts/cf-tunnel.sh dns`（公開網址生效）
 
 ## 授權
