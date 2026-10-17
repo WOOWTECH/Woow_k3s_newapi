@@ -1,0 +1,10 @@
+{
+  "_http_status": 400,
+  "_proxy_error": "bad_request",
+  "body": {
+    "message": "newapi-proxy: bad_request",
+    "proxy_error": "bad_request",
+    "reason": "manage_id",
+    "success": false
+  }
+}

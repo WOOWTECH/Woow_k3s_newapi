@@ -1,0 +1,10 @@
+{
+  "_http_status": 500,
+  "_proxy_error": "internal",
+  "body": {
+    "message": "newapi-proxy: internal",
+    "proxy_error": "internal",
+    "reason": "internal",
+    "success": false
+  }
+}

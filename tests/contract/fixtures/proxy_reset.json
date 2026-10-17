@@ -1,0 +1,10 @@
+{
+  "_http_status": 502,
+  "_proxy_error": "reset",
+  "body": {
+    "message": "newapi-proxy: reset",
+    "proxy_error": "reset",
+    "reason": "upstream_reset",
+    "success": false
+  }
+}

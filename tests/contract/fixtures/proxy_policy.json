@@ -1,0 +1,10 @@
+{
+  "_http_status": 403,
+  "_proxy_error": "policy",
+  "body": {
+    "message": "newapi-proxy: policy",
+    "proxy_error": "policy",
+    "reason": "token_group",
+    "success": false
+  }
+}

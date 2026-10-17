@@ -1,0 +1,10 @@
+{
+  "_http_status": 503,
+  "_proxy_error": "config",
+  "body": {
+    "message": "newapi-proxy: config",
+    "proxy_error": "config",
+    "reason": "ap_missing",
+    "success": false
+  }
+}

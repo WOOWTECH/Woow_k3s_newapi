@@ -1,0 +1,10 @@
+{
+  "_http_status": 429,
+  "_proxy_error": "budget",
+  "body": {
+    "message": "newapi-proxy: budget",
+    "proxy_error": "budget",
+    "reason": "add_quota_cap",
+    "success": false
+  }
+}

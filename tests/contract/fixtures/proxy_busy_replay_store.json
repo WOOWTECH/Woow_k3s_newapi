@@ -1,0 +1,10 @@
+{
+  "_http_status": 503,
+  "_proxy_error": "busy",
+  "body": {
+    "message": "newapi-proxy: busy",
+    "proxy_error": "busy",
+    "reason": "replay_store",
+    "success": false
+  }
+}

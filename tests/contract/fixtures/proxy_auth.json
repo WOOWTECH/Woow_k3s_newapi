@@ -1,0 +1,10 @@
+{
+  "_http_status": 401,
+  "_proxy_error": "auth",
+  "body": {
+    "message": "newapi-proxy: auth",
+    "proxy_error": "auth",
+    "reason": "auth",
+    "success": false
+  }
+}

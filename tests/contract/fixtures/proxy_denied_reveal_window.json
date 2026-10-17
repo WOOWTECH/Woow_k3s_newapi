@@ -1,0 +1,10 @@
+{
+  "_http_status": 403,
+  "_proxy_error": "denied",
+  "body": {
+    "message": "newapi-proxy: denied",
+    "proxy_error": "denied",
+    "reason": "reveal_window",
+    "success": false
+  }
+}

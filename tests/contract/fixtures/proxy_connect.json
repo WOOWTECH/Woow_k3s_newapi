@@ -1,0 +1,10 @@
+{
+  "_http_status": 502,
+  "_proxy_error": "connect",
+  "body": {
+    "message": "newapi-proxy: connect",
+    "proxy_error": "connect",
+    "reason": "deadline",
+    "success": false
+  }
+}

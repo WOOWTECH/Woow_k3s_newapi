@@ -1,0 +1,10 @@
+{
+  "_http_status": 408,
+  "_proxy_error": "body_timeout",
+  "body": {
+    "message": "newapi-proxy: body_timeout",
+    "proxy_error": "body_timeout",
+    "reason": "body_timeout",
+    "success": false
+  }
+}
