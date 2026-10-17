@@ -81,8 +81,11 @@ jobs:
         run: python3 -m unittest discover -s scripts/tests -v
 
       # The settings files and the channel spec must keep the invariants the
-      # PaaS depends on (scripts/newapi_admin.py INVARIANTS; DESIGN §7.1 I8).
-      - name: Settings keep the PaaS invariants
+      # PaaS depends on (scripts/newapi_admin.py INVARIANTS; DESIGN §7.1 I8),
+      # paid channels serve only priced models, and chart/values.yaml
+      # newapi.image.tag must equal INVARIANTS_FOR_VERSION: an upgrade PR that
+      # skips the invariant review (docs/OPERATIONS.md 〈升版〉) fails here.
+      - name: Settings keep the PaaS invariants and the version pin
         run: |
           set -euo pipefail
           python3 scripts/newapi_admin.py verify-settings --offline deploy/settings.json

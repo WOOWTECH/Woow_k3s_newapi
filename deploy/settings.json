@@ -32,8 +32,12 @@
     "default": "預設",
     "free": "免費試用"
   },
-  "group_ratio_setting.group_special_usable_group": {},
-  "_comment_groups": "default = sellable models at markup 1.3 (D5); free = self-hosted Qwen3-4B trial, ratio 0 (D11): with quota_setting.enable_free_model_pre_consume false, accounts that never converted points can use it, so no group other than free may have ratio 0 and group free may serve only the two Qwen (deploy/pricing/channels.json); internal = ChatGPT-subscription test channel, NOT user-selectable. group_special_usable_group stays {} (it adds selectable groups per user group). Model ratios = LiteLLM cost. Read GroupRatio / GroupGroupRatio, not group_ratio_setting.group_ratio / group_group_ratio: on rc.44 those two are start-up exports of the built-in defaults and do not follow the real values.",
+  "group_ratio_setting.group_special_usable_group": {
+    "free_blocked": {
+      "-:free": ""
+    }
+  },
+  "_comment_groups": "default = sellable models at markup 1.3 (D5); free = self-hosted Qwen3-4B trial, ratio 0 (D11): with quota_setting.enable_free_model_pre_consume false, accounts that never converted points can use it, so no group other than free may have ratio 0, group free may serve only the two Qwen (deploy/pricing/channels.json), and no model in a paid group may have ModelRatio 0 (rc.44 bills that as free for everyone too; build_pricing.py leaves such models out). internal = ChatGPT-subscription test channel, NOT user-selectable. group_special_usable_group holds only '-:' removals (an add would open a group to a user group): free_blocked -> -:free is preset for the LLM-10 trial fallback, which then only moves a user into group free_blocked (no user is in it otherwise, so it does nothing). Model ratios = LiteLLM cost. Never read or write group_ratio_setting.group_ratio / group_group_ratio: on rc.44 they are start-up exports of the built-in defaults that do not follow GroupRatio / GroupGroupRatio, yet a PUT of one replaces the live group ratios (newapi_admin.py refuses both). What counts is the effective ratio in GET /api/pricing group_ratio.",
   "TopupGroupRatio": {
     "default": 1
   },
@@ -63,6 +67,6 @@
   "general_setting.custom_currency_symbol": "點",
   "general_setting.custom_currency_exchange_rate": 32,
   "ExposeRatioEnabled": false,
-  "_comment_ratelimit": "rc.44 safe combination: groups share one counter key and only swap the limit (middleware/model-rate-limit.go:195-199), so paid requests could refill the free bucket (541 free requests/min in simulation). Hence the global Count stays 0 (groups without an override never touch the total bucket), only free is overridden, and free[1] == the global SuccessCount (one shared success list: paid + free 120 successes/min). free[0] = 10 is the D11 per-minute trial cap; the daily cap (200) is enforced by the PaaS meter cron. After upgrading to a release with 45fbb149f (per-group counters), once the contract test sees Redis keys rateLimit:<uid>:free: ModelRequestRateLimitGroup {\"default\": [300, 120], \"free\": [10, 10]}, global Count 0 and SuccessCount 120, and bump INVARIANTS_FOR_VERSION in scripts/newapi_admin.py in the same PR.",
+  "_comment_ratelimit": "rc.44 safe combination: groups share one counter key and only swap the limit (middleware/model-rate-limit.go:195-199), so paid requests could refill the free bucket (541 free requests/min in simulation). Hence the global Count stays 0 (groups without an override never touch the total bucket), only free is overridden, and free[1] == the global SuccessCount (one shared success list: paid + free 120 successes/min). free[0] = 10 is the D11 per-minute trial cap (an invariant: the PaaS copy and terms say 10); the daily cap (200) is enforced by the PaaS meter cron. After upgrading to a release with 45fbb149f (per-group counters), once the contract test sees Redis keys rateLimit:<uid>:free: ModelRequestRateLimitGroup {\"default\": [300, 120], \"free\": [10, 10]}, global Count 0 and SuccessCount 120. Those values break the rc.44 invariants on purpose: the same PR bumps INVARIANTS_FOR_VERSION and rewrites the rate-limit-group and rate-limit-count invariants and their test (test_upgrade_values_fail_on_rc44), and the PaaS I8 list changes with it (docs/OPERATIONS.md, 升版).",
   "_comment_display": "Error messages and the owner console show 點 (CUSTOM, rate 32 = R in DECISIONS D5)."
 }
