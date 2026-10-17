@@ -27,6 +27,8 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
+import threading
 import time
 
 from .config import NAMESPACE
@@ -176,33 +178,108 @@ class Kube:
 
     # -- port-forward --------------------------------------------------- #
     @contextlib.contextmanager
-    def port_forward(self, target, remote_port, timeout=30):
-        """``kubectl port-forward <target> <free>:<remote>``; yields the origin."""
+    def port_forward(self, target, remote_port, timeout=30, supervise=True):
+        """``kubectl port-forward <target> <free>:<remote>``; yields the origin.
+
+        ``supervise`` (default): a watcher restarts kubectl on the same local
+        port whenever it exits, and opens one idle TCP connection every 30 s
+        so the tunnel never sits idle. Live gate runs showed why: a
+        port-forward that waited out a 14-minute CT window was gone afterwards
+        (ConnectionRefused for every later test), and a ``svc/`` forward dies
+        with the pod it picked (master Recreate, a proxy pod kill). The
+        clients retry a refused connection (nothing was sent), so a restart
+        costs a request a second or two, never a test. X09 forwards to one
+        named pod and wants the drop: ``supervise=False``."""
         if not re.fullmatch(r"(svc|pod)/[a-z0-9-]{1,63}", target):
             raise KubeError("port_forward: svc/<name> or pod/<name>")
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             local = s.getsockname()[1]
-        proc = subprocess.Popen(
-            self._cmd("port-forward", "--address", "127.0.0.1", target, f"{local}:{remote_port}"),
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-        )
+        fwd = _Forward(self, target, remote_port, local)
+        fwd.spawn()
         try:
-            deadline = time.time() + timeout
-            while True:
-                if proc.poll() is not None:
-                    raise KubeError(f"port-forward {target} exited: {(proc.stderr.read() or '').strip()[:200]}")
-                try:
-                    with socket.create_connection(("127.0.0.1", local), timeout=1):
-                        break
-                except OSError:
-                    if time.time() > deadline:
-                        raise KubeError(f"port-forward {target} not ready in {timeout}s") from None
-                    time.sleep(0.2)
+            fwd.wait_ready(timeout)
+            if supervise:
+                fwd.start_watch()
             yield f"http://127.0.0.1:{local}"
         finally:
-            proc.terminate()
+            fwd.stop()
+
+
+class _Forward:
+    """One kubectl port-forward process, optionally restarted when it exits."""
+
+    WATCH_EVERY = 2
+    KEEPALIVE_EVERY = 30
+
+    def __init__(self, kube, target, remote_port, local):
+        self.kube, self.target, self.remote, self.local = kube, target, remote_port, local
+        self.proc = None
+        self.restarts = 0
+        self._err = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def spawn(self):
+        if self._err is not None:
+            self._err.close()
+        self._err = tempfile.TemporaryFile(mode="w+")  # noqa: SIM115 — lives as long as the process
+        self.proc = subprocess.Popen(
+            self.kube._cmd("port-forward", "--address", "127.0.0.1", self.target, f"{self.local}:{self.remote}"),
+            stdout=subprocess.DEVNULL, stderr=self._err, text=True,
+        )
+
+    def _stderr(self):
+        try:
+            self._err.seek(0)
+            return self._err.read().strip()[:200]
+        except (OSError, ValueError):
+            return ""
+
+    def _connect(self):
+        try:
+            with socket.create_connection(("127.0.0.1", self.local), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    def wait_ready(self, timeout):
+        deadline = time.time() + timeout
+        while True:
+            if self.proc.poll() is not None:
+                raise KubeError(f"port-forward {self.target} exited: {self._stderr()}")
+            if self._connect():
+                return
+            if time.time() > deadline:
+                raise KubeError(f"port-forward {self.target} not ready in {timeout}s")
+            time.sleep(0.2)
+
+    def start_watch(self):
+        self._thread = threading.Thread(target=self._watch, name=f"port-forward {self.target}", daemon=True)
+        self._thread.start()
+
+    def _watch(self):
+        idle = 0.0
+        while not self._stop.wait(self.WATCH_EVERY):
+            if self.proc.poll() is not None:
+                self.restarts += 1
+                self.spawn()
+                idle = 0.0
+                continue
+            idle += self.WATCH_EVERY
+            if idle >= self.KEEPALIVE_EVERY:
+                self._connect()
+                idle = 0.0
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
             try:
-                proc.wait(timeout=5)
+                self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                self.proc.kill()
+        if self._err is not None:
+            self._err.close()

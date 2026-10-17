@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 
 from . import signing
-from .newapi import _NoRedirect, check_origin
+from .newapi import Headers, _NoRedirect, check_origin, open_url
 from .redact import wrap_secrets
 
 UA = "woow-newapi-contract-proxy/2"
@@ -40,7 +40,7 @@ class TransportError(Exception):
 class ProxyResponse:
     def __init__(self, status, body_bytes, headers):
         self.status = status
-        self.headers = headers
+        self.headers = headers = Headers(headers or {})
         self.proxy_error = headers.get("X-Woow-Proxy-Error")
         self.precheck = headers.get("X-Woow-Proxy-Precheck")
         self.request_id = headers.get("X-Oneapi-Request-Id")
@@ -130,7 +130,7 @@ class ProxyClient:
         for k, v in (extra_headers or {}).items():
             req.add_header(k, v)
         try:
-            with _OPENER.open(req, timeout=timeout) as resp:
+            with open_url(_OPENER, req, timeout, retry_seconds=20) as resp:  # the signature's ts is good for 30 s
                 return ProxyResponse(resp.status, resp.read(), dict(resp.headers.items()))
         except urllib.error.HTTPError as e:
             return ProxyResponse(e.code, e.read(), dict(e.headers.items()) if e.headers else {})

@@ -16,6 +16,7 @@ create/patch/delete, reveal) first takes one slot from the shared
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,6 +40,33 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
+#: How long a loopback origin may refuse connections before a call fails: the
+#: suite's port-forwards restart themselves (kube.py) and a master Recreate
+#: takes 10-30 s. A refused connection never carried the request, so the retry
+#: cannot repeat a write; a GET is also retried when the dying forward resets
+#: the connection (a reset POST may have been delivered: never retried).
+REFUSED_RETRY_SECONDS = 120
+
+
+def open_url(opener, req, timeout, retry_seconds=REFUSED_RETRY_SECONDS):
+    """``opener.open`` that waits out a restarting loopback port-forward."""
+    host = urllib.parse.urlsplit(req.full_url).hostname
+    idempotent = req.get_method() in ("GET", "HEAD")
+    deadline = time.time() + retry_seconds
+    while True:
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, ConnectionResetError) as e:
+            reason = getattr(e, "reason", e)
+            retry = isinstance(reason, ConnectionRefusedError) or (
+                idempotent and isinstance(reason, (ConnectionResetError, ConnectionAbortedError)))
+            if retry and host in LOOPBACK_HOSTS and time.time() < deadline:
+                time.sleep(1)
+                continue
+            raise
+
 
 def check_origin(base, what="base"):
     """``scheme://host[:port]`` for an http(s) origin; plain http only to loopback."""
@@ -52,6 +80,18 @@ def check_origin(base, what="base"):
     return f"{u.scheme}://{u.netloc}"
 
 
+class Headers(dict):
+    """Response headers as sent; ``get`` ignores case (the proxy, a Python ASGI
+    server, sends lowercase names; new-api sends canonical ones)."""
+
+    def get(self, name, default=None):
+        low = name.lower()
+        for k, v in self.items():
+            if k.lower() == low:
+                return v
+        return default
+
+
 class Response:
     """One new-api answer: HTTP status, parsed JSON body and the headers that
     matter. ``code``/``message_key`` are the stable classification fields."""
@@ -59,7 +99,7 @@ class Response:
     def __init__(self, status, body, headers, raw_empty):
         self.status = status
         self.body = wrap_secrets(body) if isinstance(body, dict) else {}
-        self.headers = headers
+        self.headers = headers = Headers(headers or {})
         self.success = self.body.get("success")
         self.message = self.body.get("message")
         self.message_key = self.body.get("message_key")
@@ -113,7 +153,7 @@ class Client:
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         try:
-            with _OPENER.open(req, timeout=timeout) as resp:
+            with open_url(_OPENER, req, timeout) as resp:
                 return self._parse(resp.status, resp.read(), dict(resp.headers.items()))
         except urllib.error.HTTPError as e:
             raw = e.read()

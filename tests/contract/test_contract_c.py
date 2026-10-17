@@ -562,8 +562,11 @@ def test_c21_user_self_and_admin_get(lab, consumer, fixture_sink):
         assert field in data, f"user/self lacks {field}"
     a = lab.admin.get(f"/api/user/{consumer.user.id}")
     fixture_sink.capture("user_get_ok", a, route="user.get")
-    for field in ("id", "username", "group", "quota", "used_quota", "request_count", "status", "role", "remark"):
+    for field in ("id", "username", "group", "quota", "used_quota", "request_count", "status", "role"):
         assert field in (a.data or {}), f"GET /api/user/:id lacks {field}"
+    # model/user.go: Remark is `json:"remark,omitempty"` — absent when empty, so
+    # the PaaS reads a missing remark as "" (C11 just cleared it)
+    assert isinstance((a.data or {}).get("remark", ""), str), "GET /api/user/:id remark is not a string"
 
 
 # --------------------------------------------------------------------------- #

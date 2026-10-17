@@ -307,8 +307,10 @@ def test_f10_overdraft_measurement(cfg, lab, relay_base, slow, disruptive, contr
         pricing = user.up_client(up).get("/api/pricing")
         items = [it for it in (pricing.data or []) if "default" in (it.get("enable_groups") or [])]
         priced = {it["model_name"]: _out_price_per_token(it) for it in items if _out_price_per_token(it)}
-        top = max(priced, key=priced.get) if priced else None
-        assert cfg.f10_model == top, f"F10 must use the highest output price in group default: {top}"
+        best = max(priced.values()) if priced else None
+        tops = sorted(m for m, p in priced.items() if p >= best * (1 - 1e-9))  # a tie: any of them
+        assert cfg.f10_model in tops, f"F10 must use the highest output price in group default: one of {tops}"
+        top = cfg.f10_model
         n, max_tokens = cfg.f10_concurrency, cfg.f10_max_tokens
         worst_usd = n * max_tokens * priced[top]
         assert worst_usd <= cfg.f10_max_usd, (

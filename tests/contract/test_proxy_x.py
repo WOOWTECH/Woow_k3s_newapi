@@ -83,7 +83,9 @@ def test_x04_unsigned(proxy_cron, fixture_sink):
 @pytest.mark.contract_id("X04")
 @pytest.mark.parametrize("case", ["expired_ts", "future_ts", "wrong_sig", "unknown_kid"])
 def test_x04_bad_signatures(proxy_cron, case):
-    kw = {"expired_ts": {"ts_offset": -31}, "future_ts": {"ts_offset": 31},
+    # the proxy refuses |now - ts| > 30 s; 45 keeps a second of clock skew
+    # between this machine and the node from turning a refusal into a pass
+    kw = {"expired_ts": {"ts_offset": -45}, "future_ts": {"ts_offset": 45},
           "wrong_sig": {"secret": b"contract-wrong-secret-0123456789abcdef"},
           "unknown_kid": {"kid": "contract-unknown-kid"}}[case]
     r = proxy_cron.send("GET", "/api/status", identity="anon", **kw)
@@ -277,7 +279,7 @@ def test_x09_kill_mid_add_quota(cfg, lab, kube, proxy_user, disruptive, fixture_
     lock = kube.row_lock(uid, proxy_user.username, 25)
     result = {}
     try:
-        with kube.port_forward(f"pod/{pod}", 8080) as origin:
+        with kube.port_forward(f"pod/{pod}", 8080, supervise=False) as origin:
             pc = proxymod.ProxyClient(origin, cfg.auth_cron)
             time.sleep(2)
 

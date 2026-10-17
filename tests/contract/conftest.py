@@ -127,6 +127,13 @@ def pytest_collection_modifyitems(session, config, items):
     items.sort(key=rank)  # stable
 
 
+def pytest_runtest_setup(item):
+    """``@pytest.mark.slow`` alone skips under NEWAPI_CONTRACT_SKIP_SLOW=1 (not
+    only the tests that also take the ``slow`` fixture)."""
+    if item.get_closest_marker("slow") and Config().skip_slow:
+        pytest.skip("NEWAPI_CONTRACT_SKIP_SLOW=1")
+
+
 # --------------------------------------------------------------------------- #
 #  config, guard, transport                                                   #
 # --------------------------------------------------------------------------- #

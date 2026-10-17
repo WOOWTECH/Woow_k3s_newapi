@@ -15,7 +15,7 @@ import json
 import urllib.error
 import urllib.request
 
-from .newapi import _NoRedirect, check_origin
+from .newapi import Headers, _NoRedirect, check_origin, open_url
 
 UA = "woow-newapi-contract-relay/2"
 
@@ -29,7 +29,7 @@ class RelayTransportError(Exception):
 class RelayResult:
     def __init__(self, status, body, headers):
         self.status = status
-        self.headers = headers
+        self.headers = headers = Headers(headers or {})
         self.retry_after = headers.get("Retry-After")
         try:
             self.body = json.loads(body) if body else {}
@@ -54,12 +54,19 @@ class RelayResult:
         return f"<RelayResult {self.status} empty={self.raw_empty}>"
 
 
+#: The default prompt: answered in ~2 tokens and ~0.6 s by the free Qwen. The
+#: free channel's param_override {"max_tokens": 2048} *replaces* the client's
+#: max_tokens (U18, F01), so a plain "ping" made the thinking model write ~350
+#: tokens in ~22 s and the F-tests' timing (10 burst, 1 per 6 s) meaningless.
+QUICK = [{"role": "user", "content": "/no_think Reply with the single word: ok"}]
+
+
 def chat(base, key, model, *, messages=None, max_tokens=16, timeout=60, stream=False):
     """One chat completion. ``key`` is the 48-char key (no sk-); we add sk-."""
     origin = check_origin(base, "relay base")
     payload = {
         "model": model,
-        "messages": messages or [{"role": "user", "content": "ping"}],
+        "messages": messages or QUICK,
         "max_tokens": max_tokens,
         "stream": stream,
     }
@@ -68,7 +75,7 @@ def chat(base, key, model, *, messages=None, max_tokens=16, timeout=60, stream=F
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer sk-" + key)
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:
+        with open_url(_OPENER, req, timeout) as resp:
             return RelayResult(resp.status, resp.read(), dict(resp.headers.items()))
     except urllib.error.HTTPError as e:
         return RelayResult(e.code, e.read(), dict(e.headers.items()) if e.headers else {})
