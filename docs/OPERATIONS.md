@@ -47,7 +47,7 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
 | 檔案 | 內容 | 套用 |
 |---|---|---|
 | `deploy/settings.json`（stg 再疊 `deploy/settings-stg.json`，後面的檔案優先） | 系統選項；`_` 開頭的 key 是註解 | `apply-settings` |
-| `deploy/pricing/pricing-plan.json` | 模型清單（`api`、`local`、`internal`）與倍率，`scripts/build_pricing.py` 由 LiteLLM 成本產生 | `apply-pricing` |
+| `deploy/pricing/pricing-plan.json` | 模型清單（`api`、`local`、`internal`；LiteLLM 成本 0、不賣的列在 `unpriced`）與倍率，`scripts/build_pricing.py` 由 LiteLLM 成本產生 | `apply-pricing` |
 | `deploy/pricing/channels.json` | 渠道（分組、用 plan 的哪份模型清單、免費渠道的 `param_override`）；LiteLLM 金鑰不在檔案裡 | `apply-channels` |
 
 目前重點：
