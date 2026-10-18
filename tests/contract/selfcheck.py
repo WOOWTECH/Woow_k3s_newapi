@@ -251,6 +251,71 @@ def check_budget():
     assert not budget.is_ct_route("DELETE", "/api/user/sessions/x") and not budget.is_ct_route("POST", "/api/token/")
 
 
+def check_jwt_resolves_after_pacing():
+    from io import BytesIO
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from tests.contract import newapi, users
+
+    now = {"value": 1000}
+
+    class Clock:
+        @staticmethod
+        def time():
+            return now["value"]
+
+    class Pacing:
+        calls = 0
+
+        def take(self, key, label=None):
+            self.calls += 1
+            if self.calls == 1:
+                now["value"] += 1202  # the old 15-minute JWT expires during CT pacing
+
+    class Answer:
+        status = 200
+
+        def __init__(self, body):
+            self.body = BytesIO(json.dumps(body).encode())
+            self.headers = {}
+
+        def read(self):
+            return self.body.read()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.body.close()
+
+    sent = []
+
+    class Opener:
+        def open(self, req, timeout):
+            auth = req.get_header("Authorization")
+            sent.append((req.full_url, auth))
+            if req.full_url.endswith("/api/user/login"):
+                return Answer({"success": True, "data": {"access_token": "fresh", "access_expires_at": 4000}})
+            return Answer({"success": True, "data": {}})
+
+    pacing = Pacing()
+    base = newapi.Client("http://127.0.0.1", budget=pacing)
+    lab = SimpleNamespace(base=base)
+    user = users.TestUser(lab, "wct0000000001", "password", 1)
+    user.jwt, user.jwt_expires = "initial", 1900
+    with patch.object(users, "time", Clock), patch.object(newapi, "_OPENER", Opener()):
+        response = user.jwt_client().post("/api/verify", {"scope": "test"})
+        assert response.success is True
+        assert sent[-1][0].endswith("/api/verify") and sent[-1][1] == "Bearer fresh", \
+            f"request used the pre-wait JWT: {sent}"
+        assert sent[0][0].endswith("/api/user/login"), f"login did not follow the wait: {sent}"
+        assert pacing.calls == 2, f"expected paced request plus login: {pacing.calls}"
+        stale = base.with_token("explicit-old")
+        stale.get("/api/user/self")
+        assert sent[-1][1] == "Bearer explicit-old", "with_token did not preserve explicit stale-token behavior"
+
+
 class _FakeOptionClient:
     def __init__(self, live, ok=True):
         self.live, self.ok, self.puts = dict(live), ok, []
@@ -364,7 +429,7 @@ def check_committed_reports():
 
 
 CHECKS = (check_signing, check_scrub, check_fixtures, check_ids_complete, check_config, check_redaction,
-          check_budget, check_settings_guard, check_report, check_committed_reports)
+          check_budget, check_jwt_resolves_after_pacing, check_settings_guard, check_report, check_committed_reports)
 
 
 def main():

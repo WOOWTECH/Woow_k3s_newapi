@@ -236,11 +236,17 @@ class TestUser:
         self.jwt_expires = int(exp) if isinstance(exp, int) else int(time.time()) + 900
 
     def jwt_client(self):
-        """The dashboard JWT client; logs in again when the JWT is gone or
-        about to expire (15 minutes, 〔PROV〕P4)."""
+        """A client that resolves a fresh dashboard JWT after CT pacing.
+
+        A CT request may wait most of a 20-minute window. Resolving the JWT
+        before that wait can leave it expired before it reaches new-api.
+        """
+        return self.lab.base.with_token_provider(self._jwt_after_pacing)
+
+    def _jwt_after_pacing(self):
         if not self.jwt or time.time() > self.jwt_expires - JWT_SLACK:
             self.login()
-        return self.lab.base.with_token(self.jwt)
+        return self.jwt
 
     def proof(self, scope, context):
         """Password step-up proof bound to this session; returns the Response."""

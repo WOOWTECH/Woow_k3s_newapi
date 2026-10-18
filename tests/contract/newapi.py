@@ -120,16 +120,27 @@ class Client:
     ``uc_user_id``: this identity's user id, so its /api/verify calls also pace
     the user's UC:security-verification bucket."""
 
-    def __init__(self, base, token=None, budget=None, budget_ip="127.0.0.1", uc_user_id=None):
+    def __init__(self, base, token=None, budget=None, budget_ip="127.0.0.1", uc_user_id=None,
+                 token_provider=None):
         self.base = check_origin(base)
         self.token = token
         self.budget = budget
         self.budget_ip = budget_ip
         self.uc_user_id = uc_user_id
+        self.token_provider = token_provider
 
     def with_token(self, token, uc_user_id=None):
         return Client(self.base, token=token, budget=self.budget, budget_ip=self.budget_ip,
                       uc_user_id=uc_user_id)
+
+    def with_token_provider(self, provider, uc_user_id=None):
+        """Use a credential resolved at request time, after CT pacing.
+
+        ``with_token`` deliberately remains a snapshot for tests that need to
+        send a stale/revoked JWT.
+        """
+        return Client(self.base, budget=self.budget, budget_ip=self.budget_ip,
+                      uc_user_id=uc_user_id, token_provider=provider)
 
     def _account(self, method, path):
         if self.budget is None or not budgetmod.is_ct_route(method, path):
@@ -144,6 +155,8 @@ class Client:
         if not ct_exempt:
             self._account(method, path)
         use_token = self.token if token is ... else token
+        if token is ... and self.token_provider is not None:
+            use_token = self.token_provider()
         data = None if body is None else json.dumps(body, ensure_ascii=False).encode()
         req = urllib.request.Request(self.base + path, data=data, method=method)
         req.add_header("User-Agent", UA)
