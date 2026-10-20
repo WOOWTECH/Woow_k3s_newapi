@@ -30,58 +30,167 @@ svc=${SERVICE_URL:-http://newapi.new-api.svc.cluster.local:3000}
 secret=${SECRET_NAME:-newapi-cloudflared}
 api=https://api.cloudflare.com/client/v4
 
+tmp_dir=
+cleanup() {
+  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+    rm -rf -- "$tmp_dir"
+  fi
+}
+trap cleanup EXIT
+
+url_encode() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+json_body() {
+  python3 -c 'import json,sys
+mode=sys.argv[1]
+if mode == "tunnel":
+ print(json.dumps({"name":sys.argv[2],"config_src":"cloudflare"}, separators=(",",":")))
+elif mode == "ingress":
+ host,svc=sys.argv[2:4]
+ print(json.dumps({"config":{"ingress":[
+  {"hostname":host,"service":svc,"originRequest":{"connectTimeout":10,"keepAliveTimeout":90}},
+  {"service":"http_status:404"}]}}, separators=(",",":")))
+elif mode == "dns":
+ host,target,ns=sys.argv[2:5]
+ print(json.dumps({"type":"CNAME","name":host,"content":target,"proxied":True,
+                   "comment":f"woow-k3s ns {ns} new-api (Woow_k3s_newapi)"}, separators=(",",":")))
+' "$@"
+}
+
+# Open the token once through a no-follow descriptor, validate that descriptor,
+# and write the private curl config from that same in-memory value.
+write_curl_config() {
+  python3 - "$CF_API_TOKEN_FILE" "$1" <<'PY'
+import os, re, stat, sys
+src, dst = sys.argv[1:]
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9._~-]{20,512}\Z")
+MAX_TOKEN_BYTES = 512
+MAX_RAW_BYTES = MAX_TOKEN_BYTES + 2  # optional final LF plus overflow sentinel
+
+def fail(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+if not hasattr(os, "O_NOFOLLOW"):
+    fail("secure token-file open is unavailable on this platform")
+
+read_flags = os.O_RDONLY | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    read_flags |= os.O_CLOEXEC
+if hasattr(os, "O_NONBLOCK"):
+    read_flags |= os.O_NONBLOCK
+
+try:
+    fd = os.open(src, read_flags)
+except OSError:
+    fail("CF_API_TOKEN_FILE must be a readable regular file with mode 0600 or stricter")
+
+try:
+    st = os.fstat(fd)
+    if (not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or
+            not st.st_mode & stat.S_IRUSR):
+        fail("CF_API_TOKEN_FILE must be a readable regular file with mode 0600 or stricter")
+    raw = os.read(fd, MAX_RAW_BYTES)
+except OSError:
+    fail("CF_API_TOKEN_FILE must be a readable regular file with mode 0600 or stricter")
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+if len(raw) > MAX_TOKEN_BYTES + 1:
+    fail("CF_API_TOKEN_FILE contains an invalid token")
+if raw.endswith(b"\n"):
+    raw = raw[:-1]
+try:
+    token = raw.decode("ascii")
+except UnicodeDecodeError:
+    fail("CF_API_TOKEN_FILE contains an invalid token")
+if not TOKEN_RE.fullmatch(token):
+    fail("CF_API_TOKEN_FILE contains an invalid token")
+
+# The validated alphabet cannot add curl config directives or quotes.
+write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    write_flags |= os.O_CLOEXEC
+out_fd = None
+try:
+    out_fd = os.open(dst, write_flags, 0o600)
+    os.fchmod(out_fd, 0o600)
+    with os.fdopen(out_fd, "w", encoding="ascii") as f:
+        out_fd = None
+        f.write('header = "Authorization: Bearer ' + token + '"\n')
+        f.write('header = "Content-Type: application/json"\n')
+except (OSError, UnicodeError, ValueError):
+    try:
+        os.unlink(dst)
+    except OSError:
+        pass
+    fail("could not create private curl configuration")
+finally:
+    if out_fd is not None:
+        try:
+            os.close(out_fd)
+        except OSError:
+            pass
+PY
+}
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cf-tunnel.XXXXXXXX")
+chmod 700 "$tmp_dir"
+curl_config=$tmp_dir/curl.conf
+write_curl_config "$curl_config"
+
 cf() {
-  local method=$1 path=$2; shift 2
-  curl -sS --fail-with-body -X "$method" -H "Authorization: Bearer $(cat "$CF_API_TOKEN_FILE")" \
-    -H 'Content-Type: application/json' "$api$path" "$@"
+  local method=$1 path=$2
+  shift 2
+  curl -q --config "$curl_config" --noproxy '*' -sS --fail-with-body -X "$method" "$api$path" "$@"
 }
 ok() { python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("success") else (print(d.get("errors"), file=sys.stderr) or 1))'; }
 
 tunnel_id() {
-  cf GET "/accounts/$acct/cfd_tunnel?name=$name&is_deleted=false" |
+  local qname
+  qname=$(url_encode "$name")
+  cf GET "/accounts/$acct/cfd_tunnel?name=$qname&is_deleted=false" |
     python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r[0]["id"] if r else "")'
 }
 
 case $cmd in
 tunnel)
-  tmp_manifest=$(mktemp)
-  chmod 600 "$tmp_manifest"
   id=$(tunnel_id)
   if [ -z "$id" ]; then
-    id=$(cf POST "/accounts/$acct/cfd_tunnel" --data "{\"name\":\"$name\",\"config_src\":\"cloudflare\"}" |
+    body=$(json_body tunnel "$name")
+    id=$(cf POST "/accounts/$acct/cfd_tunnel" --data "$body" |
       python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["id"])')
     echo "created tunnel $name ($id)"
   else
     echo "reusing tunnel $name ($id)"
   fi
-  cf PUT "/accounts/$acct/cfd_tunnel/$id/configurations" --data "$(python3 -c '
-import json,sys
-host,svc=sys.argv[1:3]
-print(json.dumps({"config":{"ingress":[
-  {"hostname":host,"service":svc,"originRequest":{"connectTimeout":10,"keepAliveTimeout":90}},
-  {"service":"http_status:404"}]}}))' "$host" "$svc")" | ok
+  body=$(json_body ingress "$host" "$svc")
+  cf PUT "/accounts/$acct/cfd_tunnel/$id/configurations" --data "$body" | ok
   echo "ingress: $host -> $svc"
   cf GET "/accounts/$acct/cfd_tunnel/$id/token" |
     python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["result"])' |
     kubectl -n "$ns" create secret generic "$secret" --from-file=token=/dev/stdin \
-      --dry-run=client -o yaml > "$tmp_manifest"
-  # replace/create, never apply: apply would copy the token into the
+      --dry-run=client -o yaml > "$tmp_dir/secret.yaml"
+  # Replace/create, never apply: apply would copy the token into the
   # last-applied-configuration annotation.
   if kubectl -n "$ns" get secret "$secret" > /dev/null 2>&1; then
-    kubectl -n "$ns" replace -f "$tmp_manifest" > /dev/null
+    kubectl -n "$ns" replace -f "$tmp_dir/secret.yaml" > /dev/null
   else
-    kubectl -n "$ns" create -f "$tmp_manifest" > /dev/null
+    kubectl -n "$ns" create -f "$tmp_dir/secret.yaml" > /dev/null
   fi
-  rm -f "$tmp_manifest"
   echo "secret $ns/$secret updated"
   ;;
 dns)
   id=$(tunnel_id)
   [ -n "$id" ] || { echo "no tunnel $name; run 'tunnel' first" >&2; exit 1; }
   target="$id.cfargotunnel.com"
-  rec=$(cf GET "/zones/$zone/dns_records?name=$host" |
+  qhost=$(url_encode "$host")
+  rec=$(cf GET "/zones/$zone/dns_records?name=$qhost" |
     python3 -c 'import json,sys; r=json.load(sys.stdin)["result"]; print(r[0]["id"] if r else "")')
-  body="{\"type\":\"CNAME\",\"name\":\"$host\",\"content\":\"$target\",\"proxied\":true,\"comment\":\"woow-k3s ns $ns new-api (Woow_k3s_newapi)\"}"
+  body=$(json_body dns "$host" "$target" "$ns")
   if [ -z "$rec" ]; then
     cf POST "/zones/$zone/dns_records" --data "$body" | ok
     echo "created CNAME $host -> $target"
