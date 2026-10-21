@@ -122,9 +122,10 @@ backup:
   storageClassName: longhorn
   size: 20Gi
 
-# Additive migration: separate CronJob and PVC, never delete legacy dumps.
+# Stg first: disabled globally; stg explicitly opts into suspended resources.
+# Separate CronJob/PVC, never delete legacy dumps.
 encryptedBackup:
-  enabled: true
+  enabled: false
   schedule: "45 */6 * * *"
   keepDays: 7
   suspend: true
@@ -271,9 +272,10 @@ networkPolicy:
 tests:
   enabled: true
 
-# rc.44 Unix-second bigint logs/audit_logs. Unsuspend only after stg EXPLAIN.
+# Stg first: disabled globally; stg enables suspended rc.44 maintenance.
+# Unsuspend only after stg EXPLAIN.
 retention:
-  enabled: true
+  enabled: false
   suspend: true
   days: 180
   schedule: "30 4 * * *"

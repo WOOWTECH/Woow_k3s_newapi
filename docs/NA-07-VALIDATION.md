@@ -1,8 +1,8 @@
-# NA-07 local validation — dual-track review correction, 2026-10-21
+# NA-07 local validation — stg-first resource gating, 2026-10-21
 
 Scope: `Woow_k3s_newapi` only, existing `feat/na-07-retention-backup` worktree.
-Base `origin/main`: `b775213`; this correction follows `634429c` and supersedes
-its unsafe in-place suspension. No live stg/prod access, apply-settings, image
+Base `origin/main`: `b775213`; this narrow correction follows the safe dual-track
+commit `1b3e0ac` and prevents production pre-creation before stg acceptance. No live stg/prod access, apply-settings, image
 publication, git push, PR or merge was performed.
 
 ## Corrected migration invariants
@@ -14,7 +14,9 @@ publication, git push, PR or merge was performed.
   The original `find -mtime +14` retention semantics remain unchanged.
 - Additive `newapi-pg-backup-age`, separate `newapi-backup-age` PVC and scoped
   `backup-encrypted` NetworkPolicy, schedule `45 */6 * * *`, keepDays=7.
-  Defaults suspended with pruning off; original backup remains active without
+  Chart/prod default disabled: no encrypted PVC/ConfigMap/CronJob/NetworkPolicy
+  and no retention ConfigMap/CronJob/NetworkPolicy are rendered. Stg explicitly
+  enables both components with suspend=true. Pruning stays off; legacy remains active without
   requiring an age image/public recipient. Separate volumes avoid RWO contention.
 - Enabling encrypted backup requires pinned PostgreSQL+age image/public recipient.
   Both tracks can run together. Disabling/suspending legacy OR enabling encrypted
@@ -31,24 +33,27 @@ publication, git push, PR or merge was performed.
   PVC alerts cover legacy/encrypted/PostgreSQL claims. Failed Job alert covers
   both CronJob name prefixes and matching manual test Jobs; it does not require
   manual Jobs to have an owner reference.
-- Retention remains suspended pending EXPLAIN; monitoring remains opt-in. Image
+- Retention is absent on default/prod and suspended on stg pending EXPLAIN.
+  Monitoring remains opt-in. Image
   build/publication, public recipient and stg evidence remain external work.
 
 ## Executed checks for this correction
 
 | Check | Result |
 |---|---|
-| Helm lint/template default/prod/stg | Passed; YAML 27/27/30 docs; legacy active 03:45/14d, new encrypted suspended/isolated/no-prune |
-| Maintenance suite with real PostgreSQL/age | **19 passed, no skips** |
-| `scripts/chart-guards.sh` with real age | 19 existing proxy cases + 13 maintenance tests passed |
-| Admin/script regressions | **101 passed**, fake/stub HTTP only |
-| Contract offline selfcheck | **10 passed**, 48 contract IDs |
+| Helm lint/template default/prod/stg | Passed; YAML **20/20/30** docs; default/prod no added resources, stg new Jobs suspended; legacy always active 03:45/14d |
+| Maintenance suite with real PostgreSQL/age | **20 passed, no skips** |
+| `scripts/chart-guards.sh` with real age | 19 existing proxy cases + 14 maintenance tests passed |
+| Prior dual-track admin/script regressions (1b3e0ac; unchanged by this narrow edit) | **101 passed**, fake/stub HTTP only |
+| Prior dual-track contract selfcheck (1b3e0ac; unchanged) | **10 passed**, 48 contract IDs |
 | Image gate vs origin/main | Passed, upstream/proxy pins unchanged |
-| Offline prod+stg settings verification | 27 checks, zero failures; nothing applied |
-| PromQL parser 0.11.0: legacy-only / parallel / encrypted-only | All 3 / 4 / 3 alert expressions parsed |
+| Prior dual-track offline settings verification (1b3e0ac; unchanged) | 27 checks, zero failures; nothing applied |
+| Prior dual-track PromQL parser (1b3e0ac; templates unchanged) | All 3 / 4 / 3 alert expressions parsed |
 | Bash syntax, Python compile, `git diff --check` | Passed |
 
-Regression tests explicitly verify default old name/schedule/14-day value/active
+Regression tests compare **all rendered resource (kind, name) identities** for
+default/prod against pre-NA-07 `b775213` and require exact equality; tests also verify
+stg-only suspended resources and default old name/schedule/14-day value/active
 state on all site values, unchanged legacy runtime template, separate PVCs,
 parallel activation, missing/invalid image/recipient rejection, unverified stop or
 cleanup rejection, rejection of wrong image/recipient/namespace/release evidence,
@@ -68,6 +73,31 @@ NA07_POSTGRES_CLIENT_BIN=/tmp/na07-tools/client/usr/lib/postgresql/16/bin \
 NA07_AGE_BIN=/tmp/na07-tools/age/age \
 python3 -m unittest discover -s tests/maintenance -v
 ```
+
+## Actual rendered resource proof for this narrow change
+
+`helm template newapi ./chart` was run for default (`-n default`), prod
+(`-n new-api -f deploy/woow-k3s.yaml`), and stg
+(`-n new-api-stg -f deploy/woow-k3s-stg.yaml`). YAML objects were parsed, not
+counted with text grep. Captured inventories: `/tmp/na07-stgfirst-render-proof.json`.
+
+| Render | All resources | CronJobs | Added NA-07 maintenance resources | New Jobs state |
+|---|---:|---:|---:|---|
+| default | 20 | 1 | 0 | absent |
+| prod | 20 | 1 | 0 | absent |
+| stg | 30 | 3 | 7 | both suspended |
+
+The seven **stg-only** resources are:
+
+- PVC `newapi-backup-age`
+- ConfigMaps `newapi-backup-age-script`, `newapi-retention-script`
+- CronJobs `newapi-pg-backup-age`, `newapi-retention`
+- NetworkPolicies `newapi-backup-age`, `newapi-retention`
+
+All three renders retain `newapi-pg-backup`, `suspend: false`, `45 3 * * *`,
+`KEEP_DAYS=14`, and its original PVC. Production creates none of the seven new
+maintenance resources; its complete resource identity inventory equals the
+pre-NA-07 chart, as enforced by the Helm regression test.
 
 ## Still required on stg (not performed)
 

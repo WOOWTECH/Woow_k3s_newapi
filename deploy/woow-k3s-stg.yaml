@@ -79,10 +79,15 @@ proxy:
         matchLabels:
           app.kubernetes.io/component: odoo
 
-# Additive NA-07 track; the original daily backup above remains active.
+# NA-07 stg-first rollout; original daily backup above remains active.
 encryptedBackup:
+  enabled: true
   schedule: "45 */6 * * *"
   keepDays: 7
   suspend: true
   pruneEnabled: false
   size: 5Gi
+
+retention:
+  enabled: true
+  suspend: true

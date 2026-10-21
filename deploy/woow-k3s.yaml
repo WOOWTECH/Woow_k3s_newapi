@@ -20,9 +20,13 @@ backup:
   keepDays: 14
   suspend: false
 
-# Additive NA-07 track; the original daily backup above remains active.
+# NA-07 stg-first rollout; original daily backup above remains active.
 encryptedBackup:
+  enabled: false
   schedule: "45 */6 * * *"
   keepDays: 7
   suspend: true
   pruneEnabled: false
+
+retention:
+  enabled: false

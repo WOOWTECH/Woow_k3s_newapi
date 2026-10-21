@@ -17,8 +17,8 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 | `newapi-valkey` | Valkey 8.1（Redis 相容、BSD），只當快取，有密碼、不落地 |
 | `newapi-cloudflared` | Cloudflare Tunnel connector ×2（遠端管理 tunnel `woow-k3s-new-api`） |
 | `newapi-pg-backup` | 保留原名及 active：每天 03:45（台北）明文 `pg_dump -Fc`、保留設定 14 天、原 PVC；新軌驗證前不得停用 |
-| `newapi-pg-backup-age` | 新增獨立 PVC；每六小時 :45 age 加密、七日保留設定；預設暫停且不清理，需 pinned image＋公鑰啟用、還原證據才可停舊／開清理（見 OPERATIONS） |
-| `newapi-retention` | 每天 04:30（台北）分批刪 logs／audit_logs 的 180 天前資料；stg EXPLAIN 驗收前暫停 |
+| `newapi-pg-backup-age` | chart／prod 預設停用；stg 啟用資源但暫停、不清理；獨立 PVC、每六小時 :45 age 加密、七日保留設定，需 pinned image＋公鑰啟用、還原證據才可停舊／開清理（見 OPERATIONS） |
+| `newapi-retention` | chart／prod 預設停用；stg 啟用並暫停，每天 04:30（台北）分批刪 180 天前 logs／audit_logs，待 EXPLAIN 驗收 |
 | `newapi-proxy` | 選用（`proxy.enabled`，預設關；stg 開）×2＋PDB：PaaS Odoo 呼叫 new-api 的唯一通道，驗 HMAC 簽章、白名單路由與 body、注入服務帳號 PAT、XFF 一律覆寫成合成 IP；8080 簽章代理、8081 健康檢查；重放紀錄放在 Valkey 的專屬 ACL 使用者（程式在 `woow_paas_platform` 的 `extra/newapi-proxy/`，image 以 digest 釘住） |
 | NetworkPolicy | 全部 default-deny；new-api 只收 cloudflared 與同 ns 的 `newapi-proxy`，只出 DB、Valkey、LiteLLM（svc203）與公網 80/443（擋私網）；Valkey 只收 new-api 與 `newapi-proxy`；`newapi-proxy` 只收 `proxy.clients` 列的 Odoo pod |
 

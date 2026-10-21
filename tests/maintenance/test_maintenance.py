@@ -5,6 +5,9 @@ NA07_AGE_BIN=/path/to/age NA07_POSTGRES_BIN=/path/to/bin <same command>
 No kubeconfig, service credentials or live DB connections are used.
 """
 import json
+import io
+import re
+import tarfile
 import os
 from pathlib import Path
 import subprocess
@@ -35,7 +38,7 @@ class HelmTests(unittest.TestCase):
             return run(args)
 
     def active_encrypted(self):
-        return {'suspend': False, 'ageRecipient': PUBLIC,
+        return {'enabled': True, 'suspend': False, 'ageRecipient': PUBLIC,
                 'image': {'digest': DIGEST, 'tag': 'test'}}
 
     def verified_encrypted(self):
@@ -46,19 +49,28 @@ class HelmTests(unittest.TestCase):
             'verifiedAt': '2026-10-21T12:00:00Z'}
         return enc
 
-    def test_default_prod_stg_preserve_legacy_and_add_suspended_encryption(self):
+    def test_stg_first_default_prod_absent_stg_suspended_and_legacy_active(self):
         for site in [None, 'deploy/woow-k3s.yaml', 'deploy/woow-k3s-stg.yaml']:
             with self.subTest(site=site):
                 p=self.render(site=site)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 jobs=[d for d in p.stdout.split('---') if 'kind: CronJob' in d]
-                self.assertEqual(len(jobs),3)
+                staging=site=='deploy/woow-k3s-stg.yaml'
+                self.assertEqual(len(jobs),3 if staging else 1)
                 legacy=next(d for d in jobs if '  name: newapi-pg-backup\n' in d)
-                age=next(d for d in jobs if '  name: newapi-pg-backup-age\n' in d)
                 self.assertIn('schedule: "45 3 * * *"',legacy)
                 self.assertIn('suspend: false',legacy)
                 self.assertIn('value: "14"',legacy)
                 self.assertIn('claimName: newapi-backup\n',legacy)
+                if not staging:
+                    for name in ['newapi-pg-backup-age','newapi-backup-age','newapi-retention']:
+                        self.assertNotIn('  name: '+name,p.stdout)
+                    self.assertNotIn('app.kubernetes.io/component: backup-encrypted',p.stdout)
+                    self.assertNotIn('app.kubernetes.io/component: retention',p.stdout)
+                    continue
+                age=next(d for d in jobs if '  name: newapi-pg-backup-age\n' in d)
+                retention=next(d for d in jobs if '  name: newapi-retention\n' in d)
+                self.assertIn('suspend: true',retention)
                 self.assertIn('schedule: "45 */6 * * *"',age)
                 self.assertIn('suspend: true',age)
                 self.assertIn('value: "7"',age)
@@ -67,6 +79,33 @@ class HelmTests(unittest.TestCase):
                 self.assertNotIn('claimName: newapi-backup\n',age)
                 self.assertIn('schedule: "30 4 * * *"',p.stdout)
                 self.assertNotIn('AGE-SECRET-KEY-',p.stdout)
+
+    def test_default_prod_resource_inventory_matches_pre_na07(self):
+        def identities(rendered):
+            result=set()
+            for doc in rendered.split('---'):
+                kind=re.search(r'^kind: (\S+)$',doc,re.M)
+                name=re.search(r'^  name: (\S+)$',doc,re.M)
+                if kind and name: result.add((kind[1],name[1]))
+            return result
+        archive=subprocess.run(['git','archive','b775213','chart'],cwd=ROOT,capture_output=True)
+        self.assertEqual(archive.returncode,0)
+        with tempfile.TemporaryDirectory() as tmp:
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+                # Trusted tracked files from this fixed baseline; write files only.
+                for member in tar.getmembers():
+                    if member.isfile():
+                        self.assertNotIn('..',Path(member.name).parts)
+                        self.assertFalse(Path(member.name).is_absolute())
+                        target=Path(tmp)/member.name;target.parent.mkdir(parents=True,exist_ok=True)
+                        target.write_bytes(tar.extractfile(member).read())
+            for site in [None,'deploy/woow-k3s.yaml']:
+                args=['helm','template','newapi',str(Path(tmp)/'chart'),'-n','new-api-stg']
+                if site: args+=['-f',str(ROOT/site)]
+                baseline=run(args);current=self.render(site=site)
+                self.assertEqual(baseline.returncode,0,baseline.stderr)
+                self.assertEqual(current.returncode,0,current.stderr)
+                self.assertEqual(identities(current.stdout),identities(baseline.stdout))
 
     def test_legacy_dump_validation_cleanup_and_runtime_unchanged_from_main(self):
         base=run(['git','show','b775213:chart/templates/backup.yaml'],cwd=ROOT)
@@ -91,7 +130,7 @@ class HelmTests(unittest.TestCase):
             ({'capacityWarningPercent': 101}, 'encryptedBackup.capacityWarningPercent'),
         ]:
             with self.subTest(enc=enc):
-                p=self.render({'encryptedBackup': enc})
+                p=self.render({'encryptedBackup': dict({'enabled': True},**enc)})
                 self.assertNotEqual(p.returncode,0)
                 self.assertIn(error,p.stderr)
         p=self.render({'encryptedBackup': self.active_encrypted()})
@@ -132,7 +171,7 @@ class HelmTests(unittest.TestCase):
     def test_retention_guards(self):
         for key, value in [('days', 0), ('days', '180; DROP TABLE logs'),
                            ('batchSize', 10001), ('batchSleepSeconds', 0), ('maxBatches', -1)]:
-            p=self.render({'retention': {key: value}})
+            p=self.render({'retention': {'enabled': True,key: value}})
             self.assertNotEqual(p.returncode, 0)
             self.assertIn('retention.'+key, p.stderr)
 
@@ -143,7 +182,7 @@ class HelmTests(unittest.TestCase):
         self.assertIn('  name: newapi-pg-backup\n',p.stdout)
         self.assertNotIn('  name: newapi-pg-backup-age\n',p.stdout)
         self.assertNotIn('name: newapi-retention', p.stdout)
-        p=self.render(template='networkpolicy.yaml')
+        p=self.render(template='networkpolicy.yaml',site='deploy/woow-k3s-stg.yaml')
         self.assertEqual(p.returncode, 0, p.stderr)
         postgres=p.stdout.split('  name: newapi-postgres\n',1)[1].split('---',1)[0]
         self.assertIn('app.kubernetes.io/component: retention', postgres)

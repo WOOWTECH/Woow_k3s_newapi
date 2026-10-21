@@ -262,12 +262,17 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 
 ### 雙軌遷移：原每日備份保持運作
 
+遵循 **stg 先、prod 後**：chart 的 `encryptedBackup.enabled`、`retention.enabled`
+預設皆為 false，prod values 也明確設 false，因此例行 prod release 不預建新 PVC、ConfigMap、
+CronJob 或維護 NetworkPolicy。只有 stg values 明確設兩者 `enabled: true`、`suspend: true`，
+先建立暫停的驗收資源；stg 通過後，另行審閱 prod 的 enabled 變更，再依下列流程逐步啟用。
+
 預設值保持既有 **`newapi-pg-backup` 名稱、`suspend: false`、03:45 Asia/Taipei、
 `backup.keepDays: 14`**；使用原 PostgreSQL image、dump 驗證與原明文清理腳本。
 它繼續掛 `newapi-backup` PVC，例行 Helm release 不會因缺少 age image／公鑰而停掉它。
 原腳本以 `find -mtime +14` 清除明文檔，沿用既有整日計數語意；新七日政策不套到這個舊軌。
 
-新增 **`newapi-pg-backup-age`** 使用獨立 **`newapi-backup-age` PVC**，
+stg 啟用資源後，新增 **`newapi-pg-backup-age`** 使用獨立 **`newapi-backup-age` PVC**，
 `encryptedBackup.suspend: true`、`encryptedBackup.pruneEnabled: false`。
 獨立 PVC 防止新 Job 爭用舊 RWO volume、清理舊明文或因新 PVC 掛載失敗影響舊 Job。
 prod 的新 PVC 預設 20Gi、stg 5Gi；部署前確認 Longhorn 實體可用容量足以讓兩軌短暫並行。
