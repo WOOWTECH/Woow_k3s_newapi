@@ -60,7 +60,7 @@ class HelmTests(unittest.TestCase):
                 legacy=next(d for d in jobs if '  name: newapi-pg-backup\n' in d)
                 self.assertIn('schedule: "45 3 * * *"',legacy)
                 self.assertIn('suspend: false',legacy)
-                self.assertIn('value: "14"',legacy)
+                self.assertIn('value: "7"' if staging else 'value: "14"',legacy)
                 self.assertIn('claimName: newapi-backup\n',legacy)
                 if not staging:
                     for name in ['newapi-pg-backup-age','newapi-backup-age','newapi-retention']:

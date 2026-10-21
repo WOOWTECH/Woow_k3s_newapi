@@ -14,7 +14,7 @@ backup:
   schedule: "45 3 * * *"
   suspend: false
   size: 5Gi
-  keepDays: 14
+  keepDays: 7
 
 newapi:
   resources:

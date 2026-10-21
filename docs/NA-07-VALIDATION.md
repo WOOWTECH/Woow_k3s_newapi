@@ -2,16 +2,18 @@
 
 Scope: `Woow_k3s_newapi` only, existing `feat/na-07-retention-backup` worktree.
 Base `origin/main`: `b775213`; this narrow correction follows the safe dual-track
-commit `1b3e0ac` and prevents production pre-creation before stg acceptance. No live stg/prod access, apply-settings, image
-publication, git push, PR or merge was performed.
+commit `1b3e0ac` and prevents production pre-creation before stg acceptance. Live
+stg/prod CronJob schedule, suspend flag and `KEEP_DAYS` were checked read-only;
+no live mutation, apply-settings, image publication or merge was performed.
 
 ## Corrected migration invariants
 
 - Default/prod/stg retain `newapi-pg-backup`, active (`suspend: false`), schedule
-  `45 3 * * *` Asia/Taipei, keepDays=14, original `newapi-backup` PVC and
+  `45 3 * * *` Asia/Taipei, keepDays=14 in default/prod and 7 in stg (matching
+  each live CronJob), original `newapi-backup` PVC and
   PostgreSQL image. Its dump/pg_restore validation/cleanup/runtime template is
   byte-identical to the main baseline apart from explicit suspend=false.
-  The original `find -mtime +14` retention semantics remain unchanged.
+  The original `find -mtime +$KEEP_DAYS` retention semantics remain unchanged.
 - Additive `newapi-pg-backup-age`, separate `newapi-backup-age` PVC and scoped
   `backup-encrypted` NetworkPolicy, schedule `45 */6 * * *`, keepDays=7.
   Chart/prod default disabled: no encrypted PVC/ConfigMap/CronJob/NetworkPolicy
@@ -41,7 +43,7 @@ publication, git push, PR or merge was performed.
 
 | Check | Result |
 |---|---|
-| Helm lint/template default/prod/stg | Passed; YAML **20/20/30** docs; default/prod no added resources, stg new Jobs suspended; legacy always active 03:45/14d |
+| Helm lint/template default/prod/stg | Passed; YAML **20/20/30** docs; default/prod no added resources, stg new Jobs suspended; legacy always active 03:45, 14d prod / 7d stg |
 | Maintenance suite with real PostgreSQL/age | **20 passed, no skips** |
 | `scripts/chart-guards.sh` with real age | 19 existing proxy cases + 14 maintenance tests passed |
 | Prior dual-track admin/script regressions (1b3e0ac; unchanged by this narrow edit) | **101 passed**, fake/stub HTTP only |
@@ -53,7 +55,7 @@ publication, git push, PR or merge was performed.
 
 Regression tests compare **all rendered resource (kind, name) identities** for
 default/prod against pre-NA-07 `b775213` and require exact equality; tests also verify
-stg-only suspended resources and default old name/schedule/14-day value/active
+stg-only suspended resources and old name/schedule/14-day prod / 7-day stg value/active
 state on all site values, unchanged legacy runtime template, separate PVCs,
 parallel activation, missing/invalid image/recipient rejection, unverified stop or
 cleanup rejection, rejection of wrong image/recipient/namespace/release evidence,
@@ -95,7 +97,7 @@ The seven **stg-only** resources are:
 - NetworkPolicies `newapi-backup-age`, `newapi-retention`
 
 All three renders retain `newapi-pg-backup`, `suspend: false`, `45 3 * * *`,
-`KEEP_DAYS=14`, and its original PVC. Production creates none of the seven new
+the original `KEEP_DAYS` (14 default/prod, 7 stg), and its original PVC. Production creates none of the seven new
 maintenance resources; its complete resource identity inventory equals the
 pre-NA-07 chart, as enforced by the Helm regression test.
 
