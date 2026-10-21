@@ -87,8 +87,15 @@ proves that production Secrets, permissions or network readiness are correct.
 
 - Prod admin/service-account 2FA, AP/OP scope tests, actual expiry metadata and
   separately managed production PAT/HMAC/registry Secrets have not been verified.
-- Current prod Odoo instance/component labels and effective namespace policies
-  have not been verified in this task (no live-resource access was requested).
+- A later read-only `woow-k3s` check on 2026-10-21 confirmed current prod Odoo
+  web/cron labels match the candidate `paas-system` +
+  `paas-odoo-platform` + `server|cron` selector. Recheck before activation;
+  selector evidence does not prove packet-level NetworkPolicy behavior.
+- The same read-only check found `newapi-proxy-pats`, `newapi-proxy-hmac`
+  and `newapi-proxy-registry` absent by exact Secret name (NotFound, not RBAC
+  Forbidden). It confirmed the proxy resources absent and existing new-api/
+  Valkey pods and endpoints Ready. No Secret value or annotation was read.
+  Local sanitized evidence: `impl/na05-prod-readonly-20261021.md`.
 - Existing stg report opens only the image contract gate; it cannot establish
   prod credential readiness, identity isolation or operational approval.
 - Current CI intentionally rejects active prod. It must remain so until the
@@ -120,6 +127,8 @@ Validation results (2026-10-21):
 | Existing rc.44 + 3947d2b08d08 report | gate open (image contract only, not prod authorization) |
 | Python compile / bash syntax / diff whitespace | Passed |
 
-Read-only Gitea PR metadata and local files only; no Kubernetes commands or
-production/sandbox access were used. Scope is chart guard, explicit dormant prod
-flag, contract gate, offline tests and review documents. No merge or live deployment.
+Patch validation used local files and Gitea metadata. The later production check
+used only read-only Kubernetes metadata projections; it did not inspect Secret
+values, call new-api or change any resource. Scope remains chart guard, explicit
+dormant prod flag, contract gate, offline tests and review documents. No merge
+or live deployment.
