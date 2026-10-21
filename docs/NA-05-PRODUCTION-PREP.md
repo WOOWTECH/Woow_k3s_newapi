@@ -38,11 +38,9 @@ proves that production Secrets, permissions or network readiness are correct.
 
 ## Safest concrete GitOps PR path
 
-1. **Preparation only:** review this local patch against #18, with proposed title
-   `NA-05: keep production proxy dormant and close activation gate gaps`.
-   If a stacked preparation PR is later authorized, its target is
+1. **Preparation only:** review this patch against #18. Its stacked PR targets
    `feat/na07-stg-pin-sync-1021`, not main, so #17/#18 changes are not presented as
-   this task's new diff. No PR/push is performed by this preparation.
+   this task's new diff. This PR does not authorize activation or deployment.
 2. Owner reviews/merges **#17 -> main**, then retargets/reviews **#18 -> main**.
    After #18 lands, retarget/review the preparation branch against main. Keep the
    prod-off CI barrier, empty prod pin and enabled=false; this is safe code prep,
@@ -124,4 +122,4 @@ Validation results (2026-10-21):
 
 Read-only Gitea PR metadata and local files only; no Kubernetes commands or
 production/sandbox access were used. Scope is chart guard, explicit dormant prod
-flag, contract gate, offline tests and review documents. No push/PR/merge.
+flag, contract gate, offline tests and review documents. No merge or live deployment.
