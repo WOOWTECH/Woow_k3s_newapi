@@ -122,7 +122,8 @@ backup:
   storageClassName: longhorn
   size: 20Gi
 
-# Stg first: disabled globally; stg explicitly opts into suspended resources.
+# Disabled in both environments. Even suspended provisioning requires a public
+# recipient, pinned image and reviewed capacity evidence; it can allocate storage.
 # Separate CronJob/PVC, never delete legacy dumps.
 encryptedBackup:
   enabled: false
@@ -138,6 +139,14 @@ encryptedBackup:
   capacityWarningPercent: 70
   storageClassName: longhorn
   size: 20Gi
+  # Human-reviewed scheduling evidence, not a Helm lookup or proof of live health.
+  # Bind to the exact target; do not fill this from the old capacity snapshot.
+  capacityVerification:
+    evidenceRef: ""
+    namespace: ""
+    release: ""
+    storageClassName: ""
+    requestedSize: ""
   # No pruning until an actual restore is reviewed. Evidence contains no secrets.
   pruneEnabled: false
   restoreVerification:
@@ -272,7 +281,7 @@ networkPolicy:
 tests:
   enabled: true
 
-# Stg first: disabled globally; stg enables suspended rc.44 maintenance.
+# Disabled in both environments pending capacity, restore and retention acceptance.
 # Unsuspend only after stg EXPLAIN.
 retention:
   enabled: false

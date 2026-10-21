@@ -75,9 +75,11 @@ proxy:
         matchLabels:
           app.kubernetes.io/component: odoo
 
-# NA-07 stg-first rollout; original daily backup above remains active.
+# NA-07 dormant until owner recipient + reviewed Longhorn capacity are available.
+# suspend alone does not prevent PVC provisioning; keep enabled=false.
+# The original daily backup above remains active.
 encryptedBackup:
-  enabled: true
+  enabled: false
   schedule: "45 */6 * * *"
   keepDays: 7
   suspend: true
@@ -93,5 +95,5 @@ encryptedBackup:
     - name: newapi-proxy-registry
 
 retention:
-  enabled: true
+  enabled: false
   suspend: true
