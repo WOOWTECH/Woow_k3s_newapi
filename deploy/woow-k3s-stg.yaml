@@ -83,6 +83,14 @@ encryptedBackup:
   suspend: true
   pruneEnabled: false
   size: 5Gi
+  # Built by build-newapi-backup workflow run 24547 from NA-07 commit e020639.
+  # Remains suspended until the owner supplies a stg age public recipient and
+  # the actual encrypted restore has been reviewed. Never store a private key.
+  image:
+    tag: e020639cbfe3c32690c5efa1c036b4610682e438
+    digest: sha256:93f650ca7e1b3d754769183dc850add73383283f7812761691e88f559c63f965
+  imagePullSecrets:
+    - name: newapi-proxy-registry
 
 retention:
   enabled: true
