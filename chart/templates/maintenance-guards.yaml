@@ -1,0 +1,46 @@
+{{/* Boolean strings can bypass Go-template truth checks yet render as YAML false. */}}
+{{- range $component := list "backup" "retention" "monitoring" }}
+{{- if not (kindIs "bool" (index $.Values $component "enabled")) }}
+{{- fail (printf "%s.enabled must be a boolean" $component) }}
+{{- end }}
+{{- end }}
+{{- range $component := list "backup" "retention" }}
+{{- if not (kindIs "bool" (index $.Values $component "suspend")) }}
+{{- fail (printf "%s.suspend must be a boolean" $component) }}
+{{- end }}
+{{- end }}
+{{/* Fail even when a public recipient was accidentally replaced with a secret.
+Only native X25519 public recipients are accepted; never age identities/SSH keys. */}}
+{{- if .Values.backup.enabled }}
+{{- if and .Values.backup.ageRecipient (not (regexMatch "^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$" .Values.backup.ageRecipient)) }}
+{{- fail "backup.ageRecipient must be a native age1 public recipient (never a private key)" }}
+{{- end }}
+{{- if not .Values.backup.suspend }}
+{{- if not .Values.backup.ageRecipient }}{{ fail "active backup requires backup.ageRecipient" }}{{- end }}
+{{- end }}
+{{- if or .Values.backup.image.digest (not .Values.backup.suspend) }}
+{{- if or (not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.backup.image.digest)) (regexMatch "^sha256:0{64}$" .Values.backup.image.digest) }}
+{{- fail "active backup requires backup.image.digest pinned to the built PostgreSQL + age image" }}
+{{- end }}
+{{- if or (not .Values.backup.image.repository) (not .Values.backup.image.tag) }}
+{{- fail "active backup requires backup.image.repository and tag" }}
+{{- end }}
+{{- end }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.backup.keepDays))) (gt (int .Values.backup.keepDays) 365) }}
+{{- fail "backup.keepDays must be an integer from 1 to 365" }}
+{{- end }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.backup.capacityWarningPercent))) (gt (int .Values.backup.capacityWarningPercent) 100) }}
+{{- fail "backup.capacityWarningPercent must be an integer from 1 to 100" }}
+{{- end }}
+{{- end }}
+{{- if .Values.retention.enabled }}
+{{- range $key := list "days" "batchSize" "batchSleepSeconds" "maxBatches" }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $.Values.retention $key))) }}
+{{- fail (printf "retention.%s must be a positive integer" $key) }}
+{{- end }}
+{{- end }}
+{{- if gt (int .Values.retention.batchSize) 10000 }}{{ fail "retention.batchSize must not exceed 10000" }}{{- end }}
+{{- end }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.monitoring.capacityWarningPercent))) (gt (int .Values.monitoring.capacityWarningPercent) 100) }}
+{{- fail "monitoring.capacityWarningPercent must be an integer from 1 to 100" }}
+{{- end }}

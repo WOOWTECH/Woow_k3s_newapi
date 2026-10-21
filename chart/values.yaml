@@ -113,8 +113,18 @@ cloudflared:
 
 backup:
   enabled: true
-  schedule: "45 3 * * *"
-  keepDays: 14
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  # Migration gate: owner supplies a recipient + built image digest and stg
+  # restore/alert evidence, then commits suspend: false. No plaintext fallback.
+  suspend: true
+  ageRecipient: ""
+  image:
+    repository: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-backup
+    tag: ""
+    digest: ""
+  imagePullSecrets: []
+  capacityWarningPercent: 70
   storageClassName: longhorn
   size: 20Gi
 
@@ -240,3 +250,20 @@ networkPolicy:
 
 tests:
   enabled: true
+
+# rc.44 Unix-second bigint logs/audit_logs. Unsuspend only after stg EXPLAIN.
+retention:
+  enabled: true
+  suspend: true
+  days: 180
+  schedule: "30 4 * * *"
+  batchSize: 10000
+  batchSleepSeconds: 1
+  maxBatches: 1000
+
+# Requires Prometheus Operator CRD, kube-state-metrics, kubelet volume stats,
+# and a Prometheus ruleSelector accepting these labels. See OPERATIONS.
+monitoring:
+  enabled: false
+  labels: {}
+  capacityWarningPercent: 70

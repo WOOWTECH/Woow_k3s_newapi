@@ -14,7 +14,8 @@
 | Cloudflare API token | 只在執行 `cf-tunnel.sh` 時以 `CF_API_TOKEN_FILE` 指向的暫存檔 | 用完刪檔 |
 
 **new-api 把使用者 API key、渠道（上游）key、TOTP secret 都以明文存在 DB。** 備份 PVC
-`newapi-backup` 與任何 `pg_dump` 檔都要當機密資料處理。
+`newapi-backup` 與任何 `pg_dump` 檔都要當機密資料處理；NA-07 改為 age 公鑰加密，
+私鑰只由負責人離線保存，啟用 gate 見〈資料保留、備份與還原〉。
 
 ## 第一次安裝
 
@@ -256,19 +257,174 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 
 只有最新版收安全修補，請至少每月升一次。
 
-## 備份與還原
+## 資料保留、備份與還原（NA-07）
 
-- CronJob `newapi-pg-backup` 每天 03:45（台北），`/backups/newapi-*.dump`，保留 `backup.keepDays` 天。
-- 還原（會覆蓋現有資料，先停 master）：
+### 狀態與部署 gate
 
-```bash
-kubectl -n new-api scale deploy/newapi-master --replicas=0
-kubectl -n new-api exec -it newapi-postgres-0 -- sh -c \
-  'pg_restore -U newapi -d newapi --clean --if-exists /path/to/newapi-XXXX.dump'
-kubectl -n new-api scale deploy/newapi-master --replicas=1
+這份 chart 提供完整工作定義，**尚未代表 stg／prod 已驗收**。`backup.suspend: true`、
+`retention.suspend: true` 是此次 migration gate；`monitoring.enabled: false` 等候既有
+Prometheus Operator／Alertmanager 接線驗收。**直接用此版本 upgrade 會暫停原本的備份排程**，
+不能在沒有替代成功備份與下列 gate 的情況下套用到正式站；本次實作不做任何 live 操作。
+維護切換應在原備份仍工作時完成 image、公鑰、stg 還原與告警驗證，再一次提交正式啟用 values。
+
+1. 由核准的 image pipeline 用 `images/backup/Dockerfile` 建置 PostgreSQL 16 + `age` + Bash，
+   以 uid 70、root FS 唯讀測試能使用 `pg_dump`／`pg_restore`／`age`；提交
+   `backup.image.repository/tag/digest`（真實 `sha256:`，不是佔位值）。本次沒有建置、推送 image。
+   私有 registry 的唯讀拉取 Secret 只放 namespace，values 只列 `backup.imagePullSecrets` 的名稱。
+2. 負責人在離線可信裝置 `umask 077; age-keygen -o <離線 identity 檔>`，
+   `age-keygen -y <離線 identity 檔>` 的 **`age1…` 公鑰**才放該環境的 `backup.ageRecipient`。
+   stg 用獨立測試公鑰；prod 用負責人公鑰；私鑰／密碼／PAT／registry 憑證不進 values、image、
+   repo、ConfigMap 或叢集。輪替時舊私鑰至少保存到舊備份全部到期，並保留離線災難復原副本。
+3. stg 先保持兩個 CronJob 暫停，用已釘 image／公鑰的備份 Job 驗證加密與還原，再跑下方
+   retention EXPLAIN、假資料與線上請求測試；手動 `create job --from=cronjob/...` 會忽略
+   CronJob 的 suspend，**未釘 image／公鑰時不要手動觸發**（腳本會失敗，不會退回明文備份）。
+4. 確認監控 CRD／metrics／ruleSelector 與負責人告警管道可用，設定 `monitoring.enabled: true`、
+   `monitoring.labels` 為既有 Prometheus 的 ruleSelector，驗證告警真的送達。
+5. 驗收後分別提交 `backup.suspend: false`、`retention.suspend: false`；stg 先跑通，正式站
+   由負責人依部署流程處理。啟用備份時 chart 會拒絕空公鑰、私鑰字串、缺 digest／全零 digest。
+   暫停時僅供 manifest 審閱的基底 PostgreSQL image 沒有 age，不能視為可用備份 image。
+
+### 保留 180 天
+
+- `newapi-retention` 每天 **04:30 Asia/Taipei**，預設保留 `retention.days: 180` 天。
+  rc.44 的 [model/log.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/model/log.go)
+  與 [model/audit_log.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/model/audit_log.go)
+  皆為 `CreatedAt int64`／PostgreSQL `bigint`，內容是 Unix 秒數，不能用 timestamp 直接比較。
+  來源 URL、檔案 SHA-256 與欄位宣告記於 `tests/maintenance/fixtures/rc44-schema.json`；升版需重新核對。
+  工作啟動時先確認兩張表的時間欄位都是 bigint，才開始刪除。
+- 同一次執行固定 cutoff，僅刪 `created_at < floor(epoch(now())) - days*86400`。
+  每批最多 **10,000** 列、每批獨立交易、批間 sleep 1 秒；`FOR UPDATE SKIP LOCKED` 跳過
+  其他請求持有的列鎖，lock timeout 2 秒、statement timeout 30 秒。跳過且仍鎖定的舊資料會留待
+  下次執行，不宣稱單次 job 一定刪完所有被鎖的列。每表最多 1,000 批；達上限或 SQL 失敗會非 0，
+  讓監控看到。CronJob 禁止重疊，Job 最長兩小時。
+- NetworkPolicy 只放同 release 的 `retention` component 到 PostgreSQL 5432（另有共用 DNS），
+  不放行 API、Valkey 或公網。使用既有 PostgreSQL Secret，service account token 不掛載。
+- **PaaS 用量頁只顯示 180 天內資料**。因為日批次，DB 實際可能短暫留有超過 180 天的列，
+  UI／API 查詢仍須自己帶 180 天範圍；此票只改 chart/doc，不修改 PaaS。`DELETE` 不會立刻縮小
+  PVC，autovacuum 主要回收表內可重用空間；不要為了縮檔在服務中執行 `VACUUM FULL`。
+
+stg 啟用前，用實際查詢計畫確認兩張表的時間索引（下例 `logs`，再以 `audit_logs` 重跑）。
+只用 `EXPLAIN`，**不要在共享 stg 加 `ANALYZE` 執行刪除**：
+
+```sql
+EXPLAIN (COSTS, VERBOSE)
+WITH picked AS (
+  SELECT id FROM logs
+  WHERE created_at < floor(extract(epoch FROM now()))::bigint - 180::bigint * 86400
+  ORDER BY created_at, id LIMIT 10000 FOR UPDATE SKIP LOCKED
+), deleted AS (
+  DELETE FROM logs WHERE id IN (SELECT id FROM picked) RETURNING 1
+)
+SELECT count(*) FROM deleted;
 ```
 
-dump 在備份 PVC 上；要把檔案帶到 postgres pod，可暫時起一個掛 `newapi-backup` 的 pod 複製過去。
+假資料／正式批次 SQL 的執行要在批准的 stg 測試窗口，記錄兩表舊／新列數、Job 耗時、
+鎖等待與同時 `/v1/chat/completions` 的可用性；若查詢走大表掃描或排序過重，先調查索引／統計，
+不要直接解除暫停。
+
+### 每六小時 age 加密備份、保留七天
+
+- `newapi-pg-backup`：`45 */6 * * *`，台北 **00:45／06:45／12:45／18:45**。
+  RPO 目標六小時，只有定期成功且可還原時才成立。`Forbid`、排程容許延遲 30 分鐘、Job 最長一小時，
+  失敗最多重試兩次，不讓掛起的 Job 永遠壓住後續排程。
+- Bash `set -euo pipefail` 執行 `pg_dump -Fc | age -r "$AGE_RECIPIENT" -o <檔名>.part`，
+  兩端都成功才原子改名 `/backups/newapi-<UTC 時間>-<pid>.dump.age`。
+  age 加密驗證失敗或 pg_dump 中途失敗不發布正式檔、不刪既有完整備份；不寫明文暫存 dump。
+  接收公鑰無效時失敗，沒有不加密的 fallback。
+- 成功後才清除 **>= 七天**的本系統 `.dump.age` 與舊明文 `.dump`（分鐘精度），
+  也清除超過兩小時的 `.part`。遷移後未過期的舊明文 dump 仍須當機密，
+  在第一份加密備份已驗證可還原後，由負責人安排轉存／刪除；程式不提前刪掉唯一可用舊備份。
+- Job 輸出 `pg_database_size_bytes`、`backup_pvc_used_percent`；備份檔本身仍屬機密。
+  加密只保護 dump，不能取代 Secret／PVC RBAC、Longhorn 容量管理或異地備份。
+
+### 容量與告警管道：既有 Prometheus／Alertmanager
+
+選用叢集既有監控，不另外寫入 PaaS LLM-14。本票以可選的 `PrometheusRule` 提供：
+
+| 訊號 | 行為 |
+|---|---|
+| 備份 PVC `df -Pk` 使用率 **>70%** | 完整加密檔保留，Job 非 0；閾值為 `backup.capacityWarningPercent` |
+| PostgreSQL 與備份 PVC 真實使用率 **>70% 持續 5m** | `NewapiPVCAboveCapacityThreshold`；閾值 `monitoring.capacityWarningPercent` |
+| backup／retention Job failed **持續 1m** | `NewapiMaintenanceJobFailed`（含 image pull、SQL、加密、容量失敗） |
+| 七小時沒有成功備份（含從未成功）**持續 5m** | `NewapiBackupStale`，避免 CronJob 暫停、漏跑、掛起仍靜默 |
+
+PostgreSQL 指標用 `kubelet_volume_stats_used_bytes/capacity_bytes`，含 WAL／其他檔案，
+**不能把 `pg_database_size` 除以 PVC 宣告容量當成真實磁碟使用率**。PVC 選擇僅限 release 的
+`newapi-backup` 與 `data-newapi-postgres-<ordinal>`（stg 的 5Gi、prod 20Gi 皆適用）。
+告警需 kubelet volume stats、kube-state-metrics 的 Job owner／failed、CronJob created／last successful
+指標；若目前版本未開 last successful 指標，先調整該 collector。Prometheus 需選到此 namespace
+及 rule labels，Alertmanager 需路由給負責人。Job 失敗歷史保留三份，所以告警可能到舊失敗 Job
+移除才解除；先保留排錯證據再清理。這些接線與實際通知尚待 stg 驗收。
+
+驗收時在 stg 把兩個門檻暫設 **1%**，手動觸發備份 Job，確認非 0、加密完整檔仍在、
+規則觸發且負責人收到通知；再恢復 70%。監控停用／無 metrics 時不能宣稱容量告警已上線。
+
+### 先離線解密，再還原到臨時 DB
+
+1. 在已批准的 stg 窗口，用暫時 helper pod **唯讀**掛備份 PVC，uid／gid 70、無 service-account
+   token、符合 release 的 backup label。RWO 的 PVC 需排到同節點或等 Job 結束後掛載。
+   只帶走 `.dump.age`，例如已有 `na07-export` helper 時：
+
+   ```bash
+   umask 077
+   kubectl -n new-api-stg exec na07-export -- cat /backups/<完整檔名>.dump.age > ./newapi-stg.dump.age
+   ```
+
+   複製完刪 helper；私鑰始終在負責人的可信裝置，**不複製到 helper／postgres pod／Kubernetes Secret**。
+2. 在可信、加密磁碟的本機解密；先確認 age 完整驗證成功，才使用明文檔（不要直接把未驗證完畢的
+   解密串流送到會修改現有 DB 的 pg_restore）。使用匹配 PostgreSQL 16 或更新且相容的工具：
+
+   ```bash
+   set -euo pipefail
+   umask 077
+   restore_tmp=$(mktemp -d)
+   trap 'rm -rf "$restore_tmp"' EXIT
+   age -d -i /離線可信位置/owner-identity -o "$restore_tmp/newapi.dump" ./newapi-stg.dump.age
+   pg_restore --list "$restore_tmp/newapi.dump" > /dev/null
+   # 事先在隔離的臨時 PostgreSQL 建好空 DB；libpq service 指向該 DB，帳密在本機 0600 設定。
+   # newapi-dr-test 必須是臨時 DB，不能是 newapi 現用 DB。
+   pg_restore --exit-on-error --no-owner --no-privileges \
+     --dbname='service=newapi-dr-test' "$restore_tmp/newapi.dump"
+   # 在臨時 DB 核對 users/tokens/channels/logs/audit_logs 列數與取樣，再刪除測試 DB。
+   ```
+
+   錯誤私鑰或損毀檔必須使解密失敗；`grep` 找不到 `sk-` 只能當輔助檢查，不能取代 age 解密驗證。
+   清除本機明文暫存、停用 trap 並退出測試 shell；加密磁碟／tmpfs 才能避免 SSD 上刪檔無法安全抹除的問題。
+3. 真正覆寫服務 DB 是 NA-09 災難復原窗口：先取得新備份、停下 **master、全部 slave、會寫入的
+   proxy／PaaS 工作與 retention**，在隔離 DB 驗證成功後才由負責人切換或批准覆寫。
+   `--clean` 具破壞性，這裡不提供對 live namespace 的直接覆寫指令。同步保全原
+   `SESSION_SECRET`／`CRYPTO_SECRET` 等 Secret；`pg_dump` 不含 Kubernetes Secret。
+
+### 本機驗證與剩餘現場驗收
+
+離線檢查（不讀 kubeconfig／不連 live）：
+
+```bash
+helm lint ./chart
+helm template newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml > /tmp/newapi-render.yaml
+scripts/chart-guards.sh
+python3 -m unittest discover -s tests/maintenance -v
+python3 -m unittest discover -s scripts/tests -v
+python3 tests/contract/selfcheck.py
+```
+
+選用真工具的整合測試（工具需已安裝；私鑰／DB 僅在自動清理的臨時目錄，PostgreSQL 只開 Unix socket）：
+
+```bash
+NA07_POSTGRES_BIN=/path/to/postgres16/bin \
+NA07_POSTGRES_CLIENT_BIN=/path/to/postgres16-client/bin \
+NA07_AGE_BIN=/path/to/age \
+python3 -m unittest discover -s tests/maintenance -v
+```
+
+未提供工具時會明示 skip，不能把 skip 視為真還原成功。本機測試涵蓋兩張表各 10,001 筆舊列、
+近期列、嚴格邊界、被鎖列、schema 不符、批次上限、dump／age 失敗、七日清理、1% 容量失敗、
+真 age 錯誤私鑰與真 pg_dump→age→離線解密→臨時 DB pg_restore。
+
+待 stg：建置 image 的 non-root／唯讀 FS／busybox 工具行為；兩表 EXPLAIN 與索引；04:30／每六小時
+排程與七日過期清理；測試私鑰還原；1% 閾值 Job 失敗＋Alertmanager 實際通知；舊／新列數、
+Job 耗時及鎖等待；retention 期間 `/v1/chat/completions` 正常；解除暫停與正式站部署由負責人後續處理。
+
 
 ## 網路
 

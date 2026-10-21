@@ -14,8 +14,17 @@ spec:
     requests:
       storage: {{ .Values.backup.size }}
 ---
-# Daily pg_dump -Fc. The dump holds every API key and channel key in plain
-# text (new-api stores them unencrypted): treat the PVC as secret material.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "newapi.fullname" . }}-backup-script
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+data:
+  backup.sh: |
+{{ .Files.Get "files/maintenance/backup.sh" | indent 4 }}
+---
+# Encrypted pg_dump -Fc every six hours. Only public recipients enter values.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -25,19 +34,26 @@ metadata:
 spec:
   schedule: {{ .Values.backup.schedule | quote }}
   timeZone: Asia/Taipei
+  suspend: {{ .Values.backup.suspend }}
+  startingDeadlineSeconds: 1800
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
       backoffLimit: 2
+      activeDeadlineSeconds: 3600
       template:
         metadata:
           labels:
             {{- include "newapi.labels" . | nindent 12 }}
             app.kubernetes.io/component: backup
         spec:
-          restartPolicy: OnFailure
+          restartPolicy: Never
+          {{- with .Values.backup.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           automountServiceAccountToken: false
           enableServiceLinks: false
           {{- include "newapi.affinity" . | nindent 10 }}
@@ -49,7 +65,7 @@ spec:
             {{- include "newapi.podSecurity" . | nindent 12 }}
           containers:
             - name: pg-dump
-              image: {{ include "newapi.image" .Values.postgres.image }}
+              image: {{ if .Values.backup.image.digest }}{{ include "newapi.image" .Values.backup.image }}{{ else }}{{ include "newapi.image" .Values.postgres.image }}{{ end }}
               imagePullPolicy: IfNotPresent
               env:
                 - name: PGHOST
@@ -67,26 +83,13 @@ spec:
                   value: Asia/Taipei
                 - name: KEEP_DAYS
                   value: {{ .Values.backup.keepDays | quote }}
+                - name: AGE_RECIPIENT
+                  value: {{ .Values.backup.ageRecipient | quote }}
+                - name: CAPACITY_WARNING_PERCENT
+                  value: {{ .Values.backup.capacityWarningPercent | quote }}
               command:
-                - sh
-                - -c
-                - |
-                  set -eu
-                  # New pods can see REJECTs for 20-30 s while NetworkPolicy
-                  # rules are programmed; wait up to 60 s, then fail loudly.
-                  i=0
-                  until pg_isready -q; do
-                    i=$((i+1))
-                    [ "$i" -ge 60 ] && { echo "postgres unreachable after 60 s" >&2; exit 1; }
-                    sleep 1
-                  done
-                  f="/backups/newapi-$(date +%Y%m%dT%H%M%S%z).dump"
-                  pg_dump -Fc -f "$f.part"
-                  pg_restore -l "$f.part" > /dev/null
-                  mv "$f.part" "$f"
-                  echo "wrote $f ($(wc -c < "$f") bytes)"
-                  find /backups -name 'newapi-*.dump' -mtime "+$KEEP_DAYS" -print -delete
-                  find /backups -name '*.part' -mmin +120 -print -delete
+                - bash
+                - /maintenance/backup.sh
               securityContext:
                 {{- include "newapi.containerSecurity" . | nindent 16 }}
               resources:
@@ -97,11 +100,17 @@ spec:
                   cpu: 500m
                   memory: 512Mi
               volumeMounts:
+                - name: script
+                  mountPath: /maintenance
+                  readOnly: true
                 - name: backups
                   mountPath: /backups
                 - name: tmp
                   mountPath: /tmp
           volumes:
+            - name: script
+              configMap:
+                name: {{ include "newapi.fullname" . }}-backup-script
             - name: backups
               persistentVolumeClaim:
                 claimName: {{ include "newapi.fullname" . }}-backup

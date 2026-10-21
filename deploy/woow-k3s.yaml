@@ -14,3 +14,8 @@ networkPolicy:
         app.kubernetes.io/name: litellm
         app.kubernetes.io/component: app
       port: 4000
+
+backup:
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true  # NA-07: image pin + owner public recipient + stg gate pending

@@ -1,0 +1,53 @@
+{{- if .Values.monitoring.enabled }}
+{{- $fn := include "newapi.fullname" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fn }}-maintenance
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ $fn }}.maintenance
+      rules:
+        - alert: NewapiPVCAboveCapacityThreshold
+          expr: |
+            100 * kubelet_volume_stats_used_bytes{namespace={{ .Release.Namespace | quote }},persistentvolumeclaim=~"({{ $fn }}-backup|data-{{ $fn }}-postgres-[0-9]+)"}
+              / kubelet_volume_stats_capacity_bytes{namespace={{ .Release.Namespace | quote }},persistentvolumeclaim=~"({{ $fn }}-backup|data-{{ $fn }}-postgres-[0-9]+)"}
+              > {{ .Values.monitoring.capacityWarningPercent }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "new-api PostgreSQL/backup PVC capacity threshold exceeded"
+            description: "Check the PVC, WAL, backup age, failed Jobs and Longhorn free space; database size alone excludes WAL and other files."
+        - alert: NewapiMaintenanceJobFailed
+          expr: |
+            (kube_job_status_failed{namespace={{ .Release.Namespace | quote }},job_name=~"{{ $fn }}-(pg-backup|retention)-[0-9]+"} > 0)
+              and on(namespace,job_name)
+            kube_job_owner{namespace={{ .Release.Namespace | quote }},owner_kind="CronJob",owner_name=~"{{ $fn }}-(pg-backup|retention)"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "new-api backup/retention Job failed (including capacity check)"
+            description: "Inspect Job status and logs; archives are only published after the encryption pipeline succeeds. Failed history may keep this alert active until the failed Job is removed."
+        {{- if .Values.backup.enabled }}
+        - alert: NewapiBackupStale
+          expr: |
+            (time() - kube_cronjob_status_last_successful_time{namespace={{ .Release.Namespace | quote }},cronjob="{{ $fn }}-pg-backup"} > 7 * 3600)
+            or
+            ((time() - kube_cronjob_created{namespace={{ .Release.Namespace | quote }},cronjob="{{ $fn }}-pg-backup"} > 7 * 3600)
+              unless on(namespace,cronjob)
+              kube_cronjob_status_last_successful_time{namespace={{ .Release.Namespace | quote }},cronjob="{{ $fn }}-pg-backup"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "new-api has no successful backup within seven hours"
+            description: "Check suspension, image pull, scheduling, failed Jobs and recipient; backup RPO is six hours only after successful encrypted backups are verified."
+        {{- end }}
+{{- end }}

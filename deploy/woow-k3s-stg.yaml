@@ -11,6 +11,8 @@ postgres:
   size: 5Gi
 
 backup:
+  schedule: "45 */6 * * *"
+  suspend: true  # NA-07: image pin + owner public recipient + stg gate pending
   size: 5Gi
   keepDays: 7
 
