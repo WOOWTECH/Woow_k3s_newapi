@@ -30,3 +30,9 @@ encryptedBackup:
 
 retention:
   enabled: false
+
+# NA-05 preparation only: no proxy workloads/NetworkPolicies/Valkey ACL yet.
+# Do not copy the scratch enabled candidate into this file. Activation is a
+# separate reviewed PR after owner Secrets/identity/expiry and contract gates.
+proxy:
+  enabled: false
