@@ -6,6 +6,9 @@ commit `1b3e0ac` and prevents production pre-creation before stg acceptance. Liv
 stg/prod CronJob schedule, suspend flag and `KEEP_DAYS` were checked read-only;
 no live mutation, apply-settings, image publication or merge was performed.
 
+Subsequently, backup image build run 24547 published a SHA-tagged image and
+this stacked staging-pin change records its digest. Neither PR deploys it.
+
 ## Corrected migration invariants
 
 - Default/prod/stg retain `newapi-pg-backup`, active (`suspend: false`), schedule
@@ -103,8 +106,10 @@ pre-NA-07 chart, as enforced by the Helm regression test.
 
 ## Still required on stg (not performed)
 
-1. Verify Longhorn capacity for both PVCs; build/pin non-root read-only age image,
-   provide stg public recipient and registry Secret reference.
+1. Verify actual scheduling for the new 5Gi PVC; the non-root read-only age
+   image was built in run 24547 and pinned in this stacked change, and the
+   existing `newapi-proxy-registry` Secret name is referenced. Obtain the
+   owner's stg public recipient and verify the cluster can pull the image.
 2. Keep legacy active; enable new encryption, observe successful scheduled Jobs
    and original 03:45 Job, restore a real new archive and review row counts.
 3. Verify new archive/part preservation while pruning is off; record archive hash,
@@ -119,3 +124,23 @@ Do not treat these local tests as stg proof or populate verification with dummy
 values. Retain old plaintext/PVC until separately reviewed disposal; new Jobs
 cannot access that volume. To roll back, restore and verify the legacy track
 before suspending encrypted backup.
+
+## Subsequent staging preflight and image publication (read-only except JCR push)
+
+- On 2026-10-21, live stg `newapi-pg-backup` was active at 03:45 with
+  `KEEP_DAYS=7`; prod was active at 03:45 with `KEEP_DAYS=14`. No backup
+  configuration was changed. The most recent stg success was
+  `2026-10-20T19:45:18Z` at inspection.
+- In a read-only stg PostgreSQL transaction, `logs` held 3,503 rows and
+  `audit_logs` 9,210; neither had rows older than 180 days. `EXPLAIN` without
+  `ANALYZE` selected `idx_created_at_id` for `logs` and
+  `idx_audit_logs_created_at` with incremental sort for `audit_logs`.
+  This is a planner preflight, not a delete/runtime/lock acceptance test.
+- Longhorn reported per-node available bytes of 59,139,686,400;
+  346,764,083,200; 419,430,400,000; and 114,609,356,800. Scheduling,
+  replica health and the separate new PVC are not yet verified.
+- Gitea Actions run 24547 completed its build, non-root/read-only smoke,
+  push, digest pullback and cleanup steps. Source SHA:
+  `e020639cbfe3c32690c5efa1c036b4610682e438`; image digest:
+  `sha256:93f650ca7e1b3d754769183dc850add73383283f7812761691e88f559c63f965`.
+  It has not been pulled or run by Kubernetes; the new CronJob remains suspended.
