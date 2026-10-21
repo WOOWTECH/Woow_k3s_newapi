@@ -1,0 +1,186 @@
+# NA-07: publisher only; never changes Helm values, secrets, settings or a cluster.
+# No PR trigger. Main path changes auto-build; the reviewed NA-07 branch can be
+# manually dispatched for stg qualification. This file does not authorize a run.
+name: build-newapi-backup
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "images/backup/Dockerfile"
+      - ".gitea/workflows/build-newapi-backup.yml"
+
+concurrency:
+  group: build-newapi-backup-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: artifactory-jcr-artifactory-nginx.jfrog.svc.cluster.local
+  REPOSITORY: woow-paas-docker-local/newapi-backup
+  PUBLIC_REPOSITORY: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-backup
+
+jobs:
+  build:
+    if: github.repository == 'woow-paas/Woow_k3s_newapi' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image: ${{ steps.record.outputs.image }}
+      digest: ${{ steps.record.outputs.digest }}
+      pinned: ${{ steps.record.outputs.pinned }}
+    steps:
+      - name: Checkout reviewed source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard repository, ref, base and build scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == woow-paas/Woow_k3s_newapi ]]
+          case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
+            push:refs/heads/main|workflow_dispatch:refs/heads/main|workflow_dispatch:refs/heads/feat/na-07-retention-backup) ;;
+            *) echo '::error::unapproved publication event/ref'; exit 1 ;;
+          esac
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          # checkout fetch-depth=0 must include current origin/main; no tokened
+          # network fetch after checkout, and no stale/divergent manual base.
+          git show-ref --verify --quiet refs/remotes/origin/main
+          git merge-base --is-ancestor refs/remotes/origin/main HEAD
+          [[ "$REGISTRY" == artifactory-jcr-artifactory-nginx.jfrog.svc.cluster.local ]]
+          [[ "$REPOSITORY" == woow-paas-docker-local/newapi-backup ]]
+          [[ "$PUBLIC_REPOSITORY" == jcr-prod.woowtech.io/woow-paas-docker-local/newapi-backup ]]
+          [[ "$(git ls-files images/backup)" == images/backup/Dockerfile ]]
+          [[ ! -L images/backup/Dockerfile ]]
+          # Lock the entire reviewed recipe, not just its FROM. Recipe changes
+          # require explicit review/update of this hash; no arbitrary build args.
+          printf '%s\n' '7cd86ded6ce1a5a0505ece29279b1c076d00511b4f80fe5f531380797981c9ce  images/backup/Dockerfile' | sha256sum -c -
+          grep -Fx 'FROM docker.io/library/postgres:16.15-alpine3.24@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea' images/backup/Dockerfile
+          command -v docker >/dev/null
+          docker version >/dev/null
+          docker info >/dev/null
+          [[ "$(docker info --format '{{.OSType}}/{{.Architecture}}')" == linux/x86_64 ]]
+          # Auth and context stay outside the checkout and are removed always.
+          auth_dir=$(mktemp -d "${RUNNER_TEMP:?}/newapi-backup-auth.XXXXXX")
+          chmod 700 "$auth_dir"
+          printf 'DOCKER_CONFIG=%s\nIMAGE=%s/%s:%s\n' "$auth_dir" "$REGISTRY" "$REPOSITORY" "$GITHUB_SHA" >> "$GITHUB_ENV"
+
+      - name: Login to JCR using existing Actions secrets
+        shell: bash
+        env:
+          JCR_USERNAME: ${{ secrets.JCR_USERNAME }}
+          JCR_PASSWORD: ${{ secrets.JCR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$JCR_USERNAME" || -z "$JCR_PASSWORD" ]]; then
+            echo '::error::JCR_USERNAME/JCR_PASSWORD must be available to this repository (repo or inherited organization secrets)'
+            exit 1
+          fi
+          printf '%s' "$JCR_PASSWORD" | docker login "$REGISTRY" -u "$JCR_USERNAME" --password-stdin
+
+      - name: Reuse existing SHA tag; fail closed on registry errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          if out=$(docker pull --quiet "$IMAGE" 2>&1); then
+            echo 'SKIP_PUSH=1' >> "$GITHUB_ENV"
+            echo '::notice::commit-SHA tag exists; reusing it without rebuilding or pushing'
+          else
+            lc=${out,,}
+            if [[ "$lc" != *"manifest unknown"* && ! "$lc" =~ manifest\ for\ [^[:space:]]+\ not\ found ]]; then
+              echo '::error::registry existence check failed (auth/network/unknown); refusing to overwrite'
+              exit 1
+            fi
+          fi
+
+      - name: Build reviewed Dockerfile in an isolated context
+        if: env.SKIP_PUSH != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          context_dir=$(mktemp -d "${RUNNER_TEMP:?}/newapi-backup-context.XXXXXX")
+          trap 'rm -rf "$context_dir"' EXIT
+          install -m 0644 images/backup/Dockerfile "$context_dir/Dockerfile"
+          docker build --pull --platform linux/amd64 \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label 'org.opencontainers.image.source=https://git-prod.woowtech.io/woow-paas/Woow_k3s_newapi' \
+            -f "$context_dir/Dockerfile" -t "$IMAGE" "$context_dir"
+
+      - name: Smoke test non-root read-only candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
+          [[ "$revision" == "$GITHUB_SHA" ]]
+          docker run --rm --network none --user 70:70 --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m --entrypoint /bin/bash "$IMAGE" -ceu '
+              [[ "$(id -u):$(id -g)" == 70:70 ]]
+              command -v age; command -v pg_dump; command -v pg_restore
+              age --version; pg_dump --version; pg_restore --version
+              touch /tmp/na07-write-check
+              df -Pk /tmp >/dev/null
+              find /tmp -maxdepth 1 -type f -name na07-write-check -mmin +120 -print
+            '
+
+      - name: Push only the immutable commit-SHA tag
+        if: env.SKIP_PUSH != '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$IMAGE" == "$REGISTRY/$REPOSITORY:$GITHUB_SHA" ]]
+          # Recheck immediately before push; another publisher may have created
+          # this SHA while we built it. Registry-side immutability is still
+          # needed for an atomic guarantee across unrelated publishers.
+          if out=$(docker pull --quiet "$IMAGE" 2>&1); then
+            echo '::error::SHA tag appeared during build; refusing overwrite (rerun to reuse)'
+            exit 1
+          fi
+          lc=${out,,}
+          if [[ "$lc" != *"manifest unknown"* && ! "$lc" =~ manifest\ for\ [^[:space:]]+\ not\ found ]]; then
+            echo '::error::pre-push existence check failed; refusing publication'
+            exit 1
+          fi
+          docker push "$IMAGE"
+
+      - name: Pull back tag and digest; record deployable reference
+        id: record
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE"
+          refs=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE")
+          digest=''
+          while IFS= read -r ref; do
+            if [[ "$ref" == "$REGISTRY/$REPOSITORY@"* ]]; then digest=${ref##*@}; fi
+          done <<< "$refs"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ && ! "$digest" =~ ^sha256:0{64}$ ]]
+          docker pull --quiet "$REGISTRY/$REPOSITORY@$digest"
+          revision=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REGISTRY/$REPOSITORY@$digest")
+          [[ "$revision" == "$GITHUB_SHA" ]]
+          public_ref="$PUBLIC_REPOSITORY:$GITHUB_SHA"
+          printf 'image=%s\ndigest=%s\npinned=%s@%s\n' "$public_ref" "$digest" "$public_ref" "$digest" >> "$GITHUB_OUTPUT"
+          printf 'image: %s\ndigest: %s\npinned: %s@%s\n' "$public_ref" "$digest" "$public_ref" "$digest"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            printf '### NA-07 backup image\n\n%s@%s\n\nNo deployment or values change performed.\n' "$public_ref" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Remove temporary registry credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${DOCKER_CONFIG:-}" ]]; then
+            case "$DOCKER_CONFIG" in
+              "${RUNNER_TEMP:?}"/newapi-backup-auth.*) rm -rf -- "$DOCKER_CONFIG" ;;
+              *) echo '::error::unexpected credential path; refusing unsafe removal'; exit 1 ;;
+            esac
+          fi
