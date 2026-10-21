@@ -103,7 +103,8 @@ for rx in '^wp\d{10}$' '^ws[a-z]{2}\d{10}$'; do
   { head_; printf "  usernameRegex: '%s'\n" "$rx"; odoo_client; } | check "real-regex-$n" pass -
 done
 
-# NA-07: guards + rendered maintenance/network contracts and failure paths.
+# NA-07: dual-track migration/retirement guards, legacy compatibility,
+# rendered maintenance/network contracts and runtime failure paths.
 # Optional real age tests run when NA07_AGE_BIN is set.
 python3 -m unittest discover -s tests/maintenance -p test_maintenance.py -v || rc=1
 

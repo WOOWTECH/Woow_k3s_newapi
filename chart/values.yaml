@@ -111,12 +111,22 @@ cloudflared:
       cpu: 500m
       memory: 256Mi
 
+# Existing plaintext CronJob/PVC: preserve its name and daily active behavior.
+# Suspend/disable only after the encrypted track is active AND restore evidence
+# is recorded below; Helm guards reject an unverified cutover.
 backup:
+  enabled: true
+  schedule: "45 3 * * *"
+  keepDays: 14
+  suspend: false
+  storageClassName: longhorn
+  size: 20Gi
+
+# Additive migration: separate CronJob and PVC, never delete legacy dumps.
+encryptedBackup:
   enabled: true
   schedule: "45 */6 * * *"
   keepDays: 7
-  # Migration gate: owner supplies a recipient + built image digest and stg
-  # restore/alert evidence, then commits suspend: false. No plaintext fallback.
   suspend: true
   ageRecipient: ""
   image:
@@ -127,6 +137,16 @@ backup:
   capacityWarningPercent: 70
   storageClassName: longhorn
   size: 20Gi
+  # No pruning until an actual restore is reviewed. Evidence contains no secrets.
+  pruneEnabled: false
+  restoreVerification:
+    evidenceRef: ""
+    archiveSha256: ""
+    imageDigest: ""
+    recipient: ""
+    namespace: ""
+    release: ""
+    verifiedAt: ""
 
 # newapi-proxy: the only in-cluster path from the PaaS Odoo pods to new-api
 # (code: woow_paas_platform extra/newapi-proxy; AI-models design §1.4). It

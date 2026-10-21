@@ -11,10 +11,10 @@ postgres:
   size: 5Gi
 
 backup:
-  schedule: "45 */6 * * *"
-  suspend: true  # NA-07: image pin + owner public recipient + stg gate pending
+  schedule: "45 3 * * *"
+  suspend: false
   size: 5Gi
-  keepDays: 7
+  keepDays: 14
 
 newapi:
   resources:
@@ -78,3 +78,11 @@ proxy:
       podSelector:
         matchLabels:
           app.kubernetes.io/component: odoo
+
+# Additive NA-07 track; the original daily backup above remains active.
+encryptedBackup:
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true
+  pruneEnabled: false
+  size: 5Gi

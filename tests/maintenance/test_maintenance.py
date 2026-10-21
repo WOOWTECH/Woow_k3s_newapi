@@ -7,7 +7,6 @@ No kubeconfig, service credentials or live DB connections are used.
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -35,43 +34,100 @@ class HelmTests(unittest.TestCase):
                 args += ['--show-only', 'templates/' + template]
             return run(args)
 
-    def test_default_prod_stg_schedules_and_secrets(self):
+    def active_encrypted(self):
+        return {'suspend': False, 'ageRecipient': PUBLIC,
+                'image': {'digest': DIGEST, 'tag': 'test'}}
+
+    def verified_encrypted(self):
+        enc=self.active_encrypted()
+        enc['restoreVerification']={'archiveSha256': 'sha256:'+'b'*64,
+            'evidenceRef': 'stg/restore-evidence-123', 'imageDigest': DIGEST,
+            'recipient': PUBLIC, 'namespace': 'new-api-stg', 'release': 'newapi',
+            'verifiedAt': '2026-10-21T12:00:00Z'}
+        return enc
+
+    def test_default_prod_stg_preserve_legacy_and_add_suspended_encryption(self):
         for site in [None, 'deploy/woow-k3s.yaml', 'deploy/woow-k3s-stg.yaml']:
             with self.subTest(site=site):
-                p = self.render(site=site)
+                p=self.render(site=site)
                 self.assertEqual(p.returncode, 0, p.stderr)
-                self.assertIn('schedule: "45 */6 * * *"', p.stdout)
-                self.assertIn('schedule: "30 4 * * *"', p.stdout)
-                self.assertIn('timeZone: Asia/Taipei', p.stdout)
-                self.assertIn('name: PGPASSWORD\n', p.stdout)
-                self.assertNotIn('AGE-SECRET-KEY-', p.stdout)
-                self.assertEqual(p.stdout.count('  suspend: true'), 2)
+                jobs=[d for d in p.stdout.split('---') if 'kind: CronJob' in d]
+                self.assertEqual(len(jobs),3)
+                legacy=next(d for d in jobs if '  name: newapi-pg-backup\n' in d)
+                age=next(d for d in jobs if '  name: newapi-pg-backup-age\n' in d)
+                self.assertIn('schedule: "45 3 * * *"',legacy)
+                self.assertIn('suspend: false',legacy)
+                self.assertIn('value: "14"',legacy)
+                self.assertIn('claimName: newapi-backup\n',legacy)
+                self.assertIn('schedule: "45 */6 * * *"',age)
+                self.assertIn('suspend: true',age)
+                self.assertIn('value: "7"',age)
+                self.assertIn('name: PRUNE_ENABLED\n                  value: "false"',age)
+                self.assertIn('claimName: newapi-backup-age\n',age)
+                self.assertNotIn('claimName: newapi-backup\n',age)
+                self.assertIn('schedule: "30 4 * * *"',p.stdout)
+                self.assertNotIn('AGE-SECRET-KEY-',p.stdout)
 
-    def test_active_backup_requires_recipient_and_image_pin(self):
-        for backup, error in [
-            ({'suspend': False}, 'backup.ageRecipient'),
-            ({'suspend': 'false'}, 'backup.suspend must be a boolean'),
-            ({'enabled': 'false'}, 'backup.enabled must be a boolean'),
-            ({'image': {'digest': 'sha256:bad'}}, 'backup.image.digest'),
-            ({'suspend': False, 'ageRecipient': PUBLIC}, 'backup.image.digest'),
-            ({'suspend': False, 'ageRecipient': PUBLIC, 'image': {'digest': 'sha256:'+'0'*64}}, 'backup.image.digest'),
+    def test_legacy_dump_validation_cleanup_and_runtime_unchanged_from_main(self):
+        base=run(['git','show','b775213:chart/templates/backup.yaml'],cwd=ROOT)
+        self.assertEqual(base.returncode,0,base.stderr)
+        current=(ROOT/'chart/templates/backup.yaml').read_text()
+        # The only template addition is an explicit default-false suspend field.
+        self.assertEqual(current.replace('  suspend: {{ .Values.backup.suspend }}\n',''),base.stdout)
+
+    def test_active_encrypted_requires_recipient_and_image_pin(self):
+        for enc,error in [
+            ({'suspend': False}, 'encryptedBackup.ageRecipient'),
+            ({'suspend': 'false'}, 'encryptedBackup.suspend must be a boolean'),
+            ({'enabled': 'false'}, 'encryptedBackup.enabled must be a boolean'),
+            ({'pruneEnabled': 'false'}, 'encryptedBackup.pruneEnabled must be a boolean'),
+            ({'image': {'digest': 'sha256:bad'}}, 'encryptedBackup.image.digest'),
+            ({'suspend': False,'ageRecipient': PUBLIC}, 'encryptedBackup.image.digest'),
+            ({'suspend': False,'ageRecipient': PUBLIC,'image': {'digest': 'sha256:'+'0'*64}}, 'encryptedBackup.image.digest'),
             ({'ageRecipient': 'AGE-SECRET-KEY-DO-NOT-ACCEPT'}, 'public recipient'),
             ({'ageRecipient': PUBLIC+'\nINJECTED'}, 'public recipient'),
-            ({'keepDays': 0}, 'backup.keepDays'),
-            ({'keepDays': 1.5}, 'backup.keepDays'),
-            ({'capacityWarningPercent': 101}, 'backup.capacityWarningPercent'),
+            ({'keepDays': 0}, 'encryptedBackup.keepDays'),
+            ({'keepDays': 1.5}, 'encryptedBackup.keepDays'),
+            ({'capacityWarningPercent': 101}, 'encryptedBackup.capacityWarningPercent'),
         ]:
-            with self.subTest(backup=backup):
-                p=self.render({'backup': backup})
-                self.assertNotEqual(p.returncode, 0)
-                self.assertIn(error, p.stderr)
-        p=self.render({'backup': {'suspend': False, 'ageRecipient': PUBLIC,
-                                 'image': {'digest': DIGEST, 'tag': 'test'}}}, 'backup.yaml')
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn('suspend: false', p.stdout)
-        self.assertIn('@'+DIGEST, p.stdout)
-        self.assertIn('command:\n                - bash\n                - /maintenance/backup.sh', p.stdout)
-        self.assertIn('activeDeadlineSeconds: 3600', p.stdout)
+            with self.subTest(enc=enc):
+                p=self.render({'encryptedBackup': enc})
+                self.assertNotEqual(p.returncode,0)
+                self.assertIn(error,p.stderr)
+        p=self.render({'encryptedBackup': self.active_encrypted()})
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertEqual(p.stdout.count('  suspend: false'),2)  # old + new run in parallel
+        self.assertIn('@'+DIGEST,p.stdout)
+        self.assertIn('activeDeadlineSeconds: 3600',p.stdout)
+
+    def test_retirement_and_pruning_require_reviewed_restore_for_this_deployment(self):
+        for key in ['enabled','suspend']:
+            p=self.render({'backup': {key: 'false'}})
+            self.assertNotEqual(p.returncode,0)
+            self.assertIn('backup.'+key+' must be a boolean',p.stderr)
+        for backup in [{'suspend': True},{'enabled': False}]:
+            self.assertNotEqual(self.render({'backup': backup}).returncode,0)
+            p=self.render({'backup': backup,'encryptedBackup': self.active_encrypted()})
+            self.assertNotEqual(p.returncode,0)
+            self.assertIn('restoreVerification',p.stderr)
+            enc=self.verified_encrypted()
+            p=self.render({'backup': backup,'encryptedBackup': enc})
+            self.assertEqual(p.returncode,0,p.stderr)
+            # Rolling back new encryption while the old track is retired is forbidden.
+            enc['suspend']=True
+            self.assertNotEqual(self.render({'backup': backup,'encryptedBackup': enc}).returncode,0)
+        enc=self.active_encrypted();enc['pruneEnabled']=True
+        self.assertNotEqual(self.render({'encryptedBackup': enc}).returncode,0)
+        enc=self.verified_encrypted();enc['pruneEnabled']=True
+        self.assertEqual(self.render({'encryptedBackup': enc}).returncode,0)
+        for key,value in [('imageDigest','sha256:'+'c'*64),('recipient',PUBLIC+'x'),
+                          ('namespace','new-api'),('release','other'),('verifiedAt',''),
+                          ('evidenceRef',''),('archiveSha256','sha256:'+'0'*64)]:
+            enc=self.verified_encrypted();enc['restoreVerification'][key]=value
+            with self.subTest(key=key):
+                p=self.render({'backup': {'suspend': True},'encryptedBackup': enc})
+                self.assertNotEqual(p.returncode,0)
+                self.assertIn('restoreVerification',p.stderr)
 
     def test_retention_guards(self):
         for key, value in [('days', 0), ('days', '180; DROP TABLE logs'),
@@ -81,9 +137,11 @@ class HelmTests(unittest.TestCase):
             self.assertIn('retention.'+key, p.stderr)
 
     def test_disabled_components_and_scoped_network(self):
-        p=self.render({'backup': {'enabled': False}, 'retention': {'enabled': False}})
+        p=self.render({'encryptedBackup': {'enabled': False}, 'retention': {'enabled': False}})
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertNotIn('kind: CronJob', p.stdout)
+        self.assertEqual(p.stdout.count('kind: CronJob'),1)
+        self.assertIn('  name: newapi-pg-backup\n',p.stdout)
+        self.assertNotIn('  name: newapi-pg-backup-age\n',p.stdout)
         self.assertNotIn('name: newapi-retention', p.stdout)
         p=self.render(template='networkpolicy.yaml')
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -94,14 +152,33 @@ class HelmTests(unittest.TestCase):
         self.assertIn('app.kubernetes.io/component: postgres', retention)
         self.assertIn('port: 5432', retention)
         self.assertNotIn('ipBlock', retention)
+        self.assertIn('app.kubernetes.io/component: backup-encrypted',postgres)
+        age=p.stdout.split('  name: newapi-backup-age\n',1)[1]
+        self.assertIn('app.kubernetes.io/component: backup-encrypted',age)
+        self.assertIn('app.kubernetes.io/component: postgres',age)
+        self.assertNotIn('ipBlock',age)
 
     def test_monitoring_covers_both_pvcs_jobs_and_stale_backup(self):
         p=self.render({'monitoring': {'enabled': True, 'labels': {'release': 'monitoring'}}}, 'monitoring.yaml')
         self.assertEqual(p.returncode, 0, p.stderr)
         for expected in ['kind: PrometheusRule', 'release: monitoring', 'data-newapi-postgres-',
-                         'newapi-backup', '> 70', 'kube_job_status_failed', 'kube_job_owner',
+                         'newapi-backup', '> 70', 'kube_job_status_failed',
                          'kube_cronjob_status_last_successful_time', 'kube_cronjob_created']:
             self.assertIn(expected, p.stdout)
+        self.assertIn('alert: NewapiLegacyBackupStale',p.stdout)
+        self.assertIn('> 25 * 3600',p.stdout)
+        self.assertNotIn('alert: NewapiEncryptedBackupStale',p.stdout)
+        p=self.render({'monitoring': {'enabled': True},'encryptedBackup': self.active_encrypted()},'monitoring.yaml')
+        self.assertIn('alert: NewapiEncryptedBackupStale',p.stdout)
+        self.assertIn('> 7 * 3600',p.stdout)
+        self.assertIn('backup(-age)?',p.stdout)
+        self.assertIn('job_name=~"newapi-(pg-backup(-age)?|retention)-[0-9]+"',p.stdout)
+        self.assertNotIn('kube_job_owner',p.stdout)
+        p=self.render({'backup': {'suspend': True},'encryptedBackup': self.verified_encrypted(),
+                       'monitoring': {'enabled': True}},'monitoring.yaml')
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertNotIn('alert: NewapiLegacyBackupStale',p.stdout)
+        self.assertIn('alert: NewapiEncryptedBackupStale',p.stdout)
 
 
 STUB = '''#!/usr/bin/env python3
@@ -135,30 +212,41 @@ class BackupTests(unittest.TestCase):
         for tool in ['pg_dump','age','pg_isready','df','psql','sleep']:
             p=self.bin/tool; p.write_text(STUB); p.chmod(0o755)
         self.env=dict(os.environ, PATH=str(self.bin)+':'+os.environ['PATH'], BACKUP_DIR=str(self.backups),
-                      AGE_RECIPIENT=PUBLIC, KEEP_DAYS='7', CAPACITY_WARNING_PERCENT='70')
+                      AGE_RECIPIENT=PUBLIC, KEEP_DAYS='7', CAPACITY_WARNING_PERCENT='70',PRUNE_ENABLED='false')
 
     def execute(self, **env):
         return run(['bash', str(SCRIPTS/'backup.sh')], env=dict(self.env, **env))
 
     def test_success_prunes_at_seven_days_and_preserves_recent_and_unrelated(self):
-        for name, days in [('newapi-expired.dump.age',8), ('newapi-exact.dump.age',7),
-                           ('newapi-legacy.dump',8), ('newapi-recent.dump.age',6),
-                           ('unrelated.age',9), ('newapi-stale.part',1)]:
+        for name, days in [('newapi-age-expired.dump.age',8), ('newapi-age-exact.dump.age',7),
+                           ('newapi-legacy.dump',8), ('newapi-age-recent.dump.age',6),
+                           ('unrelated.age',9), ('newapi-age-stale.dump.age.part',1)]:
             p=self.backups/name; p.write_text('old')
             ts=__import__('time').time()-days*86400; os.utime(p,(ts,ts))
-        p=self.execute()
+        p=self.execute(PRUNE_ENABLED='true')
         self.assertEqual(p.returncode,0,p.stderr)
-        self.assertFalse((self.backups/'newapi-expired.dump.age').exists())
-        self.assertFalse((self.backups/'newapi-exact.dump.age').exists())
-        self.assertFalse((self.backups/'newapi-legacy.dump').exists())
-        self.assertFalse((self.backups/'newapi-stale.part').exists())
-        self.assertTrue((self.backups/'newapi-recent.dump.age').exists())
+        self.assertFalse((self.backups/'newapi-age-expired.dump.age').exists())
+        self.assertFalse((self.backups/'newapi-age-exact.dump.age').exists())
+        self.assertTrue((self.backups/'newapi-legacy.dump').exists())
+        self.assertFalse((self.backups/'newapi-age-stale.dump.age.part').exists())
+        self.assertTrue((self.backups/'newapi-age-recent.dump.age').exists())
         self.assertTrue((self.backups/'unrelated.age').exists())
         self.assertIn('pg_database_size_bytes=12345',p.stdout)
         self.assertIn('backup_pvc_used_percent=70',p.stdout)
-        new=[x for x in self.backups.glob('newapi-*.dump.age') if x.name!='newapi-recent.dump.age']
+        new=[x for x in self.backups.glob('newapi-age-*.dump.age') if x.name!='newapi-age-recent.dump.age']
         self.assertEqual(len(new),1)
         self.assertNotIn('sk-',new[0].read_text())
+
+    def test_unverified_track_never_prunes_prior_archives_or_parts(self):
+        old_names=['newapi-age-old.dump.age','newapi-legacy.dump','newapi-legacy.dump.part',
+                   'newapi-age-stale.dump.age.part','newapi-old.dump.age']
+        for name in old_names:
+            p=self.backups/name;p.write_text('preserve');os.utime(p,(0,0))
+        p=self.execute()
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertIn('pruning disabled',p.stdout)
+        for name in old_names:
+            self.assertEqual((self.backups/name).read_text(),'preserve')
 
     def test_failed_dump_or_encryption_does_not_publish_or_prune_good_archives(self):
         old=self.backups/'newapi-old.dump.age'; old.write_text('previous-good')

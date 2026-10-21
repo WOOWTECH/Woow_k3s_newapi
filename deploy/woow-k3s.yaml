@@ -16,6 +16,13 @@ networkPolicy:
       port: 4000
 
 backup:
+  schedule: "45 3 * * *"
+  keepDays: 14
+  suspend: false
+
+# Additive NA-07 track; the original daily backup above remains active.
+encryptedBackup:
   schedule: "45 */6 * * *"
   keepDays: 7
-  suspend: true  # NA-07: image pin + owner public recipient + stg gate pending
+  suspend: true
+  pruneEnabled: false

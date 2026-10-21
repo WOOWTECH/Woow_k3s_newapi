@@ -2,6 +2,8 @@
 set -euo pipefail
 umask 077
 : "${AGE_RECIPIENT:?public age recipient required}"
+: "${PRUNE_ENABLED:=false}"
+[[ $PRUNE_ENABLED == true || $PRUNE_ENABLED == false ]]
 : "${KEEP_DAYS:?}" "${CAPACITY_WARNING_PERCENT:?}"
 backup_dir=${BACKUP_DIR:-/backups}
 [[ $KEEP_DAYS =~ ^[1-9][0-9]*$ ]]
@@ -15,8 +17,7 @@ until pg_isready -q; do
   (( i < 60 )) || { echo 'postgres unreachable after 60 s' >&2; exit 1; }
   sleep 1
 done
-find "$backup_dir" -maxdepth 1 -type f -name 'newapi-*.part' -mmin +120 -print -delete
-f="$backup_dir/newapi-$(date -u +%Y%m%dT%H%M%SZ)-$$.dump.age"
+f="$backup_dir/newapi-age-$(date -u +%Y%m%dT%H%M%SZ)-$$.dump.age"
 trap 'rm -f "$f.part"' EXIT
 trap 'exit 1' HUP INT TERM
 # pipefail is essential: age can succeed even when pg_dump fails halfway.
@@ -25,10 +26,17 @@ pg_dump -Fc | age -r "$AGE_RECIPIENT" -o "$f.part"
 [[ -s $f.part ]]
 mv "$f.part" "$f"
 echo "wrote $f ($(wc -c < "$f") encrypted bytes)"
-# -mmin rounds down; +N-1 expires files at >= N whole minutes, not day 8.
-# Only prune after a successful encrypted dump, including legacy plaintext.
-find "$backup_dir" -maxdepth 1 -type f \( -name 'newapi-*.dump.age' -o -name 'newapi-*.dump' \) \
-  -mmin "+$((KEEP_DAYS * 1440 - 1))" -print -delete
+# Default: preserve every prior archive until restore evidence is reviewed.
+# Never prune plaintext/legacy names, even if pointed at the wrong directory.
+if [[ $PRUNE_ENABLED == true ]]; then
+  # -mmin rounds down: expire at >= KEEP_DAYS whole days, not day 8.
+  find "$backup_dir" -maxdepth 1 -type f -name 'newapi-age-*.dump.age' \
+    -mmin "+$((KEEP_DAYS * 1440 - 1))" -print -delete
+  find "$backup_dir" -maxdepth 1 -type f -name 'newapi-age-*.dump.age.part' \
+    -mmin +120 -print -delete
+else
+  echo 'archive pruning disabled until restore verification is recorded'
+fi
 psql -X -v ON_ERROR_STOP=1 -Atc 'SELECT pg_database_size(current_database())' |
   while IFS= read -r bytes; do echo "pg_database_size_bytes=$bytes"; done
 used=$(df -Pk "$backup_dir" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
