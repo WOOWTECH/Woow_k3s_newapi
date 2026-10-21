@@ -107,9 +107,9 @@ pre-NA-07 chart, as enforced by the Helm regression test.
 ## Still required on stg (not performed)
 
 1. Verify actual scheduling for the new 5Gi PVC; the non-root read-only age
-   image was built in run 24547 and pinned in this stacked change, and the
-   existing `newapi-proxy-registry` Secret name is referenced. Obtain the
-   owner's stg public recipient and verify the cluster can pull the image.
+   image was built in run 24547, pinned in this stacked change, and pulled
+   in a temporary staging smoke Job using the existing `newapi-proxy-registry`
+   Secret reference. Obtain the owner's stg public recipient.
 2. Keep legacy active; enable new encryption, observe successful scheduled Jobs
    and original 03:45 Job, restore a real new archive and review row counts.
 3. Verify new archive/part preservation while pruning is off; record archive hash,
@@ -143,4 +143,9 @@ before suspending encrypted backup.
   push, digest pullback and cleanup steps. Source SHA:
   `e020639cbfe3c32690c5efa1c036b4610682e438`; image digest:
   `sha256:93f650ca7e1b3d754769183dc850add73383283f7812761691e88f559c63f965`.
-  It has not been pulled or run by Kubernetes; the new CronJob remains suspended.
+- A short-lived `new-api-stg` Job `na07-backup-image-smoke-1021` pulled that
+  exact digest with the existing registry Secret reference, ran as UID 70 with
+  read-only root filesystem and no DB/PVC mount, and exited 0. It reported
+  age 1.3.2 and PostgreSQL client 16.15; its pod `imageID` matched the pin.
+  The Job was deleted and absence confirmed. It did not make a real backup or
+  restore; the new CronJob remains suspended.
