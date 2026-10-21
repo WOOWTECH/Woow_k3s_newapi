@@ -467,3 +467,11 @@ shred -u "$f" 2>/dev/null || rm -f "$f"; unset nw nc
 ### break-glass
 
 只有負責人以 `helm upgrade --set proxy.breakGlassUntil=<unix 秒>` 開啟，最多 24 小時（chart 與代理都會擋），用完設回空字串（`helm upgrade -f deploy/woow-k3s*.yaml` 即恢復）。
+
+## NA-06 stage-first Access／WAF／DNS preflight
+
+管理面只經 Cloudflare Access 或受控 `kubectl port-forward`，`newapi_admin.py` 維運走 port-forward。正式守線仍須驗收，不能因根頁 200、裸 403 或 stg NXDOMAIN 宣告完成。
+
+新增唯讀工具與 Elmo 的 UI 配置／回復順序見 [NA06-CLOUDFLARE-PREFLIGHT.md](NA06-CLOUDFLARE-PREFLIGHT.md)。`cf-exposure.py` 預設完全離線，僅 stage；token 待 Elmo 提供私有檔，沒有 Cloudflare mutation。舊 `cf-tunnel.sh tunnel/dns` 仍會寫入，不能拿來當 preflight。
+
+`check-exposure.sh` 現在必須帶 `--team-domain TEAM.cloudflareaccess.com`；匿名與禁用路由只將確切 team 的 Access login 302 記為可辨識 Access 證據。403/401/404 無法由 status 分辨 Access/WAF/origin，會保守失敗等待人工事件對照。完整 NA-06 尚需 relay、U12、具名登入、內部代理與 stage→prod gate，不能用任何單一 status 替代。

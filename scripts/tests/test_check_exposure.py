@@ -24,6 +24,9 @@ class FakeServer:
         self.requests = []
         self.pg_post_auth = "not-seen"
         self.anonymous_status = 302
+        self.access_location = "https://unit-team.cloudflareaccess.com/cdn-cgi/access/login/test?secret=must-not-print"
+        self.header_only_response = False
+        self.pg_post_status = None
         self.models_status = 200
         self.stream_status = 200
 
@@ -36,8 +39,12 @@ class FakeServer:
             def respond(self, code, body=b"private fake response body"):
                 self.send_response(code)
                 self.send_header("Content-Length", str(len(body)))
+                if code == 302:
+                    self.send_header("Location", owner.access_location)
+                    self.send_header("CF-Ray", "abcdef123456-TEST")
                 self.end_headers()
-                self.wfile.write(body)
+                if not owner.header_only_response:
+                    self.wfile.write(body)
 
             def do_GET(self):
                 owner.requests.append(("GET", self.path, self.headers.get("Authorization"),
@@ -50,7 +57,7 @@ class FakeServer:
                                         b"relay response secret must not be printed")
                 if self.path in ("/v1", "/v1/", "/v1x", "/V1/models"):
                     return self.respond(200)
-                return self.respond(404)
+                return self.respond(302)
 
             def do_POST(self):
                 size = int(self.headers.get("Content-Length", "0"))
@@ -59,7 +66,7 @@ class FakeServer:
                                        self.raw_requestline.decode("ascii").split(" ", 2)[1]))
                 if self.path == "/pg/chat/completions":
                     owner.pg_post_auth = self.headers.get("Authorization")
-                    return self.respond(owner.anonymous_status, ANON_POST_BODY)
+                    return self.respond(owner.pg_post_status or owner.anonymous_status, ANON_POST_BODY)
                 if self.path == "/v1/chat/completions":
                     return self.respond(owner.stream_status,
                                         b'data: {"choices":[]}\r\n\r\ndata: [DONE]\r\n\r\n')
@@ -112,12 +119,12 @@ class CheckExposureTests(unittest.TestCase):
     def run_script(self, *args, url=None):
         env = os.environ.copy()
         env["CURL_HOME"] = self.curl_home
-        return subprocess.run([SCRIPT, *args, url or self.server.url], env=env,
-                              text=True, capture_output=True, timeout=20)
+        return subprocess.run([SCRIPT, "--team-domain", "unit-team.cloudflareaccess.com", *args, url or self.server.url], env=env,
+                              text=True, capture_output=True, timeout=20, check=False)
 
     def assert_sensitive_absent(self, result):
         for value in (SECRET, DEFAULT_CONFIG_MARKER, ANON_BODY.decode(), ANON_POST_BODY.decode(),
-                      "relay response secret must not be printed"):
+                      "relay response secret must not be printed", "must-not-print"):
             self.assertNotIn(value, result.stdout)
             self.assertNotIn(value, result.stderr)
 
@@ -136,9 +143,54 @@ class CheckExposureTests(unittest.TestCase):
         self.server.anonymous_status = 401
         result = self.run_script()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("expected Cloudflare Access block (302/403), got 401", result.stderr)
+        self.assertIn("Access not proven", result.stderr)
         self.assert_sensitive_absent(result)
         self.assertTrue(all(auth is None for _, _, auth, _ in self.server.requests))
+
+    def test_bare_403_is_not_access_evidence(self):
+        self.server.anonymous_status = 403
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('unattributed_403', result.stdout)
+        self.assert_sensitive_absent(result)
+
+    def test_302_to_wrong_team_does_not_pass_or_print_location(self):
+        self.server.access_location = 'https://other.cloudflareaccess.com/cdn-cgi/access/login/secret'
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('other.cloudflareaccess.com', result.stdout + result.stderr)
+        self.assert_sensitive_absent(result)
+
+    def test_anonymous_observation_does_not_require_response_body_transfer(self):
+        self.server.header_only_response = True
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.server.requests), 7)
+        self.assertEqual([method for method, *_ in self.server.requests], ['GET'] * 6 + ['POST'])
+        self.assert_sensitive_absent(result)
+
+    def test_raw_curl_transport_diagnostics_are_suppressed(self):
+        result = self.run_script(url='http://127.0.0.1:1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('curl:', result.stdout + result.stderr)
+        self.assertNotIn('Failed to connect', result.stdout + result.stderr)
+        self.assert_sensitive_absent(result)
+
+    def test_anonymous_post_origin_401_is_recorded_separately(self):
+        self.server.pg_post_status = 401
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('POST /pg/chat/completions', result.stdout)
+        self.assertIn('unattributed_401_not_access', result.stdout)
+        self.assertEqual(self.server.requests[-1][0], 'POST')
+        self.assert_sensitive_absent(result)
+
+    def test_root_200_is_reachable_not_access(self):
+        self.server.anonymous_status = 200
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('reachable_not_access', result.stdout)
+        self.assert_sensitive_absent(result)
 
     def test_key_mode_checks_allow_deny_and_route_evidence(self):
         result = self.run_script("--key-file", self.key_file, "--exercise-qwen", "Qwen-test")
