@@ -9,12 +9,20 @@ Its diff against that parent still covers only the seven preparation files;
 image pin or credential. The original stacked-parent notes below record the
 2026-10-21 review sequence and are no longer instructions to merge #17/#18.
 
-Integration validation: NA-05 unit tests 9/9, all script tests 141/141,
-maintenance tests 22/22 (six optional skips), contract selfcheck 11/11,
+Integration validation: NA-05 unit tests 11/11, all script tests 143/143,
+maintenance suite 22 executed (16 passed, six optional skips), contract selfcheck 11/11,
 production and staging Helm lint, chart guards, contract gate against current
 `main`, and `git diff --check` all passed. This is offline validation only;
 production activation still requires the separate prerequisite and acceptance
 steps below.
+
+Independent review caught valid four-space YAML indentation and escaped YAML
+keys that could hide active proxy values from the first gate parser. The
+follow-up requires positive proof of a literal top-level `false` at any
+direct-child indentation; missing or unsupported shapes require contract
+validation. Both bypasses have regression tests that failed before their fixes
+and passed after them. The alternate-indent fixture was also Helm-rendered
+offline to confirm it is valid and activates the proxy.
 
 ## Boundary and exact parent
 

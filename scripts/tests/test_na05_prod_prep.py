@@ -69,6 +69,22 @@ class ProdContractGateTests(unittest.TestCase):
         self.assertEqual(len(self.required(active,active)),1)
         self.assertEqual(self.evaluate(active,active)[0],1)
 
+    def test_valid_alternate_indentation_cannot_bypass_unchanged_pin_gate(self):
+        active=proxy_values(True,self.pin).replace('\n  ', '\n    ')
+        self.assertEqual(len(self.required(active,active)),1)
+        code,text=self.evaluate(active,active)
+        self.assertEqual(code,1)
+        self.assertIn('FAIL prod proxy',text)
+
+    def test_escaped_yaml_keys_cannot_override_proven_dormancy(self):
+        for active in (
+            proxy_values(False,self.pin) + '  "\\u0065nabled": true\n',
+            proxy_values(False,self.pin) + '"\\u0070roxy":\n  enabled: true\n',
+        ):
+            with self.subTest(active=active):
+                self.assertEqual(len(self.required(active,active)),1)
+                self.assertEqual(self.evaluate(active,active)[0],1)
+
     def test_matching_existing_stg_report_opens_only_contract_gate(self):
         self.assertEqual(self.evaluate(proxy_values(False,self.pin),proxy_values(True,self.pin),self.evidence())[0],0)
 
@@ -100,6 +116,7 @@ class ProdContractGateTests(unittest.TestCase):
                      '"proxy":\n  "enabled": true\n']:
             self.assertTrue(gate_check.proxy_enabled(text))
         self.assertFalse(gate_check.proxy_enabled('proxy:\n  enabled: false # dormant\n'))
+        self.assertFalse(gate_check.proxy_enabled('proxy:\n    enabled: false\n'))
 
 
 class ProdRenderTests(unittest.TestCase):

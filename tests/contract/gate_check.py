@@ -39,40 +39,60 @@ def _now(path):
         return f.read()
 
 
-def proxy_enabled(text):
-    """Read the simple top-level proxy.enabled used by committed site values.
+def _simple_key(raw):
+    """Recognize only mapping keys that cannot hide YAML escapes or tags."""
+    if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0]:
+        raw = raw[1:-1]
+    return raw if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./-]*|<<", raw) else None
 
-    Chart guards reject non-boolean values; quoted/numeric stand-ins are not
-    an activation escape. Keep this stdlib-only like report.image_pin.
+
+def proxy_enabled(text):
+    """Require positive proof of a literal false top-level proxy.enabled.
+
+    YAML accepts different indentation widths. This stdlib-only reader treats
+    unknown shapes as active so formatting cannot bypass the contract gate.
+    Chart guards separately reject non-boolean values.
     """
     section = None
     saw_proxy = saw_enabled = False
+    direct_indent = None
     for line in (text or "").splitlines():
         body = line.split("#", 1)[0].rstrip()
         if not body.strip():
             continue
         indent = len(body) - len(body.lstrip())
-        key, _, value = body.strip().partition(":")
-        key = key.strip("'\"")
-        if key == "<<" and (indent == 0 or section == "proxy"):
-            return True  # YAML merges are not resolved by the simple pin reader.
+        raw_key, _, value = body.strip().partition(":")
+        raw_key = raw_key.strip()
         if indent == 0:
+            key = _simple_key(raw_key)
+            if key is None or key == "<<":
+                return True  # Unsupported keys and YAML merges fail closed.
             section = key
             if section == "proxy" and saw_proxy:
                 return True  # duplicate maps must not hide an activation
             if section == "proxy":
                 saw_proxy = True
+                direct_indent = None
             if section == "proxy" and value.strip():
                 # Inline/aliased proxy maps are outside image_pin's supported
                 # shape. Require validation rather than silently skipping it.
                 return True
-        elif section == "proxy" and indent == 2 and key == "enabled":
-            # Committed dormant values use literal false. Unknown/tagged/
-            # quoted spellings fail closed; Helm separately checks the type.
-            if saw_enabled or value.strip() != "false":
-                return True
-            saw_enabled = True
-    return False
+        elif section == "proxy":
+            if direct_indent is None:
+                direct_indent = indent
+            if indent < direct_indent:
+                return True  # Inconsistent map indentation is unsupported.
+            if indent == direct_indent:
+                key = _simple_key(raw_key)
+                if key is None or key == "<<":
+                    return True
+                if key == "enabled":
+                    # Committed dormant values use literal false. Unknown/tagged/
+                    # quoted spellings fail closed; Helm checks the value type.
+                    if saw_enabled or value.strip() != "false":
+                        return True
+                    saw_enabled = True
+    return not (saw_proxy and saw_enabled)
 
 
 def required(base_ref):
