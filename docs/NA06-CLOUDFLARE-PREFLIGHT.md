@@ -1,6 +1,6 @@
 # NA-06：stage-first Cloudflare 守線準備與唯讀核對
 
-本切片以 main `b7752131ba5f000ab4e4cb397713bd0677e16e68` 為基準。#15 exposure gate 與 #16 tunnel token hardening 已合併；不重新執行 `cf-tunnel.sh tunnel/dns`，它們會寫 Cloudflare／Kubernetes Secret。
+最初切片以 main `b7752131ba5f000ab4e4cb397713bd0677e16e68` 為基準；本次 tunnel／team 讀取補強以 #26 合併後 main `6b0da64ed1dcd47a9598976bd6cea9b6300c6a7b` 為基準。#15 exposure gate 與 #16 tunnel token hardening 已合併；不重新執行 `cf-tunnel.sh tunnel/dns`，它們會寫 Cloudflare／Kubernetes Secret。
 
 依 D8，公網只保留販售 relay，管理面經 Access 或受控 port-forward。NA-06 票指定 **Elmo 配置 Cloudflare**，agent 準備工具與驗收。本次只提供 local plan、API **GET-only** preflight、匿名 headers-only observer 與更嚴格的既有 curl gate。沒有 apply/delete/rollback API、沒有 prod 模式，也不改 chart／Secret／prod settings。此文件的 UI 步驟是後續人工操作指引，本輪未執行。
 
@@ -27,7 +27,8 @@ python3 scripts/cf-exposure.py --config /private/na06-stg.json --dry-run
 
 # 後續只有 Elmo 提供 token 檔且允許讀取 API 後才跑；本輪未跑
 python3 scripts/cf-exposure.py --config /private/na06-stg.json \
-  --preflight --token-file /private/cloudflare-read-token
+  --preflight --token-file /private/cloudflare-read-token \
+  --expected-origin http://REVIEWED-SERVICE.new-api-stg.svc.cluster.local:3000
 
 # 明確 opt-in；只打 stg，無 cookie/key，只讀回應 headers，不 follow redirect
 python3 scripts/cf-exposure.py --config /private/na06-stg.json --probe
@@ -45,7 +46,50 @@ API 固定 `https://api.cloudflare.com/client/v4`，GET only，15 秒 timeout，
 - 指定 zone 的 Zone Read、DNS Read、Zone WAF Read（Cloudflare UI 名稱可能使用 Read/Write 或 Read/Edit；以官方權限清單與實際 GET 為準）。
 - Token verify 的 active **不是**權限證明。每個受保護 API 成功 GET 才能證明該 read scope；**不會聲稱 write permissions 已證明**。
 
-核對 zone.id/name/account.id/status、所有 account＋zone apps 與逐頁 policy、WAF phase entrypoint、精確 hostname DNS。缺頁／無 pagination metadata／總數或每頁筆數矛盾／重複 ID、401/403/404、權限不足或未開通方案、重複或遮蔽 app、陌生多 destination app，一律非零退出。API schema 相容性與真 entitlement 尚未 live 驗證，不應為了綠燈跳過 zone scope、把空列表當完成或放寬 pagination。
+核對 zone.id/name/account.id/status、指定 tunnel 與 team（細節如下）、所有 account＋zone apps 與逐頁 policy、WAF phase entrypoint、精確 hostname DNS。缺頁／無 pagination metadata／總數或每頁筆數矛盾／重複 ID、401/403/404、權限不足或未開通方案、重複或遮蔽 app、陌生多 destination app，一律非零退出。API schema 相容性與真 entitlement 尚未 live 驗證，不應為了綠燈跳過 zone scope、把空列表當完成或放寬 pagination。
+
+## Tunnel／team 補缺（離線測試，尚未 live 驗證）
+
+`--preflight` 現在必須明確指定 `--expected-origin`：經負責人獨立核對的
+`http(s)://<service>.new-api-stg.svc.cluster.local:<port>`，不從 Cloudflare 回應反推預期值，
+也不沿用 `cf-tunnel.sh` 的 prod 預設。上例的大寫 placeholder 刻意不可通過；必須換成核准值。
+此參數只適用 API preflight，其他模式拒絕使用。
+
+新增 GET：
+
+- `/accounts/<account>/access/organizations`：`auth_domain` 必須等於指定 team domain。
+- `/accounts/<account>/cfd_tunnel/<tunnel>`：id 一致、明確 `deleted_at=null`、
+  `config_src=cloudflare`、`status=healthy`；不讀取已移除的 tunnel.connections。
+- 同 tunnel 的 `/configurations`：tunnel_id、`source=cloudflare` 與正整數 version 必須存在。
+  ingress 僅接受兩條依序規則：精確 stg host → reviewed origin、最後 `http_status:404`。
+  不接受額外 wildcard/path 規則、全域 origin override、未知 config 欄位。
+  route 的 originRequest 僅接受空設定或 repo 既有 connectTimeout=10／keepAliveTimeout=90。
+- 同 tunnel 的 `/connections`：直接讀官方 `result: Client[]`，不套用需要 total_pages 的通用
+  listing。必須非空；每個 Client 都須有唯一 UUID id、整數 config_version，且等於上述
+  configuration.version。每個 Client 的 conns 必須非空，每條連線須有唯一 UUID id 與
+  對應 Client 的 client_id。任何缺欄位、未知形狀、空連線或混合／落後／超前版本均 fail-closed。
+  result_info 必須為 dict，且 count/total_count/page/per_page 必須證明完整單頁；雖官方將其
+  列為 optional，本工具在缺失、null、不完整或多頁時一律保守拒絕，不宣告 connector 版本核對成功。
+
+依 [官方退休公告](https://developers.cloudflare.com/changelog/post/2026-07-09-tunnel-routes-and-connections-api-changes/)，
+2026-10-05 起 tunnel GET/list 不再回傳 connections；依
+[connections API](https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/cloudflared/subresources/connections/methods/get/)，
+Client 含 config_version/conns，is_pending_reconnect 已停用且永遠 false。程式完全不使用該旗標
+判斷健康，也不 fallback 到 tunnel.connections。這次僅查閱公開文件，未呼叫實際 Cloudflare API。
+
+需要指定 account 的 Cloudflare Tunnel Read 與 Access organization 讀取權限；實際 entitlement、
+API schema 相容性尚未 live 驗證。403/404、缺欄位、local-managed tunnel、未知 schema 均非零
+failed_closed；不做 fallback API、猜測 team 或略過 tunnel 檢查。這是保守支援的 schema，
+不是宣稱所有 Cloudflare tunnel 都能由此工具驗證。
+
+新增輸出只有布林證據；不輸出 tunnel、account、zone 或 connector ID。dry-run 的 account/zone
+與 DNS tunnel target 也遮罩，真實值由私有輸入帶入人工 UI。`connector_health_observed=true`
+只代表 aggregate healthy 與專用端點的連線快照；`connector_config_version_verified=true`
+表示所有回報 Client 的設定版本均與核對的遠端配置一致。這仍不能證明個別連線此刻活躍、
+origin 可達或實際 Access enforcement；API 查詢之間的並發配置變更也不構成原子快照。
+`public_dns_resolution_verified`、`bootstrap_verified`、`runtime_exposure_verified` 與 `na06_passed`
+仍為 false。DNS record 不存在時即使上述全部符合仍報 `dns_missing_or_drift`，不能宣告 ready；
+有 proxied DNS record 也不等於公網解析或實際 Access 驗收成功。
 
 ## Elmo UI 套用順序與回復
 
@@ -54,7 +98,7 @@ API 固定 `https://api.cloudflare.com/client/v4`，GET only，15 秒 timeout，
 3. 依 dry-run 的 `desired.applications` 建 stage 管理 app（`newapi-stg.woowtech.io/*`），唯一 Allow policy 只含 Elmo 核准 email，無 Everyone／Service Auth／其他 bypass。先人工確認 Access 登入與主控台可用。
 4. 依 `desired.waf` 在該 zone 的 **http_request_firewall_custom entrypoint 第一條**加入 enabled Block 規則，保留其他所有規則。不可整包 PUT 覆蓋既有 entrypoint。規則僅匹配 stg host，限制方法＋販售路徑；阻擋 raw/normalized 差異、編碼、`..`、雙斜線、非販售 `/v1*`、mj。無 `matches` regex 方案假設；仍需 Cloudflare UI expression validator/實際方案支援確認。拒絕時停止，不削弱表達式。
 5. WAF 已啟用後，才加 stage relay app `newapi-stg.woowtech.io/v1/*`，唯一 Bypass Everyone policy。較精確 path app 不繼承 root policy，所以 bypass 是高風險開口；WAF 必須先到位。U12 的 `/v1`、`/v1/`、`/v1x`、`/V1/models` 必須逐一實測記錄，不能從 wildcard 規則推斷結果。
-6. API preflight 核對 Access/WAF 已正確，bootstrap/connector 由負責人另行確認後，最後新增唯一 proxied CNAME，內容精確為 stg tunnel UUID `.cfargotunnel.com`，TTL auto。若 DNS 本就存在，先確認用途；不自動接管。DNS 未有時 preflight 按設計仍報 missing，不是通過；維持未公開可分步在 UI 核對 Access/WAF，DNS 完成後再跑全 preflight。
+6. API preflight 核對 Access/WAF、tunnel/team 已正確，bootstrap 與 connector 實際流量由負責人另行確認後，最後新增唯一 proxied CNAME，內容精確為 stg tunnel UUID `.cfargotunnel.com`，TTL auto。若 DNS 本就存在，先確認用途；不自動接管。DNS 未有時 preflight 按設計仍報 missing，不是通過；維持未公開可分步在 UI 核對 Access/WAF，DNS 完成後再跑全 preflight。
 7. 全 preflight 後跑匿名 headers observer／curl gate，接著以測試 key 驗 models、Qwen stream、被禁路由。由 Elmo 做已登入的主控台測試、port-forward `newapi_admin.py verify-settings` 與內部代理 readyz／後續 canary。**不自動進 prod**；prod 的對等計畫需另開經 stage 證據覆核的人工變更。
 
 **回復先收斂暴露**：若 stage 有問題，先撤回本次 DNS 公開或由負責人停止 stage connector，保留管理 Access；再移除／恢復本次 relay Bypass，回到該變更前版本，確認不會暴露管理 API 後才恢復本次 WAF 規則（不動其他規則）。不要先移除 root Access 或 WAF 再讓 bypass 繼續公開。既有資源只恢復本次變更前的 ID/版本且核對沒有別人並發更新；衝突就停止。工具本身無寫入，回復離線 plan 只需丟棄本次私有檔，不會宣稱自動回滾 Cloudflare。
