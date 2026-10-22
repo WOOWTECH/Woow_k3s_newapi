@@ -194,13 +194,81 @@ def check_application(actual, target, policies):
     require(policy.get('session_duration') in (None, target['session_duration']), 'access_session_drift')
 
 
-def preflight(cfg, api):
+def check_tunnel_and_team(cfg, api, expected_origin):
+    # No prod/default origin inference. The operator supplies a staging service
+    # reviewed independently of the provider response being checked.
+    require(isinstance(expected_origin, str) and re.fullmatch(
+        r'https?://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.new-api-stg\.svc\.cluster\.local:[0-9]{1,5}',
+        expected_origin), 'tunnel_origin_unknown')
+    port = int(expected_origin.rsplit(':', 1)[1])
+    require(1 <= port <= 65535, 'tunnel_origin_unknown')
+    prefix = '/accounts/' + cfg['account_id']
+    organization = api.get(prefix + '/access/organizations')['result']
+    require(isinstance(organization, dict)
+            and organization.get('auth_domain') == cfg['team_domain'], 'access_team_unknown_or_mismatch')
+    tunnel_path = prefix + '/cfd_tunnel/' + cfg['tunnel_id']
+    tunnel = api.get(tunnel_path)['result']
+    require(isinstance(tunnel, dict) and tunnel.get('id') == cfg['tunnel_id']
+            and 'deleted_at' in tunnel and tunnel['deleted_at'] is None
+            and tunnel.get('config_src') == 'cloudflare', 'tunnel_missing_or_unproven')
+    require(tunnel.get('status') == 'healthy', 'tunnel_health_unproven')
+    configuration = api.get(tunnel_path + '/configurations')['result']
+    require(isinstance(configuration, dict)
+            and configuration.get('tunnel_id') == cfg['tunnel_id']
+            and configuration.get('source') == 'cloudflare'
+            and type(configuration.get('version')) is int and configuration['version'] > 0,
+            'tunnel_config_unknown')
+    # Dedicated endpoint returns Client[], not the retired tunnel.connections.
+    # Deprecated reconnect flags do not establish health. Use aggregate tunnel
+    # health plus every reported client's connections and applied config version.
+    response = api.get(tunnel_path + '/connections')
+    clients = response['result']
+    require(isinstance(clients, list) and clients, 'tunnel_connector_health_unknown')
+    info = response.get('result_info')
+    require(isinstance(info, dict)
+            and all(type(info.get(k)) is int for k in ('count', 'total_count', 'page', 'per_page'))
+            and info['page'] == 1 and info['per_page'] >= len(clients)
+            and info['count'] == info['total_count'] == len(clients),
+            'tunnel_clients_completeness_unknown')
+    seen = set()
+    for client in clients:
+        require(isinstance(client, dict) and isinstance(client.get('id'), str)
+                and UUID.fullmatch(client['id']) and client['id'] not in seen,
+                'tunnel_client_unknown')
+        seen.add(client['id'])
+        require(type(client.get('config_version')) is int
+                and client['config_version'] == configuration['version'],
+                'tunnel_connector_config_unproven')
+        conns = client.get('conns')
+        require(isinstance(conns, list) and conns, 'tunnel_connector_health_unknown')
+        conn_ids = set()
+        for conn in conns:
+            require(isinstance(conn, dict) and isinstance(conn.get('id'), str)
+                    and UUID.fullmatch(conn['id']) and conn['id'] not in conn_ids
+                    and conn.get('client_id') == client['id'], 'tunnel_connection_unknown')
+            conn_ids.add(conn['id'])
+    config = configuration.get('config')
+    require(isinstance(config, dict) and not (set(config) - {'ingress', 'originRequest'})
+            and not config.get('originRequest'), 'tunnel_config_unknown')
+    ingress = config.get('ingress')
+    require(isinstance(ingress, list) and len(ingress) == 2
+            and all(isinstance(rule, dict) for rule in ingress), 'tunnel_ingress_unknown_or_drift')
+    route, fallback = ingress
+    require(not (set(route) - {'hostname', 'service', 'originRequest'})
+            and route.get('hostname') == HOST and route.get('service') == expected_origin
+            and route.get('originRequest', {}) in (
+                {}, {'connectTimeout': 10, 'keepAliveTimeout': 90})
+            and fallback == {'service': 'http_status:404'}, 'tunnel_ingress_unknown_or_drift')
+
+
+def preflight(cfg, api, expected_origin=None):
     want = desired(cfg)
     require(api.get('/user/tokens/verify')['result'].get('status') == 'active', 'inactive_token')
     zone = api.get('/zones/' + cfg['zone_id'])['result']
     require(zone.get('id') == cfg['zone_id'] and zone.get('name') == ZONE
             and zone.get('account', {}).get('id') == cfg['account_id']
             and zone.get('status') == 'active', 'zone_account_mismatch')
+    check_tunnel_and_team(cfg, api, expected_origin)
     apps = []
     for scope, identity in (('accounts', cfg['account_id']), ('zones', cfg['zone_id'])):
         prefix = '/' + scope + '/' + identity + '/access/apps'
@@ -229,7 +297,11 @@ def preflight(cfg, api):
     require(len(dns) == 1 and all(dns[0].get(k) == v for k, v in want['dns'].items()), 'dns_missing_or_drift')
     return {'status': 'configuration_verified', 'stage': 'stg', 'read_scopes_verified': True,
             'write_permissions_proven': False, 'access_apps': 2, 'waf_rule_first': True,
-            'proxied_dns_verified': True, 'desired_sha256': digest(want),
+            'proxied_dns_verified': True, 'tunnel_configuration_verified': True,
+            'connector_health_observed': True, 'connector_config_version_verified': True,
+            'access_team_verified': True,
+            'public_dns_resolution_verified': False, 'bootstrap_verified': False,
+            'desired_sha256': digest(want),
             'runtime_exposure_verified': False, 'na06_passed': False}
 
 
@@ -296,7 +368,9 @@ def main():
     parser.add_argument('--config')
     parser.add_argument('--token-file')
     parser.add_argument('--team-domain')
+    parser.add_argument('--expected-origin', help='Reviewed staging service URL; required for API preflight')
     args = parser.parse_args()
+    require(args.preflight or not args.expected_origin, 'unexpected_origin_argument')
     if args.classify_headers:
         require(args.team_domain and not args.token_file and not args.config)
         lines = sys.stdin.read(8192).splitlines()
@@ -308,14 +382,19 @@ def main():
     cfg = config_file(args.config)
     if args.preflight:
         require(args.token_file is not None, 'token_file_required')
-        result = preflight(cfg, ReadAPI(token_file(args.token_file)))
+        require(args.expected_origin is not None, 'tunnel_origin_unknown')
+        result = preflight(cfg, ReadAPI(token_file(args.token_file)), args.expected_origin)
     elif args.probe:
         require(not args.token_file)
         result = probe(cfg)
     else:
         require(not args.token_file, 'dry_run_must_not_read_token')
+        plan = desired(cfg)
+        plan['account_id'] = '[redacted]'
+        plan['zone_id'] = '[redacted]'
+        plan['dns']['content'] = '[redacted-tunnel].cfargotunnel.com'
         result = {'status': 'planned_only', 'stage': 'stg', 'network_calls': 0,
-                  'mutations': 0, 'na06_passed': False, 'desired': desired(cfg)}
+                  'mutations': 0, 'na06_passed': False, 'desired': plan}
     print(json.dumps(result, sort_keys=True))
     return 1 if args.probe and not result['anonymous_access_redirects_observed'] else 0
 
