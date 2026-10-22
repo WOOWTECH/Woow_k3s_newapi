@@ -263,9 +263,10 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 ### 雙軌遷移：原每日備份保持運作
 
 遵循 **stg 先、prod 後**：chart 的 `encryptedBackup.enabled`、`retention.enabled`
-預設皆為 false，prod values 也明確設 false，因此例行 prod release 不預建新 PVC、ConfigMap、
-CronJob 或維護 NetworkPolicy。只有 stg values 明確設兩者 `enabled: true`、`suspend: true`，
-先建立暫停的驗收資源；stg 通過後，另行審閱 prod 的 enabled 變更，再依下列流程逐步啟用。
+預設與 **stg／prod values 均為 false**，因此不預建新的加密備份 PVC、ConfigMap、
+CronJob 或維護 NetworkPolicy；`monitoring.enabled` 也維持 false。
+`enabled: true` 即使同時 `suspend: true` 仍會配置 PVC，**暫停不是容量保護**。
+只有容量與公鑰前置通過後，才另行審閱 stg 的 enabled 變更；stg 驗收通過後再排 prod。
 
 預設值保持既有 **`newapi-pg-backup` 名稱、`suspend: false`、03:45 Asia/Taipei、
 `backup.keepDays: 14`（prod）／`7`（stg）**；使用原 PostgreSQL image、dump 驗證與原明文清理腳本。
@@ -275,17 +276,38 @@ CronJob 或維護 NetworkPolicy。只有 stg values 明確設兩者 `enabled: tr
 stg 啟用資源後，新增 **`newapi-pg-backup-age`** 使用獨立 **`newapi-backup-age` PVC**，
 `encryptedBackup.suspend: true`、`encryptedBackup.pruneEnabled: false`。
 獨立 PVC 防止新 Job 爭用舊 RWO volume、清理舊明文或因新 PVC 掛載失敗影響舊 Job。
-prod 的新 PVC 預設 20Gi、stg 5Gi；部署前確認 Longhorn 實體可用容量足以讓兩軌短暫並行。
+prod 的新 PVC 目標維持 20Gi、stg 5Gi；部署前必須同時核對 Longhorn 實體最低可用量、
+配置排程餘額與兩份健康 replica，包含兩環境及新舊軌並行、成長和 rebuild 餘裕。
+不可改小為10Gi就宣稱容量已過關，也不可調低最低可用量或提高 over-provisioning 繞過。
 `retention.suspend: true`、`monitoring.enabled: false` 仍等候各自的 stg 驗收。
 
 **遷移分三次審閱部署，禁止先停舊再試新：**
 
-1. **先加新軌，舊軌 active 不變。** 由核准的 image pipeline 用
+1. **先通過資源配置 gate，再加新軌，舊軌 active 不變。** 由核准的 image pipeline 用
    `images/backup/Dockerfile` 建置 PostgreSQL 16 + age + Bash，測試 uid 70、root FS 唯讀，
    提交 `encryptedBackup.image.repository/tag/digest` 與拉取 Secret 的名稱
    `encryptedBackup.imagePullSecrets`。私有 registry 憑證不進 values。
    負責人在離線可信裝置產生 identity，只把 `age-keygen -y <identity>` 的 **age1 公鑰**放
    `encryptedBackup.ageRecipient`；stg／prod 各用自己的公鑰，私鑰不進 image、repo 或叢集。
+   `enabled: true` 時（包含 suspend=true）chart 要求 image pin、公鑰與以下
+   `encryptedBackup.capacityVerification`。這是人工審閱證據的設定綁定，**不是 live lookup、
+   scheduler simulation 或健康保證**；不得填假值。容量紀錄應包含最新 Longhorn 兩 replica
+   排程、已存在的 Retain/PVC、新舊備份並行、兩環境配置、重建餘裕與實測加密 dump 大小。
+   參考值不能由舊快照複製；依實際 release／namespace／storageClass／size 填寫：
+
+   ```yaml
+   encryptedBackup:
+     capacityVerification:
+       evidenceRef: "<最新已審閱容量紀錄的 URL 或 repo 路徑>"
+       namespace: "new-api-stg"
+       release: "newapi"
+       storageClassName: "longhorn"
+       requestedSize: "5Gi"  # prod 為20Gi，不能沿用stg紀錄
+   ```
+
+   公鑰的 Helm 格式檢查不取代 age checksum／可解密還原測試。沒有公鑰／容量紀錄時，
+   保持 enabled=false；不建立 PVC、不調現有 Retain PV。這些檢查不授權部署。
+
 2. **新舊並行並驗證新還原。** 設 `encryptedBackup.suspend: false`，保持
    `backup.enabled: true`、`backup.suspend: false`、`encryptedBackup.pruneEnabled: false`。
    chart 強制要求新軌有非佔位 digest、公鑰、image repository/tag；新 Job 失敗也不會停舊 Job。
@@ -321,11 +343,25 @@ prod 的新 PVC 預設 20Gi、stg 5Gi；部署前確認 Longhorn 實體可用容
 
 回退：先把 `backup.enabled: true`、`backup.suspend: false` 部署回原每日工作，
 確認其成功後才在後續部署停新軌、關閉新軌清理。不能在舊軌仍停用時停掉新軌；guard 會拒絕。
-本次 chart/doc 修改未操作任何 live 環境，image、公鑰、還原證據也尚未填入。
+本次 dormant 補強未操作 live 環境；#18 的 age image pin 保留，owner 公鑰、
+容量配置紀錄與真實還原證據仍待提供。合併不代表 NA-07 live AC 已通過。
+
+### 容量阻擋與告警驗收狀態（2026-10-21補強）
+
+沿用主線04:20 UTC唯讀容量評估：Longhorn v1.10.2，2 replicas、205%配置上限、25%最低可用；
+31zix／z0v3w 因 Longhorn DiskPressure 不合格，另兩磁碟的排程餘額約15.90／14.28GiB。
+目前20Gi新replica無合格磁碟；即使stg5Gi加prod10Gi，所需15Gi也超過14.28Gi。
+這是歷史前置阻擋，本補強沒有重查叢集；部署前重新核對，PVC Bound不代表兩份healthy。
+
+容量／失敗／stale告警沿用本chart的PrometheusRule路徑；不是LLM-14已接入的聲明。
+啟用前確認CRD、ruleSelector、kube-state-metrics、kubelet volume stats及Alertmanager收件人；
+只看到規則存在不算告警送達。依票以1%門檻驗證Job非0與實際通知，現未執行。
+七日每六小時至少28份完整加密dump，還須當次.part與成長餘裕；prune關閉期間不會停在七日，
+須在容量可接受的驗收窗口完成還原。資料庫大小不等於PVC用量，兩者需分開監測。
 
 ### 保留 180 天
 
-- `newapi-retention` 每天 **04:30 Asia/Taipei**，預設保留 `retention.days: 180` 天。
+- `newapi-retention` 每天 **04:30 Asia/Taipei**，保留 `retention.days: 180` 天；chart 拒絕改成其他天數，避免未審閱的資料刪除政策。
   rc.44 的 [model/log.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/model/log.go)
   與 [model/audit_log.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/model/audit_log.go)
   皆為 `CreatedAt int64`／PostgreSQL `bigint`，內容是 Unix 秒數，不能用 timestamp 直接比較。
