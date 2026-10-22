@@ -51,8 +51,8 @@ proxy:
     # 59b03479ef833b1b62260692431a03782bb7b47c@sha256:52da4e80eaf4b0cf38ba1b24fb684d37ab627c7d424f9e56fe15dd58a4a856fd (LLM-01a)
     # Change it here, in git — never with helm --set, or the next
     # `helm upgrade -f deploy/woow-k3s-stg.yaml` rolls back to a different image.
-    tag: 9d646e946d56477fcf1ddecb1ca4ce5ba1ce03c9
-    digest: sha256:d3ab64d43692bb557cadf86c7b340ca2d25cb4e51981c18da298f3aa5839af65
+    tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb
+    digest: sha256:0fdf5e12da8c8fec9d4b1650d2a134d6dc58d1ba86b82d54ea62b8b6fb8ce3bd
   # dockerconfigjson for jcr-prod (read), created in new-api-stg at deploy time.
   imagePullSecrets:
     - name: newapi-proxy-registry
