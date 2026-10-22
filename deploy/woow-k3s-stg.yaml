@@ -75,8 +75,8 @@ proxy:
         matchLabels:
           app.kubernetes.io/component: odoo
 
-# NA-07 dormant until owner recipient + reviewed Longhorn capacity are available.
-# suspend alone does not prevent PVC provisioning; keep enabled=false.
+# NA-07 staging qualification provisions a new PVC while the encrypted
+# CronJob remains suspended. Recheck Longhorn capacity before deployment.
 # The original daily backup above remains active.
 encryptedBackup:
   # Staging qualification: provision only; legacy daily backup stays active.

@@ -1,6 +1,6 @@
 # NA-07 staging：先建立暫停的加密備份軌（2026-10-22）
 
-本 PR 只改 `deploy/woow-k3s-stg.yaml`：新建 5Gi 加密備份 PVC 及其**暫停** CronJob，保留每日舊備份與原 PVC；不改正式 values、不啟用保留期刪除或新檔清理。合併不等於部署；staging 使用 `helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait` 手動發布。發布前必須重查下面的容量條件。六筆舊 Retain PV 全部 HOLD。
+本 PR 的部署變更只在 `deploy/woow-k3s-stg.yaml`：新建 5Gi 加密備份 PVC 及其**暫停** CronJob，保留每日舊備份與原 PVC；其餘變更是測試與說明。不改正式 values、不啟用保留期刪除或新檔清理。合併不等於部署；staging 使用 `helm upgrade newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml --wait` 手動發布。發布前必須重查下面的容量條件。六筆舊 Retain PV 全部 HOLD。
 
 ## 憑據與映像
 
