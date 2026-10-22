@@ -25,6 +25,7 @@ metadata:
 spec:
   schedule: {{ .Values.backup.schedule | quote }}
   timeZone: Asia/Taipei
+  suspend: {{ .Values.backup.suspend }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3

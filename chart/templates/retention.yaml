@@ -1,0 +1,92 @@
+{{- if .Values.retention.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "newapi.fullname" . }}-retention-script
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+data:
+  retention.sh: |
+{{ .Files.Get "files/maintenance/retention.sh" | indent 4 }}
+  retention-batch.sql: |
+{{ .Files.Get "files/maintenance/retention-batch.sql" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "newapi.fullname" . }}-retention
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.retention.schedule | quote }}
+  timeZone: Asia/Taipei
+  suspend: {{ .Values.retention.suspend }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            {{- include "newapi.labels" . | nindent 12 }}
+            app.kubernetes.io/component: retention
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          {{- include "newapi.affinity" . | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            {{- include "newapi.podSecurity" . | nindent 12 }}
+          containers:
+            - name: retention
+              image: {{ include "newapi.image" .Values.postgres.image }}
+              imagePullPolicy: IfNotPresent
+              command: ["bash", "/maintenance/retention.sh"]
+              env:
+                - name: PGHOST
+                  value: {{ include "newapi.fullname" . }}-postgres
+                - name: PGUSER
+                  value: newapi
+                - name: PGDATABASE
+                  value: newapi
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "newapi.secretName" . }}
+                      key: POSTGRES_PASSWORD
+                - name: PGOPTIONS
+                  value: "-c search_path=public -c statement_timeout=30000 -c lock_timeout=2000"
+                - name: RETENTION_DAYS
+                  value: {{ .Values.retention.days | quote }}
+                - name: BATCH_SIZE
+                  value: {{ .Values.retention.batchSize | quote }}
+                - name: BATCH_SLEEP_SECONDS
+                  value: {{ .Values.retention.batchSleepSeconds | quote }}
+                - name: MAX_BATCHES
+                  value: {{ .Values.retention.maxBatches | quote }}
+              securityContext:
+                {{- include "newapi.containerSecurity" . | nindent 16 }}
+              resources:
+                requests: {cpu: 50m, memory: 64Mi}
+                limits: {cpu: 500m, memory: 256Mi}
+              volumeMounts:
+                - name: script
+                  mountPath: /maintenance
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: script
+              configMap:
+                name: {{ include "newapi.fullname" . }}-retention-script
+            - name: tmp
+              emptyDir: {}
+{{- end }}

@@ -128,6 +128,16 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "newapi.selector" (list . "backup") | nindent 14 }}
+        {{- if .Values.encryptedBackup.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "backup-encrypted") | nindent 14 }}
+        {{- end }}
+        {{- if .Values.retention.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "retention") | nindent 14 }}
+        {{- end }}
       ports:
         - { protocol: TCP, port: 5432 }
 ---
@@ -236,4 +246,49 @@ spec:
         - { protocol: UDP, port: 7844 }
         - { protocol: TCP, port: 7844 }
         - { protocol: TCP, port: 443 }
+{{- end }}
+
+{{- if .Values.retention.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-retention
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "retention") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "postgres") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+{{- end }}
+
+{{- if .Values.encryptedBackup.enabled }}
+---
+# Separate encrypted track: postgres only (plus the common DNS policy).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fn }}-backup-age
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "newapi.selector" (list . "backup-encrypted") | nindent 6 }}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "newapi.selector" (list . "postgres") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
 {{- end }}

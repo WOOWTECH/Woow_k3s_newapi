@@ -111,12 +111,43 @@ cloudflared:
       cpu: 500m
       memory: 256Mi
 
+# Existing plaintext CronJob/PVC: preserve its name and daily active behavior.
+# Suspend/disable only after the encrypted track is active AND restore evidence
+# is recorded below; Helm guards reject an unverified cutover.
 backup:
   enabled: true
   schedule: "45 3 * * *"
   keepDays: 14
+  suspend: false
   storageClassName: longhorn
   size: 20Gi
+
+# Stg first: disabled globally; stg explicitly opts into suspended resources.
+# Separate CronJob/PVC, never delete legacy dumps.
+encryptedBackup:
+  enabled: false
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true
+  ageRecipient: ""
+  image:
+    repository: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-backup
+    tag: ""
+    digest: ""
+  imagePullSecrets: []
+  capacityWarningPercent: 70
+  storageClassName: longhorn
+  size: 20Gi
+  # No pruning until an actual restore is reviewed. Evidence contains no secrets.
+  pruneEnabled: false
+  restoreVerification:
+    evidenceRef: ""
+    archiveSha256: ""
+    imageDigest: ""
+    recipient: ""
+    namespace: ""
+    release: ""
+    verifiedAt: ""
 
 # newapi-proxy: the only in-cluster path from the PaaS Odoo pods to new-api
 # (code: woow_paas_platform extra/newapi-proxy; AI-models design §1.4). It
@@ -240,3 +271,21 @@ networkPolicy:
 
 tests:
   enabled: true
+
+# Stg first: disabled globally; stg enables suspended rc.44 maintenance.
+# Unsuspend only after stg EXPLAIN.
+retention:
+  enabled: false
+  suspend: true
+  days: 180
+  schedule: "30 4 * * *"
+  batchSize: 10000
+  batchSleepSeconds: 1
+  maxBatches: 1000
+
+# Requires Prometheus Operator CRD, kube-state-metrics, kubelet volume stats,
+# and a Prometheus ruleSelector accepting these labels. See OPERATIONS.
+monitoring:
+  enabled: false
+  labels: {}
+  capacityWarningPercent: 70

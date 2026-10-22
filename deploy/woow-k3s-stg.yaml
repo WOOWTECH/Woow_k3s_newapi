@@ -11,6 +11,8 @@ postgres:
   size: 5Gi
 
 backup:
+  schedule: "45 3 * * *"
+  suspend: false
   size: 5Gi
   keepDays: 7
 
@@ -76,3 +78,16 @@ proxy:
       podSelector:
         matchLabels:
           app.kubernetes.io/component: odoo
+
+# NA-07 stg-first rollout; original daily backup above remains active.
+encryptedBackup:
+  enabled: true
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true
+  pruneEnabled: false
+  size: 5Gi
+
+retention:
+  enabled: true
+  suspend: true

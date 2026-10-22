@@ -1,0 +1,64 @@
+{{/* Enforce boolean types: a string "false" is truthy in Go templates. */}}
+{{- range $component := list "backup" "encryptedBackup" "retention" "monitoring" }}
+{{- if not (kindIs "bool" (index $.Values $component "enabled")) }}
+{{- fail (printf "%s.enabled must be a boolean" $component) }}
+{{- end }}
+{{- end }}
+{{- range $component := list "backup" "encryptedBackup" "retention" }}
+{{- if not (kindIs "bool" (index $.Values $component "suspend")) }}
+{{- fail (printf "%s.suspend must be a boolean" $component) }}
+{{- end }}
+{{- end }}
+{{- $enc := .Values.encryptedBackup }}
+{{- if not (kindIs "bool" $enc.pruneEnabled) }}{{ fail "encryptedBackup.pruneEnabled must be a boolean" }}{{- end }}
+{{- if and $enc.ageRecipient (not (regexMatch "^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$" $enc.ageRecipient)) }}
+{{- fail "encryptedBackup.ageRecipient must be a native age1 public recipient (never a private key)" }}
+{{- end }}
+{{- if and $enc.enabled (not $enc.suspend) }}
+{{- if not $enc.ageRecipient }}{{ fail "active encryptedBackup requires encryptedBackup.ageRecipient" }}{{- end }}
+{{- end }}
+{{- if or $enc.image.digest (and $enc.enabled (not $enc.suspend)) }}
+{{- if or (not (regexMatch "^sha256:[a-f0-9]{64}$" $enc.image.digest)) (regexMatch "^sha256:0{64}$" $enc.image.digest) }}
+{{- fail "encryptedBackup.image.digest must pin the built PostgreSQL + age image" }}
+{{- end }}
+{{- if or (not $enc.image.repository) (not $enc.image.tag) }}
+{{- fail "encryptedBackup.image.repository and tag are required with a digest" }}
+{{- end }}
+{{- end }}
+{{/* No automatic cutover. This is a reviewed restore attestation, not a live
+lookup or proof that Helm itself has restored a DB. Bind it to the deployment. */}}
+{{- if or (not .Values.backup.enabled) .Values.backup.suspend $enc.pruneEnabled }}
+{{- if or (not $enc.enabled) $enc.suspend }}
+{{- fail "legacy retirement/pruning requires an active encryptedBackup and reviewed restoreVerification" }}
+{{- end }}
+{{- $v := $enc.restoreVerification }}
+{{- if or (not (regexMatch "^sha256:[a-f0-9]{64}$" $v.archiveSha256)) (regexMatch "^sha256:0{64}$" $v.archiveSha256) (not $v.evidenceRef) }}
+{{- fail "restoreVerification requires archiveSha256 and evidenceRef from a successful restore" }}
+{{- end }}
+{{- if or (ne $v.imageDigest $enc.image.digest) (ne $v.recipient $enc.ageRecipient) (ne $v.namespace .Release.Namespace) (ne $v.release .Release.Name) }}
+{{- fail "restoreVerification must match encrypted imageDigest, recipient, namespace and release" }}
+{{- end }}
+{{- if not (regexMatch "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" $v.verifiedAt) }}
+{{- fail "restoreVerification.verifiedAt must be a reviewed UTC restore timestamp" }}
+{{- end }}
+{{- end }}
+{{- range $component := list "backup" "encryptedBackup" }}
+{{- $b := index $.Values $component }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString $b.keepDays))) (gt (int $b.keepDays) 365) }}
+{{- fail (printf "%s.keepDays must be an integer from 1 to 365" $component) }}
+{{- end }}
+{{- end }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString $enc.capacityWarningPercent))) (gt (int $enc.capacityWarningPercent) 100) }}
+{{- fail "encryptedBackup.capacityWarningPercent must be an integer from 1 to 100" }}
+{{- end }}
+{{- if .Values.retention.enabled }}
+{{- range $key := list "days" "batchSize" "batchSleepSeconds" "maxBatches" }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $.Values.retention $key))) }}
+{{- fail (printf "retention.%s must be a positive integer" $key) }}
+{{- end }}
+{{- end }}
+{{- if gt (int .Values.retention.batchSize) 10000 }}{{ fail "retention.batchSize must not exceed 10000" }}{{- end }}
+{{- end }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.monitoring.capacityWarningPercent))) (gt (int .Values.monitoring.capacityWarningPercent) 100) }}
+{{- fail "monitoring.capacityWarningPercent must be an integer from 1 to 100" }}
+{{- end }}

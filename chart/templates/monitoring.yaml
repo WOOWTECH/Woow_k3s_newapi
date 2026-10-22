@@ -1,0 +1,53 @@
+{{- if .Values.monitoring.enabled }}
+{{- $fn := include "newapi.fullname" . }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fn }}-maintenance
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: {{ $fn }}.maintenance
+      rules:
+        - alert: NewapiPVCAboveCapacityThreshold
+          expr: |
+            100 * kubelet_volume_stats_used_bytes{namespace={{ .Release.Namespace | quote }},persistentvolumeclaim=~"({{ $fn }}-backup(-age)?|data-{{ $fn }}-postgres-[0-9]+)"}
+              / kubelet_volume_stats_capacity_bytes{namespace={{ .Release.Namespace | quote }},persistentvolumeclaim=~"({{ $fn }}-backup(-age)?|data-{{ $fn }}-postgres-[0-9]+)"}
+              > {{ .Values.monitoring.capacityWarningPercent }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "new-api PostgreSQL/backup PVC capacity threshold exceeded"
+            description: "Check the PVC, WAL, backup age, failed Jobs and Longhorn free space; database size alone excludes WAL and other files."
+        - alert: NewapiMaintenanceJobFailed
+          expr: |
+            (kube_job_status_failed{namespace={{ .Release.Namespace | quote }},job_name=~"{{ $fn }}-(pg-backup(-age)?|retention)-[0-9]+"} > 0)
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "new-api backup/retention Job failed (including capacity check)"
+            description: "Inspect Job status and logs; archives are only published after the encryption pipeline succeeds. Failed history may keep this alert active until the failed Job is removed."
+        {{- range $track := list (dict "config" .Values.backup "suffix" "pg-backup" "alert" "NewapiLegacyBackupStale" "hours" 25) (dict "config" .Values.encryptedBackup "suffix" "pg-backup-age" "alert" "NewapiEncryptedBackupStale" "hours" 7) }}
+        {{- if and $track.config.enabled (not $track.config.suspend) }}
+        - alert: {{ $track.alert }}
+          expr: |
+            (time() - kube_cronjob_status_last_successful_time{namespace={{ $.Release.Namespace | quote }},cronjob="{{ $fn }}-{{ $track.suffix }}"} > {{ $track.hours }} * 3600)
+            or
+            ((time() - kube_cronjob_created{namespace={{ $.Release.Namespace | quote }},cronjob="{{ $fn }}-{{ $track.suffix }}"} > {{ $track.hours }} * 3600)
+              unless on(namespace,cronjob)
+              kube_cronjob_status_last_successful_time{namespace={{ $.Release.Namespace | quote }},cronjob="{{ $fn }}-{{ $track.suffix }}"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "new-api {{ $track.suffix }} has no successful backup within {{ $track.hours }} hours"
+            description: "Check image pull, scheduling, failed Jobs and recipient. Each active backup track has its own deadline; suspended tracks do not produce stale alerts."
+        {{- end }}
+        {{- end }}
+{{- end }}

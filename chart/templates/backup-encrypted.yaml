@@ -1,0 +1,121 @@
+{{- if .Values.encryptedBackup.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "newapi.fullname" . }}-backup-age
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.encryptedBackup.storageClassName }}
+  resources:
+    requests:
+      storage: {{ .Values.encryptedBackup.size }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "newapi.fullname" . }}-backup-age-script
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+data:
+  backup.sh: |
+{{ .Files.Get "files/maintenance/backup.sh" | indent 4 }}
+---
+# Encrypted pg_dump -Fc every six hours. Only public recipients enter values.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "newapi.fullname" . }}-pg-backup-age
+  labels:
+    {{- include "newapi.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.encryptedBackup.schedule | quote }}
+  timeZone: Asia/Taipei
+  suspend: {{ .Values.encryptedBackup.suspend }}
+  startingDeadlineSeconds: 1800
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "newapi.labels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-encrypted
+        spec:
+          restartPolicy: Never
+          {{- with .Values.encryptedBackup.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          {{- include "newapi.affinity" . | nindent 10 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            {{- include "newapi.podSecurity" . | nindent 12 }}
+          containers:
+            - name: pg-dump
+              image: {{ if .Values.encryptedBackup.image.digest }}{{ include "newapi.image" .Values.encryptedBackup.image }}{{ else }}{{ include "newapi.image" .Values.postgres.image }}{{ end }}
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: PGHOST
+                  value: {{ include "newapi.fullname" . }}-postgres
+                - name: PGUSER
+                  value: newapi
+                - name: PGDATABASE
+                  value: newapi
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "newapi.secretName" . }}
+                      key: POSTGRES_PASSWORD
+                - name: TZ
+                  value: Asia/Taipei
+                - name: KEEP_DAYS
+                  value: {{ .Values.encryptedBackup.keepDays | quote }}
+                - name: AGE_RECIPIENT
+                  value: {{ .Values.encryptedBackup.ageRecipient | quote }}
+                - name: PRUNE_ENABLED
+                  value: {{ .Values.encryptedBackup.pruneEnabled | quote }}
+                - name: CAPACITY_WARNING_PERCENT
+                  value: {{ .Values.encryptedBackup.capacityWarningPercent | quote }}
+              command:
+                - bash
+                - /maintenance/backup.sh
+              securityContext:
+                {{- include "newapi.containerSecurity" . | nindent 16 }}
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              volumeMounts:
+                - name: script
+                  mountPath: /maintenance
+                  readOnly: true
+                - name: backups
+                  mountPath: /backups
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: script
+              configMap:
+                name: {{ include "newapi.fullname" . }}-backup-age-script
+            - name: backups
+              persistentVolumeClaim:
+                claimName: {{ include "newapi.fullname" . }}-backup-age
+            - name: tmp
+              emptyDir: {}
+{{- end }}

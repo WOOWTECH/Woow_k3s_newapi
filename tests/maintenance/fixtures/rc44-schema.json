@@ -1,0 +1,19 @@
+{
+  "tag": "v1.0.0-rc.44",
+  "models": {
+    "log": {
+      "source": "https://raw.githubusercontent.com/QuantumNous/new-api/v1.0.0-rc.44/model/log.go",
+      "sha256": "7bfd1f350dc511486e7926fd20c19a41d6e74a91ed7315214b2b3b1b8e8e3df8",
+      "created_at_declaration": "CreatedAt         int64  `json:\"created_at\" gorm:\"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type\"`",
+      "sql_type": "bigint",
+      "unit": "unix_seconds"
+    },
+    "audit_log": {
+      "source": "https://raw.githubusercontent.com/QuantumNous/new-api/v1.0.0-rc.44/model/audit_log.go",
+      "sha256": "79ec11b63387a1ade7c52f42566921efeb187d8a8f498bfe726780d067844c1a",
+      "created_at_declaration": "CreatedAt  int64      `json:\"created_at\" gorm:\"type:bigint;index:idx_audit_user_time,priority:2;index:idx_audit_token_time,priority:2;index\"`",
+      "sql_type": "bigint",
+      "unit": "unix_seconds"
+    }
+  }
+}
