@@ -3,15 +3,19 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/check-exposure.sh [--key-file FILE --exercise-qwen QWEN_MODEL] <host-or-https-url>" >&2
+  echo "usage: scripts/check-exposure.sh --team-domain TEAM.cloudflareaccess.com [--key-file FILE --exercise-qwen QWEN_MODEL] <host-or-https-url>" >&2
 }
 
 fail() { echo "check-exposure: $*" >&2; exit 1; }
 
+team_domain=
 key_file=
 exercise_model=
 while (($#)); do
   case $1 in
+    --team-domain)
+      (($# >= 2)) || { usage; exit 2; }
+      team_domain=$2; shift 2 ;;
     --key-file)
       (($# >= 2)) || { usage; exit 2; }
       key_file=$2; shift 2 ;;
@@ -25,6 +29,9 @@ while (($#)); do
 done
 (($# == 1)) || { usage; exit 2; }
 input=$1
+[[ $team_domain =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$ ]] ||
+  fail '--team-domain must be the exact approved Access team domain'
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $input == *://* ]]; then
   scheme=${input%%://*}
@@ -90,7 +97,7 @@ trap cleanup EXIT
 curl_config=
 if [[ -n $key_file ]]; then
   [[ -f $key_file ]] || fail 'key file is not a regular file'
-  mode=$(stat -c '%a' -- "$key_file") || fail 'cannot inspect key file permissions'
+  mode=$(stat -c '%a' -- "$key_file" 2>/dev/null) || fail 'cannot inspect key file permissions'
   # Require exactly 0600 or a stricter mode (owner read-only); reject group/other bits.
   (( (8#$mode & 077) == 0 )) || fail 'key file must have mode 0600 or stricter'
   [[ -r $key_file && -s $key_file ]] || fail 'key file must be readable and non-empty'
@@ -103,7 +110,7 @@ if [[ -n $key_file ]]; then
 fi
 
 curl_status() {
-  local auth_mode=$1 method=$2 path=$3 output=$4; shift 4
+  local auth_mode=$1 method=$2 path=$3; shift 3
   local -a cfg=()
   case $auth_mode in
     anonymous) ;;
@@ -116,46 +123,64 @@ curl_status() {
     url="$base/"
     target=(--request-target "$path")
   fi
-  curl -q -sS --connect-timeout 5 --max-time 20 --path-as-is -o "$output" \
-    -w '%{http_code}' -X "$method" "${cfg[@]}" "${target[@]}" --url "$url" "$@"
+  curl -q -s --noproxy '*' --connect-timeout 5 --max-time 20 --path-as-is --head -o /dev/null \
+    -w '%{http_code}' -X "$method" "${cfg[@]}" "${target[@]}" --url "$url" "$@" 2>/dev/null
+}
+
+# --head disables response-body transfer; -X preserves the actual GET/POST
+# method (this does NOT send HEAD). curl emits
+# only selected metadata to the offline classifier; Location queries and Ray
+# IDs are never printed. No redirect is followed, even in authenticated mode.
+curl_access() {
+  local auth_mode=$1 method=$2 path=$3
+  local -a cfg=() target=()
+  [[ $auth_mode != key ]] || cfg=(--config "$curl_config")
+  local url="$base$path"
+  if [[ $path == //* ]]; then
+    url="$base/"; target=(--request-target "$path")
+  fi
+  local -a body=()
+  [[ $method != POST ]] || body=(-H 'Content-Length: 0')
+  curl -q -s --noproxy '*' --connect-timeout 5 --max-time 20 --path-as-is --head \
+    -o /dev/null -w '%{http_code}\n%header{location}\n%header{cf-ray}\n%header{cf-mitigated}\n' \
+    -X "$method" "${cfg[@]}" "${target[@]}" "${body[@]}" --url "$url" 2>/dev/null |
+    python3 "$script_dir/cf-exposure.py" --classify-headers --team-domain "$team_domain"
 }
 
 anon_paths=(/ /console /api/status /api/pricing /api/ratio_config /api/perf-metrics/summary)
 for path in "${anon_paths[@]}"; do
-  status=$(curl_status anonymous GET "$path" "$tmpdir/body") || fail "anonymous GET $path: transport error"
-  case $status in
-    302|403) echo "PASS anonymous $path: $status" ;;
-    *) fail "anonymous GET $path expected Cloudflare Access block (302/403), got $status" ;;
-  esac
+  if ! evidence=$(curl_access anonymous GET "$path"); then
+    echo "EVIDENCE anonymous GET $path: $evidence"
+    fail "anonymous GET $path: Access not proven (bare 403/401/200 or transport failure is not a pass)"
+  fi
+  echo "OBSERVED anonymous GET $path: $evidence"
 done
-
-status=$(curl_status anonymous POST /pg/chat/completions "$tmpdir/body" --data-binary '') ||
-  fail 'anonymous POST /pg/chat/completions: transport error'
-case $status in
-  302|403) echo "PASS anonymous POST /pg/chat/completions: $status" ;;
-  *) fail "anonymous POST /pg/chat/completions expected Cloudflare Access block (302/403), got $status" ;;
-esac
+if ! evidence=$(curl_access anonymous POST /pg/chat/completions); then
+  echo "EVIDENCE anonymous POST /pg/chat/completions: $evidence"
+  fail 'anonymous POST /pg/chat/completions: Access not proven'
+fi
+echo "OBSERVED anonymous POST /pg/chat/completions: $evidence"
 
 if [[ -z $key_file ]]; then
-  echo '略過已驗證 relay 測項'
+  echo '略過已驗證 relay 測項；headers observations only, Access enforcement/NA06 not verified'
   exit 0
 fi
 
-status=$(curl_status key GET /v1/models "$tmpdir/body") || fail 'authenticated GET /v1/models: transport error'
+status=$(curl_status key GET /v1/models) || fail 'authenticated GET /v1/models: transport error'
 [[ $status == 200 ]] || fail "authenticated GET /v1/models expected 200, got $status"
 echo "PASS authenticated /v1/models: $status"
 
 denied_paths=(/v1/dashboard/billing/subscription /v1/tasks/x /v1/mj/submit/imagine /v1/video/generations/x /v1/../api/status /v1/%2e%2e/api/status //api/status)
 for path in "${denied_paths[@]}"; do
-  status=$(curl_status key GET "$path" "$tmpdir/body") || fail "authenticated GET $path: transport error"
-  case $status in
-    302|401|403|404) echo "PASS blocked $path: $status" ;;
-    *) fail "authenticated GET $path expected blocked (302/401/403/404), got $status" ;;
-  esac
+  if ! evidence=$(curl_access key GET "$path"); then
+    echo "EVIDENCE authenticated GET $path: $evidence"
+    fail "authenticated GET $path: denial source unproven; correlate WAF rule in Cloudflare Security Events"
+  fi
+  echo "OBSERVED Access login redirect GET $path: $evidence"
 done
 
 for path in /v1 /v1/ /v1x /V1/models; do
-  status=$(curl_status key GET "$path" "$tmpdir/body") || fail "authenticated GET $path: transport error"
+  status=$(curl_status key GET "$path") || fail "authenticated GET $path: transport error"
   echo "EVIDENCE $path: $status"
 done
 
@@ -164,9 +189,9 @@ if [[ -n $exercise_model ]]; then
   stream_file="$tmpdir/stream"
   payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":8,"stream":true}' "$exercise_model")
   cfg=(--config "$curl_config")
-  status=$(curl -q -sS --connect-timeout 5 --max-time 45 --path-as-is --max-filesize 65536 \
+  status=$(curl -q -s --noproxy '*' --connect-timeout 5 --max-time 45 --path-as-is --max-filesize 65536 \
     -o "$stream_file" -w '%{http_code}' -H 'Content-Type: application/json' \
-    -X POST "${cfg[@]}" --data-binary "$payload" "$base/v1/chat/completions") ||
+    -X POST "${cfg[@]}" --data-binary "$payload" "$base/v1/chat/completions" 2>/dev/null) ||
       fail 'Qwen stream: transport error'
   [[ $status == 200 ]] || fail "Qwen stream expected 200, got $status"
   if ! tr -d '\r' < "$stream_file" | LC_ALL=C grep -aFxq 'data: [DONE]'; then

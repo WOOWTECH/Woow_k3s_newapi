@@ -1,0 +1,8 @@
+{
+  "stage": "stg",
+  "account_id": "REPLACE_WITH_EXPLICIT_ACCOUNT_ID",
+  "zone_id": "REPLACE_WITH_EXPLICIT_ZONE_ID",
+  "tunnel_id": "REPLACE_WITH_EXISTING_STG_TUNNEL_UUID",
+  "owner_email": "REPLACE_WITH_ELMO_APPROVED_EMAIL",
+  "team_domain": "REPLACE_WITH_APPROVED_TEAM.cloudflareaccess.com"
+}
