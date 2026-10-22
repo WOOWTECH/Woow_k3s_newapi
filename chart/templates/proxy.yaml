@@ -7,7 +7,13 @@ overwrites X-Forwarded-For with a synthetic per-tenant IP. Replay records are
 shared by all replicas in the release's Valkey (ACL user newapi-proxy, see
 templates/valkey.yaml).
 */ -}}
+{{- if not (kindIs "bool" .Values.proxy.enabled) }}
+{{- fail "proxy.enabled must be a boolean (dormant means false, not a string)" }}
+{{- end }}
 {{- if .Values.proxy.enabled }}
+{{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.proxy.replicas))) (lt (int64 .Values.proxy.replicas) 1) (gt (int64 .Values.proxy.replicas) 2147483647) }}
+{{- fail "proxy.replicas must be a positive integer; use proxy.enabled=false for dormant preparation" }}
+{{- end }}
 {{- $fn := include "newapi.fullname" . -}}
 {{- $p := .Values.proxy -}}
 {{- $img := $p.image -}}

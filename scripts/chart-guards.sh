@@ -103,6 +103,13 @@ for rx in '^wp\d{10}$' '^ws[a-z]{2}\d{10}$'; do
   { head_; printf "  usernameRegex: '%s'\n" "$rx"; odoo_client; } | check "real-regex-$n" pass -
 done
 
+# NA-05: a quoted false must never accidentally create proxy resources.
+printf 'proxy:\n  enabled: "false"\n' | check proxy-string-false fail "proxy.enabled must be a boolean"
+printf 'proxy:\n  enabled: "true"\n' | check proxy-string-true fail "proxy.enabled must be a boolean"
+for replicas in 0 -1 1.5 2147483648; do
+  { head_; printf '  replicas: %s\n' "$replicas"; odoo_client; } | check "proxy-replicas-$replicas" fail "proxy.replicas must be a positive integer"
+done
+
 # NA-07: stg-first resource gating, dual-track retirement, legacy compatibility,
 # rendered maintenance/network contracts and runtime failure paths.
 # Optional real age tests run when NA07_AGE_BIN is set.

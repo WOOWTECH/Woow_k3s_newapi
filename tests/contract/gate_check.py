@@ -6,7 +6,8 @@ When a PR changes ``chart/values.yaml`` ``newapi.image`` or the proxy image in
 report of the stg gate run (docs/OPERATIONS.md 〈升版〉) whose env block names
 those exact tags and digests, with fail = skip = partial = missing = 0, no test
 user left behind, verify-settings exit 0 after the flips and no secret
-residue (report.gate_problems). Nothing changed -> nothing required.
+residue (report.gate_problems). Any active production proxy also requires the
+report even if its pin did not change. Dormant unchanged pins need no new report.
 
     python3 tests/contract/gate_check.py --base-ref origin/main   # exit 0 / 1
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -37,6 +39,62 @@ def _now(path):
         return f.read()
 
 
+def _simple_key(raw):
+    """Recognize only mapping keys that cannot hide YAML escapes or tags."""
+    if len(raw) >= 2 and raw[0] in "'\"" and raw[-1] == raw[0]:
+        raw = raw[1:-1]
+    return raw if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./-]*|<<", raw) else None
+
+
+def proxy_enabled(text):
+    """Require positive proof of a literal false top-level proxy.enabled.
+
+    YAML accepts different indentation widths. This stdlib-only reader treats
+    unknown shapes as active so formatting cannot bypass the contract gate.
+    Chart guards separately reject non-boolean values.
+    """
+    section = None
+    saw_proxy = saw_enabled = False
+    direct_indent = None
+    for line in (text or "").splitlines():
+        body = line.split("#", 1)[0].rstrip()
+        if not body.strip():
+            continue
+        indent = len(body) - len(body.lstrip())
+        raw_key, _, value = body.strip().partition(":")
+        raw_key = raw_key.strip()
+        if indent == 0:
+            key = _simple_key(raw_key)
+            if key is None or key == "<<":
+                return True  # Unsupported keys and YAML merges fail closed.
+            section = key
+            if section == "proxy" and saw_proxy:
+                return True  # duplicate maps must not hide an activation
+            if section == "proxy":
+                saw_proxy = True
+                direct_indent = None
+            if section == "proxy" and value.strip():
+                # Inline/aliased proxy maps are outside image_pin's supported
+                # shape. Require validation rather than silently skipping it.
+                return True
+        elif section == "proxy":
+            if direct_indent is None:
+                direct_indent = indent
+            if indent < direct_indent:
+                return True  # Inconsistent map indentation is unsupported.
+            if indent == direct_indent:
+                key = _simple_key(raw_key)
+                if key is None or key == "<<":
+                    return True
+                if key == "enabled":
+                    # Committed dormant values use literal false. Unknown/tagged/
+                    # quoted spellings fail closed; Helm checks the value type.
+                    if saw_enabled or value.strip() != "false":
+                        return True
+                    saw_enabled = True
+    return not (saw_proxy and saw_enabled)
+
+
 def required(base_ref):
     """[(why, expected_pins)] the PR must carry a green report for."""
     old = {k: _at(base_ref, p) for k, p in FILES.items()}
@@ -47,8 +105,11 @@ def required(base_ref):
     out = []
     if newapi_old != newapi_new or stg_old != stg_new:
         out.append(("chart newapi.image / stg proxy.image changed", {"newapi": newapi_new, "proxy": stg_new}))
-    if prod_old != prod_new and prod_new.get("tag"):
-        out.append(("prod proxy.image changed", {"newapi": newapi_new, "proxy": prod_new}))
+    # Every active production render needs a matching report, even when the
+    # image was pinned earlier while dormant. A digest-only change must not
+    # bypass this check simply because tag is empty.
+    if proxy_enabled(new["prod"]) or (prod_old != prod_new and any(prod_new.values())):
+        out.append(("prod proxy active / image pinned", {"newapi": newapi_new, "proxy": prod_new}))
     return out
 
 
@@ -66,6 +127,14 @@ def main(argv=None):
         return 0
     failed = 0
     for why, want in needs:
+        if why.startswith("prod "):
+            pin = want["proxy"]
+            if (not re.fullmatch(r"[0-9a-f]{40}", pin.get("tag") or "")
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", pin.get("digest") or "")
+                    or pin.get("digest") == "sha256:" + "0" * 64):
+                print("FAIL prod proxy requires a full commit-SHA tag and non-placeholder digest before contract validation")
+                failed += 1
+                continue
         name = report.report_name(want)
         path = os.path.join(report.REPORTS_DIR, name)
         if not os.path.exists(path):
