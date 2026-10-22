@@ -1,5 +1,7 @@
 # Dormant safety follow-up（2026-10-21）
 
+> 2026-10-22 staging 後續候選：本文件以下是 #21 合併時的歷史 dormant 證據；新的 staging 專用暫停 PVC／CronJob 配置與仍待驗的現場條件見 [NA-07-STG-SUSPENDED-20261022.md](NA-07-STG-SUSPENDED-20261022.md)。正式 values 仍保持 dormant。
+
 本段取代下方歷史紀錄中的「stg預建暫停資源」預設；既有 #17/#18 功能與過往證據不重做、不冒稱本輪驗收。
 這次基於 #18 `d487835aeb8c20ed8143e3d0de7ca94b7008e749` 的獨立分支，只補：
 
