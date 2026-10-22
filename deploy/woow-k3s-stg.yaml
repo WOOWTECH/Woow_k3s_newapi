@@ -40,15 +40,11 @@ networkPolicy:
 proxy:
   enabled: true
   image:
-    # Built by woow_paas_platform build-newapi-proxy (workflow_dispatch run
-    # 21271) on the LLM-02b feature branch feat/llm-02b-platform-foundation,
-    # Built by woow_paas_platform build-newapi-proxy on develop after PR #1822
-    # (LLM-02b review 2) merged: run 21930, merge commit 9d646e94. On top of
-    # #1792's ap.user.list route, its 200 answers are rebuilt from an
-    # allow-list (only id/username/quota/used_quota/request_count/status/
-    # DeletedAt, only for PROXY_USERNAME_REGEX users; others {id, username:
-    # null}); before it the relay leaked every user's e-mail, setting,
-    # aff_code and Stripe/OAuth ids to a CRON key. Previous pins, for rollback:
+    # Match the already-running staging Helm release and Deployment (read-only
+    # checked 2026-10-21). Source commit 3947d2b0 adds call deadlines and
+    # circuit-probe recovery; exact image pair passed the 2026-10-19 NA-03
+    # staging contract gate in tests/contract/reports/. Previous pins:
+    # 9d646e946d56477fcf1ddecb1ca4ce5ba1ce03c9@sha256:d3ab64d43692bb557cadf86c7b340ca2d25cb4e51981c18da298f3aa5839af65 (#1822)
     # 8fa836218e85cda520abacf0ab9e29744761c187@sha256:2e6193f3a4a2b2a3e4a0f60601f77d96fcff73b953336488ce18a3e3f7d49496 (#1792)
     # 59b03479ef833b1b62260692431a03782bb7b47c@sha256:52da4e80eaf4b0cf38ba1b24fb684d37ab627c7d424f9e56fe15dd58a4a856fd (LLM-01a)
     # Change it here, in git — never with helm --set, or the next
@@ -87,6 +83,14 @@ encryptedBackup:
   suspend: true
   pruneEnabled: false
   size: 5Gi
+  # Built by build-newapi-backup workflow run 24547 from NA-07 commit e020639.
+  # Remains suspended until the owner supplies a stg age public recipient and
+  # the actual encrypted restore has been reviewed. Never store a private key.
+  image:
+    tag: e020639cbfe3c32690c5efa1c036b4610682e438
+    digest: sha256:93f650ca7e1b3d754769183dc850add73383283f7812761691e88f559c63f965
+  imagePullSecrets:
+    - name: newapi-proxy-registry
 
 retention:
   enabled: true

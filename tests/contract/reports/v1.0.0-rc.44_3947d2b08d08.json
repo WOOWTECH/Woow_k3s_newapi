@@ -1,7 +1,7 @@
 {
   "cleanup": {
     "created": 10,
-    "deleted": 10,
+    "deleted": 12,
     "errors": [],
     "left": [],
     "soft_deleted": []
@@ -27,7 +27,7 @@
     "server_address": "https://newapi-stg.woowtech.io",
     "target": "stg"
   },
-  "generated_at": "2026-10-18T09:47:02+00:00",
+  "generated_at": "2026-10-19T05:02:38+00:00",
   "ids": {
     "C01": {
       "notes": [],
@@ -324,35 +324,35 @@
     "C23": {
       "exhaust": {
         "attempts_to_429": 19,
-        "recovery_seconds": 1159.1,
-        "retry_after": 1156
+        "recovery_seconds": 842.6,
+        "retry_after": 833
       }
     },
     "C25": {
       "session_limit_logins": 102
     },
     "F03": {
-      "elapsed_s": 10.8,
-      "passed": 11
+      "elapsed_s": 4.9,
+      "passed": 10
     },
     "F04": {
-      "elapsed_s": 2.5,
+      "elapsed_s": 3.0,
       "passed": 10
     },
     "F05": {
-      "counterexample_free_per_minute": 47
+      "counterexample_free_per_minute": 56
     },
     "F07": {
-      "429": 12,
-      "elapsed_s": 11.1,
-      "ok": 124,
+      "429": 5,
+      "elapsed_s": 24.9,
+      "ok": 131,
       "other": []
     },
     "F10": {
       "concurrency": 200,
-      "denied_rate": 0.915,
-      "elapsed_s": 10.7,
-      "final_quota": 126636,
+      "denied_rate": 0.95,
+      "elapsed_s": 10.4,
+      "final_quota": 138830,
       "max_tokens": 48,
       "model": "anthropic/claude-fable-5.1",
       "overdraft_points": 0.0,
@@ -360,23 +360,23 @@
       "seed_points": 10,
       "statuses": {
         "403": 0,
-        "429": 183,
+        "429": 190,
         "5xx": 0,
-        "ok": 17,
+        "ok": 10,
         "other": 0,
         "transport": 0
       },
       "upstream_error_rate": 0.0,
-      "used_quota": 29614,
+      "used_quota": 17420,
       "worst_case_usd": 0.48
     },
     "F11": {
-      "probe_200": 6,
-      "probe_429": 2,
-      "probe_500": 0,
+      "probe_200": 5,
+      "probe_429": 1,
+      "probe_500": 2,
       "probe_requests": 8,
       "probe_transport": 0,
-      "restart_s": 11.8
+      "restart_s": 11.2
     },
     "U18": {
       "client_4": {
@@ -390,13 +390,13 @@
       "override_replaces_client_value": true
     },
     "X06": {
-      "stalled_answer_s": 2.07
+      "stalled_answer_s": 3.63
     },
     "X09": {
       "client_saw": "RemoteDisconnected",
       "executed_per_log": true,
       "forwarded": true,
-      "pod": "newapi-proxy-69b9fbfb58-2rv72",
+      "pod": "newapi-proxy-69b9fbfb58-5fbmh",
       "quota_delta": 1
     },
     "ct_budget": {
@@ -412,47 +412,47 @@
     "C25 unreachable": "ACCESS_TOKEN_ROUTE_UNDECLARED: rc.44 declares every dashboard route (router/access_token_scope_test.go TestAccessTokenRouteRulesCoverEveryDashboardRoute); the upgrade diff of middleware/access_token_routes.go (docs/OPERATIONS.md 〈升版〉) pins it"
   },
   "run": {
-    "finished": 1792318479,
+    "finished": 1792388393,
     "invocation": "merged",
-    "started": 1792313160,
-    "wall_seconds": 5259.7
+    "started": 1792382445,
+    "wall_seconds": 5005.3
   },
   "runs": [
     {
-      "finished": 1792316822,
+      "finished": 1792386158,
       "gate": false,
       "invocation": "main",
       "pytest_exit": 0,
       "skip_slow": false,
-      "started": 1792313160,
-      "wall_seconds": 3662.1
+      "started": 1792382445,
+      "wall_seconds": 3712.6
     },
     {
-      "finished": 1792317281,
+      "finished": 1792387197,
       "gate": false,
       "invocation": "disruptive",
       "pytest_exit": 0,
       "skip_slow": false,
-      "started": 1792316847,
-      "wall_seconds": 434.5
+      "started": 1792386755,
+      "wall_seconds": 441.5
     },
     {
-      "finished": 1792317291,
+      "finished": 1792387503,
       "gate": false,
       "invocation": "upstream_down",
       "pytest_exit": 0,
       "skip_slow": false,
-      "started": 1792317290,
-      "wall_seconds": 1.2
+      "started": 1792387500,
+      "wall_seconds": 3.0
     },
     {
-      "finished": 1792318479,
+      "finished": 1792388393,
       "gate": false,
       "invocation": "ct_exhaust",
       "pytest_exit": 0,
       "skip_slow": false,
-      "started": 1792317317,
-      "wall_seconds": 1161.9
+      "started": 1792387545,
+      "wall_seconds": 848.2
     }
   ],
   "schema": 2,
@@ -474,77 +474,77 @@
   },
   "tests": {
     "tests/contract/test_contract_c.py::test_c01_login_envelope": {
-      "duration": 13.64,
+      "duration": 57.77,
       "id": "C01",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c02_proof_expires_after_60s": {
-      "duration": 67.01,
+      "duration": 68.85,
       "id": "C02",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c02_verify_shape": {
-      "duration": 2.06,
+      "duration": 2.64,
       "id": "C02",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c03_admin_contexts": {
-      "duration": 822.98,
+      "duration": 8.76,
       "id": "C03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c03_generate_context_must_be_exact": {
-      "duration": 2.1,
+      "duration": 3.12,
       "id": "C03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c03_revoke_context_is_token_id": {
-      "duration": 2.26,
+      "duration": 2.5,
       "id": "C03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c04_generate_method_is_password": {
-      "duration": 3.01,
+      "duration": 0.32,
       "id": "C04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c05_create_access_token": {
-      "duration": 4.79,
+      "duration": 4.82,
       "id": "C05",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c05_expiry_floor": {
-      "duration": 1.99,
+      "duration": 2.46,
       "id": "C05",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c06_session_only_routes[DELETE-/api/user/sessions/not-a-session]": {
-      "duration": 0.32,
+      "duration": 0.31,
       "id": "C06",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c06_session_only_routes[GET-/api/user/access_tokens/catalog]": {
-      "duration": 0.33,
+      "duration": 0.32,
       "id": "C06",
       "outcome": "pass",
       "partial": null,
@@ -565,175 +565,175 @@
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c07_catalog_scope_names": {
-      "duration": 0.32,
+      "duration": 0.31,
       "id": "C07",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c07_route_scope_map_admin": {
-      "duration": 1.62,
+      "duration": 1.6,
       "id": "C07",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c07_route_scope_map_consumer": {
-      "duration": 3.55,
+      "duration": 3.61,
       "id": "C07",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c08_delete_session": {
-      "duration": 3.24,
+      "duration": 4.46,
       "id": "C08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c09_create_user": {
-      "duration": 6.21,
+      "duration": 5.69,
       "id": "C09",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c10_search_like_order_unscoped": {
-      "duration": 11.82,
+      "duration": 1084.2,
       "id": "C10",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c11_put_user_whole_overwrite_keeps_session": {
-      "duration": 1.63,
+      "duration": 2.26,
       "id": "C11",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c12_add_quota_and_log": {
-      "duration": 0.69,
+      "duration": 0.15,
       "id": "C12",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c13_add_quota_errors": {
-      "duration": 1.66,
+      "duration": 0.34,
       "id": "C13",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c14_create_token": {
-      "duration": 0.68,
+      "duration": 0.14,
       "id": "C14",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c15_list_tokens_order_and_mask": {
-      "duration": 1.96,
+      "duration": 0.4,
       "id": "C15",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c16_reveal": {
-      "duration": 5.89,
+      "duration": 7.58,
       "id": "C16",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c17_put_token_whole_overwrite": {
-      "duration": 2.32,
+      "duration": 0.48,
       "id": "C17",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c18_bad_keys_401_and_status_not_written_back": {
-      "duration": 6.27,
+      "duration": 3.46,
       "id": "C18",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c19_log_self_shape": {
-      "duration": 1.0,
+      "duration": 0.24,
       "id": "C19",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c19_retention_columns": {
-      "duration": 0.99,
+      "duration": 0.95,
       "id": "C19",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c20_stat_and_data": {
-      "duration": 1.3,
+      "duration": 0.27,
       "id": "C20",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c21_user_self_and_admin_get": {
-      "duration": 0.64,
+      "duration": 0.15,
       "id": "C21",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c22_status_invariants": {
-      "duration": 0.32,
+      "duration": 0.06,
       "id": "C22",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c23_critical_limit_429": {
-      "duration": 1161.56,
+      "duration": 846.71,
       "id": "C23",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c23_route_limit_map": {
-      "duration": 47.14,
+      "duration": 60.86,
       "id": "C23",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c24_trusted_proxies_honour_proxy_xff": {
-      "duration": 7.01,
+      "duration": 59.17,
       "id": "C24",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c25_error_codes": {
-      "duration": 4.75,
+      "duration": 3.28,
       "id": "C25",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c25_expiry_codes": {
-      "duration": 378.29,
+      "duration": 601.14,
       "id": "C25",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c25_session_limits": {
-      "duration": 24.25,
+      "duration": 379.71,
       "id": "C25",
       "outcome": "pass",
       "partial": null,
@@ -747,126 +747,126 @@
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c26_token_name_bytes_and_page_size": {
-      "duration": 3.58,
+      "duration": 1.05,
       "id": "C26",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c26_user_field_limits": {
-      "duration": 1.29,
+      "duration": 0.29,
       "id": "C26",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_contract_c.py::test_c27_pat_survives_password_group_and_disable": {
-      "duration": 1055.64,
+      "duration": 16.02,
       "id": "C27",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f01_free_channel_caps_max_tokens": {
-      "duration": 325.14,
+      "duration": 356.8,
       "id": "F01",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f01_free_trial_works": {
-      "duration": 15.29,
+      "duration": 12.77,
       "id": "F01",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f02_pre_consume_control": {
-      "duration": 76.47,
+      "duration": 79.61,
       "id": "F02",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f03_per_minute_cap": {
-      "duration": 72.81,
+      "duration": 66.87,
       "id": "F03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f03_refill_after_6s": {
-      "duration": 76.76,
+      "duration": 74.34,
       "id": "F03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f04_concurrent_cap": {
-      "duration": 64.52,
+      "duration": 64.95,
       "id": "F04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f05_counterexample_reopens_bypass": {
-      "duration": 125.28,
+      "duration": 125.3,
       "id": "F05",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f05_no_bypass_with_safe_config": {
-      "duration": 122.88,
+      "duration": 122.65,
       "id": "F05",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f06_daily_cap_primitives": {
-      "duration": 132.38,
+      "duration": 130.75,
       "id": "F06",
       "outcome": "pass",
       "partial": "the 5-minute disable, the 00:00 restore and disabled_by=suspend are the PaaS meter cron (LLM-10 acceptance); NA-03 pins only the new-api primitives it stands on",
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f07_paid_success_cap": {
-      "duration": 134.77,
+      "duration": 148.05,
       "id": "F07",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f08_cross_group_denied": {
-      "duration": 62.66,
+      "duration": 62.2,
       "id": "F08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f09_fuse": {
-      "duration": 63.75,
+      "duration": 63.69,
       "id": "F09",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f10_overdraft_measurement": {
-      "duration": 28.05,
+      "duration": 31.23,
       "id": "F10",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f11_valkey_restart": {
-      "duration": 99.77,
+      "duration": 97.13,
       "id": "F11",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_free_tier_f.py::test_f12_redis_key_format": {
-      "duration": 4.53,
+      "duration": 4.39,
       "id": "F12",
       "outcome": "pass",
       "partial": null,
@@ -880,182 +880,182 @@
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x02_forged_headers_ignored": {
-      "duration": 5.29,
+      "duration": 67.58,
       "id": "X02",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x03_blocked_paths[anon-GET-/v1/models]": {
-      "duration": 0.08,
+      "duration": 1.84,
       "id": "X03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x03_blocked_paths[ap-GET-/api/channel/]": {
-      "duration": 0.07,
+      "duration": 1.84,
       "id": "X03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x03_blocked_paths[ap-GET-/api/option/]": {
-      "duration": 0.08,
+      "duration": 1.62,
       "id": "X03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x03_blocked_paths[ap-POST-/api/user/topup]": {
-      "duration": 0.09,
+      "duration": 1.84,
       "id": "X03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x03_blocked_paths[ap-PUT-/api/user/]": {
-      "duration": 0.07,
+      "duration": 1.85,
       "id": "X03",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_bad_signatures[expired_ts]": {
-      "duration": 0.07,
+      "duration": 1.9,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_bad_signatures[future_ts]": {
-      "duration": 0.06,
+      "duration": 1.84,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_bad_signatures[unknown_kid]": {
-      "duration": 0.07,
+      "duration": 1.84,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_bad_signatures[wrong_sig]": {
-      "duration": 0.07,
+      "duration": 1.84,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_replay": {
-      "duration": 0.15,
+      "duration": 2.77,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_unsigned": {
-      "duration": 0.08,
+      "duration": 1.66,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x04_web_key_scope": {
-      "duration": 0.08,
+      "duration": 1.86,
       "id": "X04",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x05_ap_with_authorization": {
-      "duration": 0.08,
+      "duration": 1.84,
       "id": "X05",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x06_upstream_down": {
-      "duration": 1.16,
+      "duration": 2.96,
       "id": "X06",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x06_upstream_stalled": {
-      "duration": 11.15,
+      "duration": 11.1,
       "id": "X06",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x07_reveal_window": {
-      "duration": 126.91,
+      "duration": 137.52,
       "id": "X07",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_create_non_prefix_username": {
-      "duration": 0.08,
+      "duration": 1.84,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body0-manage_mode]": {
-      "duration": 0.07,
+      "duration": 1.71,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body1-manage_mode]": {
-      "duration": 0.07,
+      "duration": 1.84,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body2-manage_value]": {
-      "duration": 0.09,
+      "duration": 1.86,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body3-manage_value]": {
-      "duration": 0.08,
+      "duration": 1.85,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body4-manage_action]": {
-      "duration": 0.07,
+      "duration": 1.86,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_body_policy[body5-manage_fields]": {
-      "duration": 0.08,
+      "duration": 1.84,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x08_manage_targets": {
-      "duration": 0.95,
+      "duration": 5.39,
       "id": "X08",
       "outcome": "pass",
       "partial": null,
       "skip_reason": null
     },
     "tests/contract/test_proxy_x.py::test_x09_kill_mid_add_quota": {
-      "duration": 39.85,
+      "duration": 42.53,
       "id": "X09",
       "outcome": "pass",
       "partial": null,
