@@ -79,20 +79,27 @@ proxy:
 # suspend alone does not prevent PVC provisioning; keep enabled=false.
 # The original daily backup above remains active.
 encryptedBackup:
-  enabled: false
+  # Staging qualification: provision only; legacy daily backup stays active.
+  enabled: true
   schedule: "45 */6 * * *"
   keepDays: 7
   suspend: true
   pruneEnabled: false
   size: 5Gi
-  # Built by build-newapi-backup workflow run 24547 from NA-07 commit e020639.
-  # Remains suspended until the owner supplies a stg age public recipient and
-  # the actual encrypted restore has been reviewed. Never store a private key.
+  # Fresh test recipient; private identity stays outside Git and the cluster.
+  ageRecipient: age15n5z9tqsltqm202ev2dl24wuk7gh0xczexkaklc9j3dqnxf4cq7qcymlgf
+  # Immutable image from successful workflow run 25116; recipe matches main.
   image:
-    tag: e020639cbfe3c32690c5efa1c036b4610682e438
-    digest: sha256:93f650ca7e1b3d754769183dc850add73383283f7812761691e88f559c63f965
+    tag: c9f8416dcefb1b880c1b654b1190c8e989c6b826
+    digest: sha256:334f25bfe563aa4142ab2261c06a93110f600c002187478c9992b1dd14b873c5
   imagePullSecrets:
     - name: newapi-proxy-registry
+  capacityVerification:
+    evidenceRef: docs/NA-07-STG-SUSPENDED-20261022.md
+    namespace: new-api-stg
+    release: newapi
+    storageClassName: longhorn
+    requestedSize: 5Gi
 
 retention:
   enabled: false

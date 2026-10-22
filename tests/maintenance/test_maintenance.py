@@ -52,23 +52,37 @@ class HelmTests(unittest.TestCase):
             'verifiedAt': '2026-10-21T12:00:00Z'}
         return enc
 
-    def test_all_sites_dormant_without_new_pvc_and_legacy_backup_preserved(self):
+    def test_default_prod_dormant_stg_suspended_and_legacy_backup_preserved(self):
         for site in [None, 'deploy/woow-k3s.yaml', 'deploy/woow-k3s-stg.yaml']:
             with self.subTest(site=site):
                 p = self.render(site=site)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 jobs = [d for d in p.stdout.split('---') if 'kind: CronJob' in d]
-                self.assertEqual(len(jobs), 1)
-                legacy = jobs[0]
+                self.assertEqual(len(jobs), 2 if site == 'deploy/woow-k3s-stg.yaml' else 1)
+                legacy = next(d for d in jobs if '  name: newapi-pg-backup\n' in d)
                 self.assertIn('  name: newapi-pg-backup\n', legacy)
                 self.assertIn('schedule: "45 3 * * *"', legacy)
                 self.assertIn('suspend: false', legacy)
                 self.assertIn('value: "7"' if site == 'deploy/woow-k3s-stg.yaml' else 'value: "14"', legacy)
                 self.assertIn('claimName: newapi-backup\n', legacy)
-                for name in ['newapi-pg-backup-age', 'newapi-backup-age', 'newapi-retention']:
-                    self.assertNotIn('  name: ' + name, p.stdout)
-                for component in ['backup-encrypted', 'retention']:
-                    self.assertNotIn('app.kubernetes.io/component: ' + component, p.stdout)
+                self.assertNotIn('  name: newapi-retention', p.stdout)
+                self.assertNotIn('app.kubernetes.io/component: retention', p.stdout)
+                if site == 'deploy/woow-k3s-stg.yaml':
+                    encrypted = next(d for d in jobs if '  name: newapi-pg-backup-age\n' in d)
+                    self.assertIn('schedule: "45 */6 * * *"', encrypted)
+                    self.assertIn('suspend: true', encrypted)
+                    self.assertIn('claimName: newapi-backup-age\n', encrypted)
+                    self.assertIn('  name: newapi-backup-age\n', p.stdout)
+                else:
+                    self.assertNotIn('  name: newapi-pg-backup-age', p.stdout)
+                    self.assertNotIn('  name: newapi-backup-age', p.stdout)
+                    self.assertNotIn('app.kubernetes.io/component: backup-encrypted', p.stdout)
+
+    def test_site_values_have_unique_top_level_keys(self):
+        for site in ('deploy/woow-k3s.yaml', 'deploy/woow-k3s-stg.yaml'):
+            with self.subTest(site=site):
+                keys = re.findall(r'^([A-Za-z][A-Za-z0-9_]*):', (ROOT / site).read_text(), re.M)
+                self.assertEqual(len(keys), len(set(keys)), 'A later YAML key silently overrides an earlier one')
 
     def test_all_site_resource_identities_match_pre_na07(self):
         def identities(rendered):
@@ -95,7 +109,15 @@ class HelmTests(unittest.TestCase):
                 baseline=run(args);current=self.render(site=site)
                 self.assertEqual(baseline.returncode,0,baseline.stderr)
                 self.assertEqual(current.returncode,0,current.stderr)
-                self.assertEqual(identities(current.stdout),identities(baseline.stdout))
+                expected=identities(baseline.stdout)
+                if site == 'deploy/woow-k3s-stg.yaml':
+                    expected |= {
+                        ('PersistentVolumeClaim', 'newapi-backup-age'),
+                        ('ConfigMap', 'newapi-backup-age-script'),
+                        ('CronJob', 'newapi-pg-backup-age'),
+                        ('NetworkPolicy', 'newapi-backup-age'),
+                    }
+                self.assertEqual(identities(current.stdout),expected)
 
     def test_legacy_dump_validation_cleanup_and_runtime_unchanged_from_main(self):
         base=run(['git','show','b775213:chart/templates/backup.yaml'],cwd=ROOT)
