@@ -1,3 +1,42 @@
+# Dormant safety follow-up（2026-10-21）
+
+本段取代下方歷史紀錄中的「stg預建暫停資源」預設；既有 #17/#18 功能與過往證據不重做、不冒稱本輪驗收。
+這次基於 #18 `d487835aeb8c20ed8143e3d0de7ca94b7008e749` 的獨立分支，只補：
+
+- stg/prod 新 encryptedBackup、retention、monitoring 均disabled；新增PVC/Job/維護NP皆不渲染。
+- 既有每日backup名稱、PVC、image、排程、14d prod／7d stg、active狀態不變；不觸碰Retain PV。
+- enabled=true（即使suspended）要求公鑰、image pin、綁namespace/release/storageClass/size的容量審閱參照。
+- 固定180天政策、批次上限與既有告警／加密腳本沿用#17；沒有新增runtime腳本或重建image。
+
+容量審閱欄位只驗設定綁定，不驗紀錄真偽／時效或live scheduler；不得用虛構證據啟用。
+缺公鑰、容量／replica與live驗收證據，本輪沒有任何部署、PVC建立、叢集／Secret讀取。
+
+| 票面 AC | #17/#18 已有 | 本輪／尚待 |
+| --- | --- | --- |
+| AC1 180d batched清理、最近列不變／鎖等待 | 腳本、schema guard、bounded SQL、過往本地PG測試、stg EXPLAIN | 本輪重跑離線／本地隔離測試另列；實際stg合成資料／耗時／鎖等待待驗 |
+| AC2 6h、7d、age加密 | 獨立新軌與pipefail／發布前不清舊檔、image已釘 | owner公鑰缺；真排程/加密dump待驗。舊每日明文備份不因本PR停用；7d pruning仍需還原證據 |
+| AC3 解密pg_restore | #17報告本地臨時PG/age成功 | 真stg來源加密dump由owner離線解密還原待驗 |
+| AC4 1%非0與告警 | runtime threshold／PrometheusRule模板及離線測試 | receiver、selector、metrics與實際通知未驗；monitoring維持disabled |
+| AC5 retention期間relay正常 | 批次、sleep、SQL lock/statement timeout | stg真流量併行、p95／可用性待驗 |
+
+## 本輪實際離線驗證
+
+- Helm lint／template：default **20**、prod **20**、stg **23** 個資源；三組新增NA-07資源均**0**。
+  default/prod/stg 的資源(kind,name)清單均與pre-NA07基底相同；legacy runtime模板保持相同。
+- maintenance suite：**22/22 PASS，0 skips**；重跑真age與自建PostgreSQL 16 Unix socket臨時DB，
+  含加密dump／解密還原、10,001列分批、嚴格邊界與locked row；測試fixtures自行清理。
+- chart-guards：既有代理guard全部PASS，維護測試**16項（其中真age選跑1項在此預設命令skip）**；
+  上述22項完整命令另已啟用真age，沒有以skip冒稱驗過。
+- admin離線回歸 **101/101**；contract selfcheck **10/10**（48 IDs）；兩環境offline settings各**27/27**。
+- image gate對#18 exact base通過，沒有變更upstream/proxy/backup image；Bash syntax、diff check通過。
+- 本機工具沿用上游已準備的 `/tmp/na07-tools`；不下載image、不publish、不連live DB、不碰kubeconfig。
+
+上述是本輪執行的local/offline驗證，不是stg AC1–5或容量/告警送達驗收。
+
+以下均為上游歷史驗證與部署準備記錄，20/20/30資源數不是本輪dormant render結果。
+
+---
+
 # NA-07 local validation — stg-first resource gating, 2026-10-21
 
 Scope: `Woow_k3s_newapi` only, existing `feat/na-07-retention-backup` worktree.

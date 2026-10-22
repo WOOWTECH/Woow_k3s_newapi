@@ -14,15 +14,27 @@
 {{- if and $enc.ageRecipient (not (regexMatch "^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$" $enc.ageRecipient)) }}
 {{- fail "encryptedBackup.ageRecipient must be a native age1 public recipient (never a private key)" }}
 {{- end }}
-{{- if and $enc.enabled (not $enc.suspend) }}
-{{- if not $enc.ageRecipient }}{{ fail "active encryptedBackup requires encryptedBackup.ageRecipient" }}{{- end }}
+{{- if $enc.enabled }}
+{{- if not $enc.ageRecipient }}{{ fail "provisioning encryptedBackup requires encryptedBackup.ageRecipient even when suspended" }}{{- end }}
 {{- end }}
-{{- if or $enc.image.digest (and $enc.enabled (not $enc.suspend)) }}
+{{- if or $enc.image.digest $enc.enabled }}
 {{- if or (not (regexMatch "^sha256:[a-f0-9]{64}$" $enc.image.digest)) (regexMatch "^sha256:0{64}$" $enc.image.digest) }}
 {{- fail "encryptedBackup.image.digest must pin the built PostgreSQL + age image" }}
 {{- end }}
 {{- if or (not $enc.image.repository) (not $enc.image.tag) }}
 {{- fail "encryptedBackup.image.repository and tag are required with a digest" }}
+{{- end }}
+{{- end }}
+{{/* Suspended CronJobs still render a PVC. Require reviewed scheduling evidence
+before provisioning; this attestation is not a live capacity/replica check. */}}
+{{- if $enc.enabled }}
+{{- $c := $enc.capacityVerification }}
+{{- if not (kindIs "map" $c) }}{{ fail "encryptedBackup.capacityVerification must be a mapping" }}{{- end }}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$" (toString $c.evidenceRef)) }}
+{{- fail "encryptedBackup.capacityVerification requires a reviewed scheduling evidenceRef" }}
+{{- end }}
+{{- if or (ne $c.namespace .Release.Namespace) (ne $c.release .Release.Name) (ne $c.storageClassName $enc.storageClassName) (ne $c.requestedSize $enc.size) }}
+{{- fail "encryptedBackup.capacityVerification must match namespace, release, storageClassName and requestedSize" }}
 {{- end }}
 {{- end }}
 {{/* No automatic cutover. This is a reviewed restore attestation, not a live
@@ -57,6 +69,7 @@ lookup or proof that Helm itself has restored a DB. Bind it to the deployment. *
 {{- fail (printf "retention.%s must be a positive integer" $key) }}
 {{- end }}
 {{- end }}
+{{- if ne (int .Values.retention.days) 180 }}{{ fail "retention.days must be 180 for the approved retention policy" }}{{- end }}
 {{- if gt (int .Values.retention.batchSize) 10000 }}{{ fail "retention.batchSize must not exceed 10000" }}{{- end }}
 {{- end }}
 {{- if or (not (regexMatch "^[1-9][0-9]*$" (toString .Values.monitoring.capacityWarningPercent))) (gt (int .Values.monitoring.capacityWarningPercent) 100) }}

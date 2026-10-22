@@ -1,5 +1,21 @@
 # NA-05 dormant production proxy: review patch and activation blockers
 
+## 2026-10-22 integration update
+
+PRs #17 and #18 have merged into infra `main`. This dormant preparation is now
+integrated against `main` at `64b5df293f33ec25a761d108153650a4f7127c49`.
+Its diff against that parent still covers only the seven preparation files;
+`deploy/woow-k3s.yaml` keeps `proxy.enabled: false`, with no production proxy
+image pin or credential. The original stacked-parent notes below record the
+2026-10-21 review sequence and are no longer instructions to merge #17/#18.
+
+Integration validation: NA-05 unit tests 9/9, all script tests 141/141,
+maintenance tests 22/22 (six optional skips), contract selfcheck 11/11,
+production and staging Helm lint, chart guards, contract gate against current
+`main`, and `git diff --check` all passed. This is offline validation only;
+production activation still requires the separate prerequisite and acceptance
+steps below.
+
 ## Boundary and exact parent
 
 Prepared in a new isolated worktree `wt-na05-dormant-prod-1021`, branch
