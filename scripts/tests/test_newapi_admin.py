@@ -852,6 +852,64 @@ class TestCall(Base):
         self.assertIn('"key": "GroupRatio"', out)
 
 
+class TestProdDenyOnly(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.status["server_address"] = PROD
+
+    def test_every_cli_mutation_is_rejected_before_an_authenticated_request(self):
+        cases = [
+            ("apply-settings", SETTINGS),
+            ("apply-settings", "--only", "RetryTimes", SETTINGS),
+            ("apply-pricing",),
+            ("apply-channels", "--update"),
+            ("call", "PUT", "/api/option/", '{"key":"GroupRatio","value":"{}"}'),
+            ("call", "POST", "/api/user/access_tokens", '{"name":"x"}'),
+            ("call", "DELETE", "/api/channel/1"),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                self.fake.requests.clear()
+                rc, _, err = self.run_tool(*args, target="prod")
+                self.assertEqual(rc, 2)
+                self.assertIn("production writes are disabled", err)
+                self.assertEqual(self.writes(), [])
+
+    def test_snapshot_and_backup_are_not_created_before_denial(self):
+        snapshot = os.path.join(self.tmp, "snapshot.json")
+        backup_dir = os.path.join(self.tmp, "backup")
+        rc, _, _ = self.run_tool("apply-settings", "--snapshot", snapshot, SETTINGS, target="prod")
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(snapshot))
+        rc, _, _ = self.run_tool("apply-pricing", "--backup-dir", backup_dir, target="prod")
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(backup_dir))
+
+    def test_production_reads_still_work(self):
+        rc, _, _ = self.run_tool("get-options", "GroupRatio", target="prod")
+        self.assertEqual(rc, 0)
+        rc, _, _ = self.run_tool("call", "GET", "/api/status", target="prod")
+        self.assertEqual(rc, 0)
+        self.run_tool("apply-channels", "--dry-run", target="prod")
+        self.assertTrue(self.calls("GET", "/api/channel/"))
+        self.assertEqual(self.writes(), [])
+
+    def test_unknown_server_address_is_not_a_prod_bypass(self):
+        self.fake.status["server_address"] = "http://localhost:3000"
+        rc, _, err = self.run_tool("apply-settings", SETTINGS, target="prod")
+        self.assertEqual(rc, 2)
+        self.assertIn("production writes are disabled", err)
+        self.assertEqual(self.writes(), [])
+
+    def test_password_login_is_not_attempted_before_denial(self):
+        rc, _, err = self.run_tool("--base", self.base, "--creds", self.creds(url=PROD),
+                                   "apply-settings", SETTINGS, auth=False, target="prod")
+        self.assertEqual(rc, 2)
+        self.assertIn("production writes are disabled", err)
+        self.assertEqual(self.calls("POST", "/api/user/login"), [])
+        self.assertEqual(self.writes(), [])
+
+
 class TestChannels(Base):
     def setUp(self):
         super().setUp()

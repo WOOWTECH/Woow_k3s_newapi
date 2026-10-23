@@ -3,6 +3,8 @@
 
 Nothing has a default target: every command that talks to a server needs
 --base and one credential, and every write also needs --target.
+Production mutations are disabled until the approved price-notice gate and
+all-writer interlock exist. This client currently permits only production reads.
 
   --base URL         the new-api origin itself, e.g. a port-forward
                      http://127.0.0.1:3301. Plain http only to 127.0.0.1, ::1
@@ -296,6 +298,13 @@ def require_target(c, a, writes, out=None):
     if by_base and by_base != a.target:
         raise Fatal(f"--target {a.target}, but --base is the {by_base} URL: refusing to write")
     return a.target
+
+
+def deny_prod_write(target):
+    """NA-04 brake: no production mutation through this client before GA evidence."""
+    if target == "prod":
+        raise Fatal("production writes are disabled until the approved price-notice gate "
+                    "and all-writer interlock are implemented; use read-only commands")
 
 
 def get_options(c):
@@ -977,6 +986,7 @@ def cmd_apply_settings(a):
     if "ServerAddress" in settings and target_of(settings["ServerAddress"]) != target:
         raise Fatal(f"the files set ServerAddress {settings['ServerAddress']!r}, not the {target} URL "
                     f"{TARGET_URLS[target]}" + (": staging layers deploy/settings-stg.json on top" if target == "stg" else ""))
+    deny_prod_write(target)
     if a.snapshot:
         take_snapshot(c, a.snapshot)
     failed = 0
@@ -998,7 +1008,8 @@ def cmd_apply_pricing(a):
     markup lives in GroupRatio) and drop fixed prices for plan models."""
     plan = load_json(a.plan)
     c = client_from_args(a)
-    require_target(c, a, writes=True)
+    target = require_target(c, a, writes=True)
+    deny_prod_write(target)
     opts = get_options(c)
     os.makedirs(a.backup_dir, mode=0o700, exist_ok=True)
     host = re.sub(r"[^A-Za-z0-9.-]+", "_", c.base.split("//", 1)[-1])
@@ -1178,6 +1189,8 @@ def cmd_apply_channels(a):
     selected = select_channels(spec, a.group, a.with_internal)
     c = client_from_args(a)
     target = require_target(c, a, writes=not a.dry_run)
+    if not a.dry_run:
+        deny_prod_write(target)
     label = a.label or target or "?"
     have = {}
     for ch in list_channels(c):
@@ -1257,7 +1270,8 @@ def cmd_apply_channels(a):
 def cmd_call(a):
     c = client_from_args(a)
     if a.method.upper() != "GET":
-        require_target(c, a, writes=True, out=sys.stderr)  # stdout stays JSON
+        target = require_target(c, a, writes=True, out=sys.stderr)  # stdout stays JSON
+        deny_prod_write(target)
     body = json.loads(a.json) if a.json else None
     if a.path.rstrip("/") == "/api/option" and isinstance(body, dict) and body.get("key") in NEVER_WRITE:
         raise Fatal(f"{body['key']} must never be written (on rc.44 it replaces the live group ratios)")
