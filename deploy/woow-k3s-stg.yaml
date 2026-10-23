@@ -67,7 +67,7 @@ proxy:
   clients:
     # Odoo pods of dev sandboxes only: not their agent-runtime, nginx or
     # pgadmin pods, nothing in paas-ws-stg-*.
-    # 舊 stg 平台 Odoo（dev-sandbox-stg）也在這一筆；woow-paas/paas-app-bundle-cd#289 PR-4 刪沙盒時再評估是否移除。
+    # 舊 stg 已在 cd#289 PR-4 退役刪除；這一筆保留給其他平台沙盒。
     - name: sandbox-odoo
       namespaceSelector:
         matchLabels:
