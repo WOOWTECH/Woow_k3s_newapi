@@ -66,7 +66,8 @@ proxy:
   opExpiresAt: "1807713552"
   clients:
     # Odoo pods of dev sandboxes only: not their agent-runtime, nginx or
-    # pgadmin pods, nothing in paas-ws-stg-* or paas-stg-system.
+    # pgadmin pods, nothing in paas-ws-stg-*.
+    # 舊 stg 平台 Odoo（dev-sandbox-stg）也在這一筆；woow-paas/paas-app-bundle-cd#289 PR-4 刪沙盒時再評估是否移除。
     - name: sandbox-odoo
       namespaceSelector:
         matchLabels:
@@ -74,6 +75,21 @@ proxy:
       podSelector:
         matchLabels:
           app.kubernetes.io/component: odoo
+    # stg 平台 Odoo 新 release（paas-app-bundle-cd 的 paas-odoo-platform-stg，woow-odoo chart platform profile；cd#289）。
+    # 只選 web 與 cron（component In server, cron）；同 release 的 postgresql、db-backup Job 不選。
+    # 形狀同 chart values.yaml 的 prod 範例（paas-odoo），只換 ns 與 instance。
+    # web／cron 那一側的 egress 在 paas-app-bundle-cd 的 paas-odoo-platform-stg-guardrails/web-cron-egress-netpol.yaml。
+    - name: platform-odoo-stg
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: paas-stg-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/instance: paas-odoo-platform-stg
+        matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [server, cron]
 
 # NA-07 staging qualification provisions a new PVC while the encrypted
 # CronJob remains suspended. Recheck Longhorn capacity before deployment.
