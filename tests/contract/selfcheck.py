@@ -317,14 +317,29 @@ def check_jwt_resolves_after_pacing():
 
 
 class _FakeOptionClient:
-    def __init__(self, live, ok=True):
+    def __init__(self, live, ok=True, base="http://127.0.0.1:3000", statuses=None, fail_after_write=False):
         self.live, self.ok, self.puts = dict(live), ok, []
+        self.base = base
+        self.statuses = list(statuses or ["https://newapi-stg.woowtech.io"])
+        self.status_calls = 0
+        self.fail_after_write = fail_after_write
 
     def get(self, path):
         class R:
             pass
 
         r = R()
+        if path == "/api/status":
+            ix = min(self.status_calls, len(self.statuses) - 1)
+            address = self.statuses[ix]
+            self.status_calls += 1
+            if isinstance(address, tuple):
+                r.status, r.success, r.data = address
+                r.code = "STATUS_ERROR"
+                return r
+            r.status, r.success, r.code = 200, True, None
+            r.data = {"server_address": address} if address is not None else None
+            return r
         r.status, r.code = (200, None) if self.ok else (403, "ACCESS_TOKEN_SCOPE_DENIED")
         r.success = self.ok
         r.data = [{"key": k, "value": v} for k, v in self.live.items()] if self.ok else None
@@ -336,6 +351,8 @@ class _FakeOptionClient:
         self.puts.append(body)
         self.live[body["key"]] = st.NA.encode(json.loads(body["value"]) if isinstance(body["value"], str)
                                               and body["value"][:1] in "[{" else body["value"])
+        if self.fail_after_write and len(self.puts) == 1:
+            raise RuntimeError("simulated response loss after write")
 
         class R:
             success = True
@@ -352,9 +369,38 @@ def check_settings_guard():
     declared = st.NA.load_layers(list(st.SETTINGS_FILES))
     live = {k: st.NA.encode(v) for k, v in declared.items()}
     quiet = {"notify": lambda m: None}
+    # Missing / production targets and a mismatched server identity all refuse before writes.
+    for target in (None, "prod", "unknown"):
+        c = _FakeOptionClient(live)
+        try:
+            with st.SettingsAdmin(c, target=target, **quiet).temporary(
+                    "quota_setting.enable_free_model_pre_consume", True):
+                pass
+        except st.SettingsRefused:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid settings target {target!r}")
+        assert not c.puts, f"a PUT went out for target {target!r}"
+    for base, addresses in (("https://newapi.woowtech.io", ["https://newapi-stg.woowtech.io"]),
+                             ("https://unknown.invalid", ["https://newapi-stg.woowtech.io"]),
+                             ("https://newapi-stg.woowtech.io", ["https://newapi.woowtech.io"]),
+                             ("http://127.0.0.1:3000", ["https://newapi.woowtech.io"]),
+                             ("http://127.0.0.1:3000", [(503, False, {"server_address":
+                                                                       "https://newapi-stg.woowtech.io"})]),
+                             ("http://127.0.0.1:3000", [(200, True, [])])):
+        c = _FakeOptionClient(live, base=base, statuses=addresses)
+        try:
+            with st.SettingsAdmin(c, target="stg", **quiet).temporary(
+                    "quota_setting.enable_free_model_pre_consume", True):
+                pass
+        except st.SettingsRefused:
+            pass
+        else:
+            raise AssertionError(f"accepted unsafe settings origin/status {base}")
+        assert not c.puts, f"a PUT went out for unsafe origin/status {base}"
     # GET fails -> refuse before any PUT
     c = _FakeOptionClient(live, ok=False)
-    sa = st.SettingsAdmin(c, **quiet)
+    sa = st.SettingsAdmin(c, target="stg", **quiet)
     try:
         with sa.temporary("quota_setting.enable_free_model_pre_consume", True):
             pass
@@ -367,7 +413,7 @@ def check_settings_guard():
     drift = dict(live, GroupRatio=json.dumps({"default": 1.3, "free": 0}))
     c = _FakeOptionClient(drift)
     try:
-        with st.SettingsAdmin(c, **quiet).temporary_json_member("GroupRatio", "free", 1):
+        with st.SettingsAdmin(c, target="stg", **quiet).temporary_json_member("GroupRatio", "free", 1):
             pass
     except st.SettingsRefused:
         pass
@@ -376,12 +422,64 @@ def check_settings_guard():
     assert not c.puts
     # clean -> flip, then the declared value comes back (never {})
     c = _FakeOptionClient(live)
-    sa = st.SettingsAdmin(c, **quiet)
+    sa = st.SettingsAdmin(c, target="stg", **quiet)
     with sa.temporary_json_member("GroupRatio", "free", 1):
         assert json.loads(c.live["GroupRatio"])["free"] == 1
         assert json.loads(c.live["GroupRatio"])["default"] == 1.3, "the member flip dropped the other groups"
     assert st.NA.same(declared["GroupRatio"], c.live["GroupRatio"]), "not restored to the declared value"
     assert sa.flipped == ["GroupRatio"]
+    assert len(c.puts) == 2 and c.status_calls == 5, "status must be checked before option read and both PUTs"
+
+    # The target changes after the temporary flip; restore must refuse its PUT and retain the note.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as note_dir:
+        c = _FakeOptionClient(live, fail_after_write=True)
+        sa = st.SettingsAdmin(c, target="stg", note_dir=note_dir, **quiet)
+        try:
+            with sa.temporary("quota_setting.enable_free_model_pre_consume", True):
+                pass
+        except RuntimeError as e:
+            assert "simulated response loss" in str(e), f"original PUT error was not propagated: {e}"
+        else:
+            raise AssertionError("a failed initial PUT did not propagate its original error")
+        assert len(c.puts) == 2, "the ambiguous initial PUT was not followed by a restore attempt"
+        assert st.NA.same(declared["quota_setting.enable_free_model_pre_consume"],
+                          c.live["quota_setting.enable_free_model_pre_consume"]), \
+            "the restore after an ambiguous PUT did not return the declared value"
+        assert sa.flipped == ["quota_setting.enable_free_model_pre_consume"]
+        assert not os.listdir(note_dir), "restore note remained after the guarded restore succeeded"
+
+    with tempfile.TemporaryDirectory() as note_dir:
+        c = _FakeOptionClient(live, statuses=["https://newapi-stg.woowtech.io",
+                                               "https://newapi-stg.woowtech.io",
+                                               "https://newapi.woowtech.io"])
+        sa = st.SettingsAdmin(c, target="stg", note_dir=note_dir, **quiet)
+        try:
+            with sa.temporary("quota_setting.enable_free_model_pre_consume", True):
+                pass
+        except st.SettingsRefused:
+            pass
+        else:
+            raise AssertionError("flipped after the staging identity changed before the first PUT")
+        assert not c.puts and not sa.flipped, "a PUT or flip record was made after preflight refusal"
+        assert not os.listdir(note_dir), "a restore note remained although no flip occurred"
+
+    with tempfile.TemporaryDirectory() as note_dir:
+        c = _FakeOptionClient(live, statuses=["https://newapi-stg.woowtech.io",
+                                               "https://newapi-stg.woowtech.io",
+                                               "https://newapi-stg.woowtech.io",
+                                               "https://newapi.woowtech.io"])
+        sa = st.SettingsAdmin(c, target="stg", note_dir=note_dir, **quiet)
+        try:
+            with sa.temporary("quota_setting.enable_free_model_pre_consume", True):
+                pass
+        except AssertionError as e:
+            assert "RESTORE FAILED" in str(e), f"unexpected restore failure: {e}"
+        else:
+            raise AssertionError("restored after the staging identity changed")
+        assert len(c.puts) == 1, "a second PUT went out after the staging identity changed"
+        assert os.listdir(note_dir), "restore note was removed despite a refused restore"
 
 
 def check_report():
