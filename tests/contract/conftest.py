@@ -355,7 +355,8 @@ def settings_admin(cfg, newapi_base, budget, request):
             pat = load_pat(cfg.settings_pat_file, "settings PAT")
         except ConfigError as e:
             pytest.exit(str(e), returncode=3)
-        st.settings = SettingsAdmin(newapi.Client(newapi_base, token=pat, budget=budget), notify=st.note)
+        st.settings = SettingsAdmin(newapi.Client(newapi_base, token=pat, budget=budget), target="stg",
+                                    notify=st.note)
     return st.settings
 
 

@@ -26,11 +26,13 @@ option:read+option:write), never the general admin PAT.
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
 import sys
 import tempfile
 import time
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -61,15 +63,48 @@ class SettingsRefused(AssertionError):
 
 
 class SettingsAdmin:
-    def __init__(self, client, notify=None, note_dir=None):
+    def __init__(self, client, target=None, notify=None, note_dir=None):
         self.c = client
+        self.target = target
         self.declared = NA.load_layers(list(SETTINGS_FILES))
         self.notify = notify or (lambda msg: print(msg, file=sys.__stderr__, flush=True))
         self.note_dir = note_dir or tempfile.gettempdir()
         self.flipped = []  # keys flipped this run (report)
 
+    def _check_target(self):
+        if self.target != "stg":
+            raise SettingsRefused(f"settings target must be explicitly 'stg' (got {self.target!r}): refusing to write")
+        base = getattr(self.c, "base", None)
+        direct_target = NA.target_of(base)
+        if direct_target == "prod":
+            raise SettingsRefused("settings client points directly at production: refusing to write")
+        if direct_target is not None and direct_target != self.target:
+            raise SettingsRefused(f"settings client target {direct_target!r} does not match {self.target!r}")
+        if direct_target is None:
+            try:
+                host = urllib.parse.urlsplit(base or "").hostname
+                is_loopback = (host in ("localhost", "::1")
+                               or (host is not None and ipaddress.ip_address(host).is_loopback))
+            except ValueError:
+                is_loopback = False
+            if not is_loopback:
+                raise SettingsRefused("settings client has an unknown non-loopback origin: refusing to write")
+
+        try:
+            r = self.c.get("/api/status")
+            data = r.data
+            address = data.get("server_address") if isinstance(data, dict) else None
+            valid = r.status == 200 and r.success is True and isinstance(data, dict)
+        except Exception as e:  # transport/client errors must fail closed
+            raise SettingsRefused(f"GET /api/status failed ({type(e).__name__}): refusing to access options") from None
+        if not valid:
+            raise SettingsRefused("GET /api/status failed or returned an invalid response: refusing to access options")
+        if NA.target_of(address) != self.target:
+            raise SettingsRefused("GET /api/status does not identify the declared staging target: refusing to access options")
+
     # -- reads ---------------------------------------------------------- #
     def live(self):
+        self._check_target()
         r = self.c.get("/api/option/")
         if r.status != 200 or r.success is not True or not isinstance(r.data, list):
             raise SettingsRefused(f"GET /api/option/ failed (HTTP {r.status}, code {r.code}): refusing to flip")
@@ -94,6 +129,7 @@ class SettingsAdmin:
 
     # -- writes --------------------------------------------------------- #
     def _put(self, key, value):
+        self._check_target()
         r = self.c.put("/api/option/", {"key": key, "value": NA.wire(value)})
         if r.success is not True:
             raise AssertionError(f"PUT /api/option/ {key} failed (HTTP {r.status}, {r.message_key or r.code})")
@@ -111,19 +147,33 @@ class SettingsAdmin:
             self._put(key, declared)
             if not NA.same(declared, self.live().get(key, "")):
                 raise AssertionError("read-back differs")
-        except AssertionError as e:
+        except Exception as e:
             raise AssertionError(
                 f"RESTORE FAILED for {key} on new-api-stg ({e}). Run now: {restore_command()}") from None
 
     @contextlib.contextmanager
     def _flip(self, key, new_value):
         declared = self._check_declared(key)
+        self._check_target()
         note = self._write_note(key, declared)
         self.notify(f"\n[contract] flipping {key} on new-api-stg; restore note {note}\n"
                     f"[contract] if this run dies, restore with: {restore_command()}\n")
         self.flipped.append(key)
         try:
             self._put(key, new_value)
+        except SettingsRefused:
+            # The preflight proves no PUT was attempted; do not claim a flip or
+            # run a restore PUT for a value we did not change.
+            self.flipped.pop()
+            os.unlink(note)
+            raise
+        except BaseException:
+            # The request may have reached new-api even if its response failed.
+            # Keep the note until a guarded restore proves the declared value.
+            self._restore(key, declared)
+            os.unlink(note)
+            raise
+        try:
             yield
         finally:
             self._restore(key, declared)
