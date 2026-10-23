@@ -890,9 +890,25 @@ class TestProdDenyOnly(Base):
         self.assertEqual(rc, 0)
         rc, _, _ = self.run_tool("call", "GET", "/api/status", target="prod")
         self.assertEqual(rc, 0)
+        rc, _, _ = self.run_tool("call", "GET", "/api/option/", target="prod")
+        self.assertEqual(rc, 0)
         self.run_tool("apply-channels", "--dry-run", target="prod")
         self.assertTrue(self.calls("GET", "/api/channel/"))
         self.assertEqual(self.writes(), [])
+
+    def test_production_raw_get_requires_known_read_only_path(self):
+        for target in ("prod", "stg", None):
+            with self.subTest(target=target):
+                self.fake.requests.clear()
+                rc, _, err = self.run_tool("call", "GET", "/api/user/aff", target=target)
+                self.assertEqual(rc, 2)
+                self.assertIn("production raw GET", err)
+                self.assertEqual(self.calls("GET", "/api/user/aff"), [])
+        for path in ("/api/status?mode=write", "/api/option/../user/aff"):
+            with self.subTest(path=path):
+                rc, _, err = self.run_tool("call", "GET", path, target="prod")
+                self.assertEqual(rc, 2)
+                self.assertIn("production raw GET", err)
 
     def test_unknown_server_address_is_not_a_prod_bypass(self):
         self.fake.status["server_address"] = "http://localhost:3000"
@@ -905,9 +921,20 @@ class TestProdDenyOnly(Base):
         rc, _, err = self.run_tool("--base", self.base, "--creds", self.creds(url=PROD),
                                    "apply-settings", SETTINGS, auth=False, target="prod")
         self.assertEqual(rc, 2)
-        self.assertIn("production writes are disabled", err)
+        self.assertIn("production access requires --token-file", err)
         self.assertEqual(self.calls("POST", "/api/user/login"), [])
         self.assertEqual(self.writes(), [])
+
+    def test_production_read_rejects_password_session_creation(self):
+        for command in (("get-options", "GroupRatio"), ("apply-channels", "--dry-run")):
+            with self.subTest(command=command):
+                self.fake.requests.clear()
+                rc, _, err = self.run_tool("--base", self.base, "--creds", self.creds(url=PROD),
+                                           *command, auth=False, target=None)
+                self.assertEqual(rc, 2)
+                self.assertIn("production access requires --token-file", err)
+                self.assertEqual(self.calls("POST", "/api/user/login"), [])
+                self.assertEqual(self.writes(), [])
 
 
 class TestChannels(Base):
