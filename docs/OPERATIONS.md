@@ -2,6 +2,8 @@
 
 適用：release `newapi`、namespace `new-api`、網址 <https://newapi.woowtech.io>。
 
+> **NA-04 正式寫入暫停中：** `newapi_admin.py --target prod` 只允許使用 PAT 的唯讀操作；`apply-settings`、`apply-pricing`、非 dry-run 的 `apply-channels` 及任何非 GET 的 `call` 一律在寫入前拒絕，原始 GET 也限 `/api/status`、`/api/option/`、`/api/pricing`、`/api/channel/` 四條已確認唯讀路徑，沒有覆寫參數。正式站即使尚未開 2FA 也禁止 `--creds`，以免登入產生 session。下方正式套用與回滾命令是尚未開放的流程紀錄，不能照抄執行。須先有負責人／法務定稿、AI 分頁公告、全體受影響者可信寄信回執、七天成熟、現價與受眾重核，以及覆蓋 console／直接 API／其他腳本的全寫入者互鎖，再另行審核受信任的寫入流程。這支 CLI 的拒絕只保護它自己，不代表服務端已有互鎖；staging 寫入與正式唯讀對帳仍可使用。
+
 ## 機密資料放哪裡
 
 | 東西 | 位置 | 注意 |
@@ -28,11 +30,10 @@ scripts/cf-tunnel.sh tunnel                # tunnel woow-k3s-new-api + ingress +
 helm upgrade --install newapi ./chart -n new-api -f deploy/woow-k3s.yaml --wait
 kubectl -n new-api port-forward svc/newapi 3300:3000 &
 NEWAPI_ROOT_USER=<管理員帳號> NEWAPI_PUBLIC_URL=https://newapi.woowtech.io scripts/bootstrap-root.sh http://127.0.0.1:3300
-A="scripts/newapi_admin.py --base http://127.0.0.1:3300 --creds ~/.config/newapi/root-credentials --target prod"   # 只有開 2FA 之前能用密碼
-$A apply-settings deploy/settings.json
-$A apply-pricing
-$A apply-channels --key-alias newapi-litellm --key-file <LiteLLM 金鑰的 0600 檔>   # 或 --key-file - 從 stdin
-$A verify-settings deploy/settings.json
+A="scripts/newapi_admin.py --base http://127.0.0.1:3300 --token-file ~/.config/newapi/pat-ops --target prod"   # 先由負責人建立唯讀 PAT
+# 正式設定／價格／渠道套用目前被 CLI 拒絕；通過 NA-04 核可流程前不得執行。
+$A get-options --snapshot ~/.config/newapi-backups/prod-before-<日期>.json
+$A verify-settings deploy/settings.json  # 唯讀；套用前預期會報出差異
 helm test newapi -n new-api
 scripts/cf-tunnel.sh dns                   # 這一步之後網址才對外
 kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放行 new-api
@@ -40,11 +41,11 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
 
 `/api/setup` 是匿名、先到先得：**DNS 必須在 bootstrap-root.sh 之後才建。**
 
-全新安裝的 `ServerAddress` 還是預設值，工具認不出是哪個站，寫入時就以 `--target` 為準（畫面會印 `not a known site: a fresh install?`）；`apply-settings deploy/settings.json` 套用後它就認得 prod。
+全新安裝的 `ServerAddress` 還是預設值，工具認不出是哪個站；即使指定 `--target prod`，目前正式寫入仍被拒絕。第一次安裝的後續設定必須等受信任的正式流程完成。
 
 ## 設定即程式碼
 
-系統選項、價格與渠道都以本 repo 為準：改設定請改檔案再套用，不要只在後台點。
+系統選項、價格與渠道都以本 repo 為準；目前只可在 staging 套用，正式站先做唯讀對帳。不要在後台繞過正式寫入暫停點。
 
 | 檔案 | 內容 | 套用 |
 |---|---|---|
@@ -61,18 +62,18 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
 - 關閉 JS 任務外掛（外掛讀得到渠道 key）
 - 加價、免費試用分組、限流與顯示單位：見〈PaaS 依賴的設定不變量〉
 
-### 用 PAT 操作（root 開了 2FA 之後唯一的方式）
+### 用 PAT 操作（正式站一律如此）
 
-root 開 2FA 之後，密碼登入會停在二次驗證，`--creds` 就不能用了。`newapi_admin.py --token-file` 改用 root 的個人存取權杖（PAT），完全不走密碼登入。
+正式站即使 root 尚未開 2FA，CLI 也拒絕 `--creds`，因為登入會建立 session 並消耗發行額度。root 開 2FA 後密碼登入本身也會停在二次驗證。`newapi_admin.py --token-file` 使用 root 的個人存取權杖（PAT），不走密碼登入。
 
 1. 瀏覽器以 root 登入 → 個人設定 → 存取權杖 → 新增：名稱例如 `ops-<日期>`、**1 天到期**（N21），只勾這次要用的權限：
 
    | 指令 | 權限 |
    |---|---|
    | `get-options`、`verify-settings` | `option:read` |
-   | `apply-settings`、`apply-pricing` | `option:read`、`option:write` |
+   | `apply-settings`、`apply-pricing`（目前僅 staging 可執行） | `option:read`、`option:write` |
    | `apply-channels --dry-run`（渠道漂移檢查） | `channel:read` |
-   | `apply-channels` | `channel:read`、`channel:sensitive_write`（加 `--update` 時再加 `channel:write`；`--rekey` 兩個都要） |
+   | `apply-channels`（目前僅 staging 可執行） | `channel:read`、`channel:sensitive_write`（加 `--update` 時再加 `channel:write`；`--rekey` 兩個都要） |
 
 2. 權杖只顯示一次，直接存成 0600 檔（不進 shell history、不印在畫面上）。工具只接受權限 0600、內容只有一行 `nap_…` 的檔案：
 
@@ -86,8 +87,8 @@ root 開 2FA 之後，密碼登入會停在二次驗證，`--creds` 就不能用
    kubectl -n new-api port-forward svc/newapi 3300:3000 &
    A="scripts/newapi_admin.py --base http://127.0.0.1:3300 --token-file ~/.config/newapi/pat-ops --target prod"
    $A get-options --snapshot ~/.config/newapi-backups/prod-before-$(date +%Y%m%d-%H%M).json   # 回滾依據
-   $A apply-settings deploy/settings.json     # stg（--target stg）：deploy/settings.json deploy/settings-stg.json
-   $A verify-settings deploy/settings.json    # exit 0 才算完成
+   # 正式站 apply-settings／apply-pricing／apply-channels 目前全部被拒絕。
+   $A verify-settings deploy/settings.json    # 唯讀；未套用時差異是預期結果
    ```
 
 4. 做完到個人設定撤掉這把 PAT（或等它 1 天後自動過期），再 `shred -u ~/.config/newapi/pat-ops`。
@@ -101,6 +102,8 @@ root 開 2FA 之後，密碼登入會停在二次驗證，`--creds` 就不能用
 - 密碼登入每次都會開一個 new-api 登入 session；工具結束時（成功或失敗）用 `DELETE /api/user/sessions/<sid>` 撤掉。rc.44 每個帳號最多 50 個有效 session、24 小時內最多發 100 個（`service/auth_session.go`；撤掉只減少有效數，不減少發出數），超過就是 409 `AUTH_SESSION_LIMIT`／429 `AUTH_SESSION_ISSUANCE_LIMIT`，root 連後台都登不進去。stg 常跑的檢查請用 PAT（〈staging〉）。
 
 各指令的細節：
+
+以下 `apply-*` 與非 GET `call` 的正式站說明保留作為未來流程參考；目前 CLI 一律拒絕，回滾也須先由負責人走獨立核准的事故程序。`--target stg` 的既有開發／驗證流程不受影響。
 
 - `get-options --snapshot <檔>`：寫出 0600 的 JSON（`{key: 現值}` 加上 `_snapshot` 中繼資料：主機、版本、`ServerAddress`、濾掉的 key），不覆寫既有檔、拒絕寫進本 repo。token、secret、key 類的值不會出現：伺服器端 GetOptions 本來就不回（`controller/option.go`），工具再依 key 名稱與值的樣子過濾一次，濾掉的 key 列在 `_snapshot.redacted`。`CompletionRatioMeta`（計算值）與 `group_ratio_setting.group_ratio`、`group_ratio_setting.group_group_ratio`（rc.44 啟動時匯出的內建預設值）一律不進快照，列在 `_snapshot.excluded`，`apply-settings` 也拒絕任何含有這兩個 key 的檔案：它們和實際生效的分組倍率是同一份 map，寫入其中一個會把生效中的加價換成 `{"default":1,…}`、拿掉 free 分組並存進 DB，`GroupRatio` 選項卻還顯示 1.3（`setting/ratio_setting/group_ratio.go:31-49`）。檢查金鑰外洩要用 `grep -cP '(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20}' <檔>` 與 `grep -c 'nap_' <檔>`（LiteLLM 金鑰含 `-`、`_`），不要只 grep `sk-`：new-api 內建的 `SparkDesk-*` 模型名稱含 `sk-` 字樣，單純 `grep sk-` 會有 1 行。
 - **回滾**：快照本身就是設定檔。照 `deploy/settings.json` 的 key 全部寫回：`$A apply-settings --only-keys-of deploy/settings.json <快照>`（快照裡沒有的 key，例如之後才加進 settings.json 的，印 `skip` 跳過，不會中止）；只還原幾個：`$A apply-settings --only ModelRequestRateLimitCount,GroupRatio <快照>`。兩者都不給會被拒絕（不要把 200 多個選項整包寫回）。`apply-settings --snapshot <檔>` 會先快照、再套用。NA-04 套用後要整個退回：
@@ -117,8 +120,8 @@ root 開 2FA 之後，密碼登入會停在二次驗證，`--creds` 就不能用
 - **渠道漂移檢查**：`verify-settings` 不讀渠道設定（`param_override` 的 `max_tokens` 上限、base URL、免費渠道是否存在），所以和 `verify-settings` 一起跑 `$A apply-channels --dry-run`（只要 `channel:read`；exit 0 才算一致）。
 - `verify-settings`：唯讀，只發三個請求（匿名 `/api/status`、`GET /api/option/`、`GET /api/pricing`，都在 GA 桶，不吃 CT 桶）。比對設定檔每個 key 的現值、〈PaaS 依賴的設定不變量〉、plan 的倍率（以及沒有固定價格、沒有 `billing_setting.billing_mode` 計費公式蓋過 plan 的模型），以及各分組實際提供哪些模型、價格是否大於 0；任何一項不符 exit 1，只印 key 名稱與值，不印任何憑證；`-v` 連通過的也列出、`--no-plan` 略過 plan 的價格與渠道比對。`--offline` 只檢查檔案本身與 `chart/values.yaml` 的版本釘選（CI 每個 PR 都跑）。
 - `call METHOD PATH [JSON]`：輸出預設遮罩（像金鑰的值，以及名稱是 token、secret、password、api_key、key 的欄位）；`--raw` 才原樣印出，會先在 stderr 警告。非 GET 一樣要 `--target`。
-- 調價（`GroupRatio` 或 plan 的倍率）一樣走 PR：改檔 → `apply-settings`／`apply-pricing` → `verify-settings`。加價屬於 PaaS 依賴的值，先照下一節通知 PaaS。
-- 密碼登入（`--creds`）只剩第一次安裝（開 2FA 之前）與 stg（root 刻意不開 2FA）能用；root 有 2FA 時工具會提示改用 `--token-file`。
+- 調價（`GroupRatio` 或 plan 的倍率）目前只可在 PR 與 staging 驗證；正式站的 `apply-settings`／`apply-pricing` 被 deny-only 守門拒絕。未來的正式寫入須先完成公告、逐人寄信、七天成熟和獨立全寫入者互鎖，再由負責人另行核可；`verify-settings` 仍可唯讀執行。
+- 密碼登入（`--creds`）只允許 staging（root 刻意不開 2FA）使用；正式站不論 2FA 狀態皆須 `--token-file`。原始 `call GET` 對正式站只允許上述四條已確認唯讀 API，避免有寫入副作用的 GET。
 
 ## PaaS 依賴的設定不變量
 

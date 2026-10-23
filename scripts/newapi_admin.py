@@ -3,6 +3,8 @@
 
 Nothing has a default target: every command that talks to a server needs
 --base and one credential, and every write also needs --target.
+Production mutations are disabled until the approved price-notice gate and
+all-writer interlock exist. This client currently permits only production reads.
 
   --base URL         the new-api origin itself, e.g. a port-forward
                      http://127.0.0.1:3301. Plain http only to 127.0.0.1, ::1
@@ -16,11 +18,12 @@ Nothing has a default target: every command that talks to a server needs
                        apply-channels --dry-run       channel:read
                        apply-channels                 channel:read + channel:sensitive_write
                                                       (+ channel:write with --update)
-  --creds FILE       0600 file with url= / username= / password= lines: root
-                     password login, only while root has no 2FA (staging; first
-                     install). The password is refused when url= names another
-                     site than the server at --base. The login session is
-                     revoked when the command ends.
+  --creds FILE       0600 file with url= / username= / password= lines: staging
+                     root password login while root has no 2FA. Production
+                     refuses password login, including for reads, because it
+                     creates a session. The password is refused when url=
+                     names another site than the server at --base. The login
+                     session is revoked when the command ends.
   --target stg|prod  required by every write; checked against the server's
                      ServerAddress (anonymous /api/status) and a public --base.
 
@@ -32,7 +35,7 @@ Commands:
   apply-channels [--dry-run] [--update [--rekey]] [--group G] [--with-internal]
                  [--key-alias A --key-file F | --key-env VAR]
                  [--free-key-alias A --free-key-file F | --free-key-env VAR]
-  call [--raw] METHOD PATH [JSON]
+  call [--raw] METHOD PATH [JSON] (production GET limited to four known read routes)
 
 Credentials are never printed or written anywhere; values that look like
 credentials are masked in every output (`call --raw` opts out).
@@ -64,6 +67,7 @@ DEFAULT_CHART_VALUES = os.path.join(REPO, "chart", "values.yaml")
 # (deploy/settings.json, deploy/settings-stg.json; a unit test keeps them equal).
 TARGET_URLS = {"prod": "https://newapi.woowtech.io", "stg": "https://newapi-stg.woowtech.io"}
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+PROD_RAW_GET_PATHS = frozenset(("/api/status", "/api/option/", "/api/pricing", "/api/channel/"))
 
 PAT_RE = re.compile(r"nap_[A-Za-z0-9_-]{16,256}")
 UPSTREAM_KEY_RE = re.compile(r"sk-[A-Za-z0-9_-]{16,256}")
@@ -258,6 +262,8 @@ def client_from_args(a):
         _require_private(path, "credentials")
         creds = read_creds(path)
         c = Client(a.base, creds=creds)
+        if is_production_target(c, a):
+            raise Fatal("production access requires --token-file; password login creates a session")
         guard_password(c, creds, a.target)
     else:
         raise Fatal("no credentials: pass --token-file (a root PAT) or --creds (root password; only before 2FA)")
@@ -296,6 +302,19 @@ def require_target(c, a, writes, out=None):
     if by_base and by_base != a.target:
         raise Fatal(f"--target {a.target}, but --base is the {by_base} URL: refusing to write")
     return a.target
+
+
+def is_production_target(c, a):
+    """Recognize a stated or anonymously identified production origin."""
+    return (a.target == "prod" or target_of(c.base) == "prod"
+            or target_of(c.status().get("server_address")) == "prod")
+
+
+def deny_prod_write(target):
+    """NA-04 brake: no production mutation through this client before GA evidence."""
+    if target == "prod":
+        raise Fatal("production writes are disabled until the approved price-notice gate "
+                    "and all-writer interlock are implemented; use read-only commands")
 
 
 def get_options(c):
@@ -977,6 +996,7 @@ def cmd_apply_settings(a):
     if "ServerAddress" in settings and target_of(settings["ServerAddress"]) != target:
         raise Fatal(f"the files set ServerAddress {settings['ServerAddress']!r}, not the {target} URL "
                     f"{TARGET_URLS[target]}" + (": staging layers deploy/settings-stg.json on top" if target == "stg" else ""))
+    deny_prod_write(target)
     if a.snapshot:
         take_snapshot(c, a.snapshot)
     failed = 0
@@ -998,7 +1018,8 @@ def cmd_apply_pricing(a):
     markup lives in GroupRatio) and drop fixed prices for plan models."""
     plan = load_json(a.plan)
     c = client_from_args(a)
-    require_target(c, a, writes=True)
+    target = require_target(c, a, writes=True)
+    deny_prod_write(target)
     opts = get_options(c)
     os.makedirs(a.backup_dir, mode=0o700, exist_ok=True)
     host = re.sub(r"[^A-Za-z0-9.-]+", "_", c.base.split("//", 1)[-1])
@@ -1178,6 +1199,8 @@ def cmd_apply_channels(a):
     selected = select_channels(spec, a.group, a.with_internal)
     c = client_from_args(a)
     target = require_target(c, a, writes=not a.dry_run)
+    if not a.dry_run:
+        deny_prod_write(target)
     label = a.label or target or "?"
     have = {}
     for ch in list_channels(c):
@@ -1257,7 +1280,10 @@ def cmd_apply_channels(a):
 def cmd_call(a):
     c = client_from_args(a)
     if a.method.upper() != "GET":
-        require_target(c, a, writes=True, out=sys.stderr)  # stdout stays JSON
+        target = require_target(c, a, writes=True, out=sys.stderr)  # stdout stays JSON
+        deny_prod_write(target)
+    elif is_production_target(c, a) and a.path not in PROD_RAW_GET_PATHS:
+        raise Fatal("production raw GET is limited to known read-only endpoints")
     body = json.loads(a.json) if a.json else None
     if a.path.rstrip("/") == "/api/option" and isinstance(body, dict) and body.get("key") in NEVER_WRITE:
         raise Fatal(f"{body['key']} must never be written (on rc.44 it replaces the live group ratios)")
