@@ -173,17 +173,92 @@ class ReadAPI:
         raise Failure('pagination_unproven')
 
 
+def public_uri(value):
+    """Parse the deliberately narrow hostname/path subset used by preflight."""
+    require(isinstance(value, str) and 0 < len(value) <= 512, 'access_destination_unknown')
+    require(value.isascii() and not any(c in value for c in ('\\', '%', '?', '#', '@')),
+            'access_destination_unknown')
+    if value.startswith('https://'):
+        value = value[len('https://'):]
+    require('://' not in value and not value.startswith('//'), 'access_destination_unknown')
+    hostname, slash, path = value.partition('/')
+    require(hostname and not hostname.startswith('.') and not hostname.endswith('.')
+            and '..' not in hostname and re.fullmatch(r'[A-Za-z0-9.*-]+', hostname),
+            'access_destination_unknown')
+    for label in hostname.lower().split('.'):
+        require(label and re.fullmatch(r'[a-z0-9*-]+', label)
+                and (('*' in label) or (len(label) <= 63 and not label.startswith('-')
+                                         and not label.endswith('-'))),
+                'access_destination_unknown')
+    require(not slash or (path and re.fullmatch(r'[A-Za-z0-9._~/*-]+', path)
+                          and '//' not in path
+                          and all(segment not in ('.', '..') for segment in path.split('/'))),
+            'access_destination_unknown')
+    return hostname.lower() + ('/' + path if slash else '')
+
+
+def application_destinations(app):
+    """Return URI patterns, override state, schema generation, and primary domain."""
+    if 'destinations' in app:
+        destinations = app['destinations']
+        require(isinstance(destinations, list) and destinations, 'access_destination_unknown')
+        uris, has_override = [], False
+        for destination in destinations:
+            require(isinstance(destination, dict)
+                    and set(destination) <= {'type', 'uri', 'overrides'}
+                    and destination.get('type') == 'public', 'access_destination_unknown')
+            uri = public_uri(destination.get('uri'))
+            uris.append(uri)
+            if 'overrides' in destination:
+                overrides = destination['overrides']
+                require(isinstance(overrides, list), 'access_destination_unknown')
+                for override in overrides:
+                    require(isinstance(override, dict)
+                            and set(override) == {'behavior', 'path_pattern'}
+                            and override.get('behavior') == 'public'
+                            and isinstance(override.get('path_pattern'), str)
+                            and re.fullmatch(r'/[A-Za-z0-9._~/*-]*', override['path_pattern'])
+                            and '//' not in override['path_pattern']
+                            and all(part not in ('.', '..')
+                                    for part in override['path_pattern'].split('/')),
+                            'access_destination_unknown')
+                    has_override = True
+        domain = app.get('domain')
+        primary_domain = None if domain is None else public_uri(domain)
+        return uris, has_override, True, primary_domain
+
+    domain = app.get('domain')
+    require(domain is None or isinstance(domain, str), 'access_destination_unknown')
+    domains = []
+    if domain:
+        domains.append(public_uri(domain))
+    legacy = app.get('self_hosted_domains', [])
+    require(isinstance(legacy, list) and all(isinstance(item, str) for item in legacy),
+            'access_destination_unknown')
+    domains.extend(public_uri(item) for item in legacy)
+    return domains, False, False, None
+
+
 def overlaps(domain):
-    # Conservative matching. Unknown/multi-destination apps are never ignored.
+    # Path is ignored conservatively; every host wildcard is tested against HOST.
     hostname = domain.split('/', 1)[0].lower()
     return fnmatch.fnmatchcase(HOST, hostname)
 
 
 def check_application(actual, target, policies):
-    require(actual.get('type') == 'self_hosted' and actual.get('domain') == target['domain']
+    require(actual.get('type') == 'self_hosted'
             and actual.get('session_duration') == target['session_duration'], 'access_drift')
-    require(not actual.get('destinations')
-            and actual.get('self_hosted_domains', []) in ([], [target['domain']]), 'access_extra_destinations')
+    domains, has_override, modern, primary_domain = application_destinations(actual)
+    if modern:
+        require(len(domains) == 1 and domains[0] == target['domain'] and not has_override,
+                'access_extra_destinations')
+        # destinations supersedes self_hosted_domains, but not the primary domain.
+        require(primary_domain is None or primary_domain == target['domain'],
+                'access_extra_destinations')
+    else:
+        require(actual.get('domain') == target['domain']
+                and actual.get('self_hosted_domains', []) in ([], [target['domain']]),
+                'access_extra_destinations')
     require(not actual.get('options_preflight_bypass') and not actual.get('service_auth_401_redirect'), 'access_bypass_drift')
     require(len(policies) == 1, 'access_policy_drift')
     policy, expected = policies[0], target['policies'][0]
@@ -274,15 +349,22 @@ def preflight(cfg, api, expected_origin=None):
         prefix = '/' + scope + '/' + identity + '/access/apps'
         for app in api.listing(prefix):
             require(isinstance(app, dict), 'invalid_api_schema')
-            domains = [app.get('domain', '')] + (app.get('self_hosted_domains') or [])
-            require(not app.get('destinations'), 'access_destinations_need_review')
-            if any(overlaps(domain) for domain in domains):
+            domains, _, modern, primary_domain = application_destinations(app)
+            # destinations replaces self_hosted_domains, while a modern primary
+            # domain remains an independent conservative overlap signal.
+            overlap_domains = list(dict.fromkeys(
+                domains + ([primary_domain] if modern and primary_domain is not None else [])))
+            if any(overlaps(domain) for domain in overlap_domains):
                 apps.append((prefix, app))
     require(len(apps) == 2, 'access_overlap_or_missing')
-    require(sorted(app['domain'] for _, app in apps) == sorted(a['domain'] for a in want['applications']),
-            'access_overlap_or_missing')
+    matched_ids = set()
     for target in want['applications']:
-        prefix, app = next((p, a) for p, a in apps if a['domain'] == target['domain'])
+        matches = [(p, a) for p, a in apps
+                   if target['domain'] in application_destinations(a)[0]]
+        require(len(matches) == 1 and id(matches[0][1]) not in matched_ids,
+                'access_overlap_or_missing')
+        prefix, app = matches[0]
+        matched_ids.add(id(app))
         require(isinstance(app.get('id'), str) and UUID.fullmatch(app['id']), 'invalid_api_schema')
         policies = api.listing(prefix + '/' + app['id'] + '/policies')
         check_application(app, target, policies)

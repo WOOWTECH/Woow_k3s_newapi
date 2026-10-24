@@ -136,10 +136,93 @@ class TestPlanAndPreflight(unittest.TestCase):
         with self.assertRaises(cf.Failure):
             cf.preflight(CFG, self.api, ORIGIN)
 
-    def test_unknown_app_destinations_require_manual_review(self):
-        self.api.apps[0]['destinations'] = [{'type': 'public', 'uri': 'other.example.test'}]
+    def test_unrelated_public_destinations_do_not_block_preflight(self):
+        self.api.zone_apps = [{'destinations': [
+            {'type': 'public', 'uri': 'docs.example.test/team'}]}]
+        self.assertEqual(cf.preflight(CFG, self.api, ORIGIN)['access_apps'], 2)
+
+    def test_destination_only_exact_targets_are_supported(self):
+        for app, target in zip(self.api.apps, cf.desired(CFG)['applications']):
+            app.pop('domain')
+            app['destinations'] = [{'type': 'public', 'uri': target['domain']}]
+        self.assertEqual(cf.preflight(CFG, self.api, ORIGIN)['access_apps'], 2)
+
+    def test_modern_primary_domain_overlap_and_empty_destinations_fail_closed(self):
+        cases = (
+            {'domain': cf.HOST, 'destinations': [
+                {'type': 'public', 'uri': 'unrelated.example.test'}]},
+            {'domain': cf.HOST, 'destinations': []},
+            {'domain': 'https://bad@unrelated.example.test', 'destinations': [
+                {'type': 'public', 'uri': 'another.example.test'}]},
+        )
+        for app in cases:
+            api = FixtureAPI()
+            api.zone_apps = [app]
+            with self.subTest(app=app), self.assertRaises(cf.Failure):
+                cf.preflight(CFG, api, ORIGIN)
+
+        api = FixtureAPI()
+        api.zone_apps = [{'domain': 'primary.example.test', 'destinations': [
+            {'type': 'public', 'uri': 'destination.example.test'}]}]
+        self.assertEqual(cf.preflight(CFG, api, ORIGIN)['access_apps'], 2)
+
+    def test_legacy_self_hosted_domains_remain_supported(self):
+        self.api.apps[0]['self_hosted_domains'] = [
+            cf.desired(CFG)['applications'][0]['domain']]
+        self.assertEqual(cf.preflight(CFG, self.api, ORIGIN)['access_apps'], 2)
+
+    def test_public_destination_overlap_wildcards_and_multiple_targets_fail(self):
+        for uri in ('*.woowtech.io/unrelated', 'newapi-*.woowtech.io/hidden',
+                    cf.HOST + '/unrelated/path'):
+            api = FixtureAPI()
+            api.zone_apps = [{'destinations': [{'type': 'public', 'uri': uri}]}]
+            with self.subTest(uri=uri), self.assertRaises(cf.Failure):
+                cf.preflight(CFG, api, ORIGIN)
+        api = FixtureAPI()
+        api.apps[0]['destinations'] = [
+            {'type': 'public', 'uri': cf.desired(CFG)['applications'][0]['domain']},
+            {'type': 'public', 'uri': 'another.example.test'}]
         with self.assertRaises(cf.Failure):
-            cf.preflight(CFG, self.api, ORIGIN)
+            cf.preflight(CFG, api, ORIGIN)
+
+    def test_public_destination_unknown_private_and_malformed_shapes_fail_closed(self):
+        cases = (
+            {'uri': cf.HOST},
+            {'type': 'worker', 'worker_id': 'worker'},
+            {'type': 'private', 'hostname': cf.HOST},
+            {'type': 'public'},
+            {'type': 'public', 'uri': ''},
+            {'type': 'public', 'uri': 'http://' + cf.HOST},
+            {'type': 'public', 'uri': 'https://user@' + cf.HOST},
+            {'type': 'public', 'uri': cf.HOST + '?next=evil'},
+            {'type': 'public', 'uri': cf.HOST + '/./private'},
+            {'type': 'public', 'uri': cf.HOST + '/%2e%2e/private'},
+            {'type': 'public', 'uri': cf.HOST, 'unexpected': True},
+        )
+        for destination in cases:
+            api = FixtureAPI()
+            api.apps[0]['destinations'] = [destination]
+            with self.subTest(destination=destination), self.assertRaises(cf.Failure):
+                cf.preflight(CFG, api, ORIGIN)
+
+    def test_public_destination_overrides_are_rejected(self):
+        api = FixtureAPI()
+        api.apps[0]['destinations'] = [{'type': 'public',
+            'uri': cf.desired(CFG)['applications'][0]['domain'],
+            'overrides': [{'behavior': 'public', 'path_pattern': '/api/*'}]}]
+        with self.assertRaises(cf.Failure):
+            cf.preflight(CFG, api, ORIGIN)
+
+    def test_destinations_take_precedence_over_legacy_domains(self):
+        target = cf.desired(CFG)['applications'][0]['domain']
+        self.api.apps[0]['destinations'] = [{'type': 'public', 'uri': target}]
+        self.api.apps[0]['self_hosted_domains'] = ['legacy-confusion.example.test']
+        self.assertEqual(cf.preflight(CFG, self.api, ORIGIN)['access_apps'], 2)
+        api = FixtureAPI()
+        api.apps[0]['destinations'] = [{'type': 'public', 'uri': 'elsewhere.example.test'}]
+        api.apps[0]['self_hosted_domains'] = [target]
+        with self.assertRaises(cf.Failure):
+            cf.preflight(CFG, api, ORIGIN)
 
     def test_waf_must_be_exact_enabled_block_and_first(self):
         for mutation in ('disabled', 'expression', 'skip_first', 'duplicate'):

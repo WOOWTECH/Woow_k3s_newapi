@@ -48,6 +48,10 @@ API 固定 `https://api.cloudflare.com/client/v4`，GET only，15 秒 timeout，
 
 核對 zone.id/name/account.id/status、指定 tunnel 與 team（細節如下）、所有 account＋zone apps 與逐頁 policy、WAF phase entrypoint、精確 hostname DNS。缺頁／無 pagination metadata／總數或每頁筆數矛盾／重複 ID、401/403/404、權限不足或未開通方案、重複或遮蔽 app、陌生多 destination app，一律非零退出。API schema 相容性與真 entitlement 尚未 live 驗證，不應為了綠燈跳過 zone scope、把空列表當完成或放寬 pagination。
 
+### Access public destinations 支援界線
+
+依 [Access applications list schema](https://developers.cloudflare.com/api/resources/zero_trust/subresources/access/subresources/applications/methods/list/)，`destinations` 存在時取代 `self_hosted_domains`。唯讀 preflight 接受明確 `type: "public"` 且有非空 URI 的 destination；URI 限 hostname/path（可選 `https://`），拒絕其他 scheme、credentials、port、query、fragment、編碼路徑及未知欄位。雖 schema 將 `type` 與 `uri` 標為 optional，本工具要求兩者，且拒絕空 destinations 清單，避免猜測 destination 類型。每個 public URI 與非 null 的 top-level `domain` 都必須可解析，並參與 hostname overlap 判定（忽略 path）；wildcard 也會保守比對 stg host。非相關 hostname 的合法 public destination 可存在；未知／private destination 或形狀不明仍 fail-closed。兩個 target app 必須各自只含一個精確預期 URI，top-level `domain` 必須為 null 或與 URI 相同，且沒有 public override；override 可繞過 Access。`self_hosted_domains` 在 destinations 存在時依官方規則忽略。這些界線由離線 mock tests 覆蓋；本次只查公開 schema，未登入 Cloudflare、未呼叫 Cloudflare API，未做 live schema／entitlement 驗證。
+
 ## Tunnel／team 補缺（離線測試，尚未 live 驗證）
 
 `--preflight` 現在必須明確指定 `--expected-origin`：經負責人獨立核對的
