@@ -1,11 +1,13 @@
 # Staging values for woow-k3s (release newapi, namespace new-api-stg).
-# Used by the PaaS "AI 模型" tab on staging; no public hostname yet
-# (cloudflared off), callers reach it in-cluster.
+# Used by the PaaS "AI 模型" tab on staging. The connector attaches to the
+# dormant staging tunnel, whose remote ingress is only http_status:404. No
+# origin route or DNS is added here. Do not publish the hostname until the
+# NA-06 Access and WAF gates are verified.
 #   helm upgrade --install newapi ./chart -n new-api-stg --create-namespace -f deploy/woow-k3s-stg.yaml
 publicUrl: https://newapi-stg.woowtech.io
 
 cloudflared:
-  enabled: false
+  enabled: true
 
 postgres:
   size: 5Gi
