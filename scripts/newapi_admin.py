@@ -3,8 +3,9 @@
 
 Nothing has a default target: every command that talks to a server needs
 --base and one credential, and every write also needs --target.
-Production mutations are disabled until the approved price-notice gate and
-all-writer interlock exist. This client currently permits only production reads.
+General production mutations are disabled until the approved price-notice gate
+and all-writer interlock exist. The sole bounded exception is display-settings
+--apply: two fixed display values, never prices, with before/after checks.
 
   --base URL         the new-api origin itself, e.g. a port-forward
                      http://127.0.0.1:3301. Plain http only to 127.0.0.1, ::1
@@ -15,6 +16,8 @@ all-writer interlock exist. This client currently permits only production reads.
                      2FA (production). Scopes per command:
                        get-options, verify-settings   option:read
                        apply-settings, apply-pricing  option:read + option:write
+                       display-settings               option:read (PAT only)
+                       display-settings --apply       option:read + option:write (PAT only)
                        apply-channels --dry-run       channel:read
                        apply-channels                 channel:read + channel:sensitive_write
                                                       (+ channel:write with --update)
@@ -29,6 +32,7 @@ all-writer interlock exist. This client currently permits only production reads.
 
 Commands:
   get-options [--snapshot OUT] [KEY ...]
+  display-settings [--apply] (PAT only; fixed CUSTOM / 32; default read-only)
   verify-settings [--offline] [--plan PLAN | --no-plan] [-v] FILE [FILE ...]
   apply-settings [--snapshot OUT] [--only KEY[,KEY...] | --only-keys-of FILE] FILE [FILE ...]
   apply-pricing [--plan PLAN] [--backup-dir DIR]
@@ -488,6 +492,13 @@ def take_snapshot(c, path, opts=None, keys=None):
 INVARIANTS_FOR_VERSION = "v1.0.0-rc.44"
 MARKUP = 1.3                  # DECISIONS D5: GroupRatio.default
 POINTS_PER_USD = 32           # DECISIONS D5: R, never changes
+# Narrow non-price repair. Set the exchange rate before selecting CUSTOM so
+# an old rate is not briefly used with the new display type. No caller input,
+# settings file, environment override or arbitrary option can enter this tuple.
+DISPLAY_SETTINGS = (
+    ("general_setting.custom_currency_exchange_rate", "custom_currency_exchange_rate", POINTS_PER_USD),
+    ("general_setting.quota_display_type", "quota_display_type", "CUSTOM"),
+)
 FREE_PER_MINUTE = 10          # DECISIONS D11: free-trial requests per minute
 USABLE_GROUPS = {"default", "free"}
 SPECIAL_USABLE_KEY = "group_ratio_setting.group_special_usable_group"
@@ -939,6 +950,105 @@ def cmd_verify_settings(a):
 
 # ----------------------------------------------------------- commands
 
+def _display_status(c, a):
+    """Require the reviewed server and all status invariants except the repair."""
+    try:
+        answer = c.req("GET", "/api/status", auth=False)
+    except Fatal:
+        raise Fatal("display-settings status read failed; upstream details withheld") from None
+    if not isinstance(answer, dict) or answer.get("success") is not True or not isinstance(answer.get("data"), dict):
+        raise Fatal("display-settings requires a successful status response")
+    status = answer["data"]
+    if status.get("server_address") not in (TARGET_URLS[a.target], TARGET_URLS[a.target] + "/"):
+        raise Fatal("display-settings requires a known ServerAddress matching --target")
+    exempt = {"status." + field for _, field, _ in DISPLAY_SETTINGS}
+    if any(problem for name, _, problem in check_status(status) if name not in exempt):
+        raise Fatal("display-settings requires rc.44 and matching non-display status invariants")
+    return status
+
+
+def _display_options(c):
+    try:
+        answer = c.req("GET", "/api/option/")
+    except Fatal:
+        raise Fatal("display-settings option read failed; upstream details withheld") from None
+    if not isinstance(answer, dict) or answer.get("success") is not True or not isinstance(answer.get("data"), list):
+        raise Fatal("display-settings requires a successful option response")
+    opts = {}
+    for entry in answer["data"]:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("key"), str)
+                or not isinstance(entry.get("value"), str) or entry["key"] in opts):
+            raise Fatal("display-settings requires unambiguous string-valued options")
+        opts[entry["key"]] = entry["value"]
+    if any(key not in opts for key, _, _ in DISPLAY_SETTINGS):
+        raise Fatal("display-settings requires both known display options in the option response")
+    return opts
+
+
+def cmd_display_settings(a):
+    """Plan or repair only two fixed display options; no broad prod permit."""
+    if a.target is None:
+        raise Fatal("display-settings requires --target stg|prod, including for a plan")
+    if not a.token_file or a.creds:
+        raise Fatal("display-settings requires --token-file; password sessions are not permitted")
+    c = client_from_args(a)
+    if (origin(c.base) != TARGET_URLS[a.target]
+            and urllib.parse.urlsplit(c.base).hostname not in LOOPBACK_HOSTS):
+        raise Fatal("display-settings --base must be the matching public origin or a loopback port-forward")
+    before_status = _display_status(c, a)
+    before = _display_options(c)
+    pending = [(key, field, value) for key, field, value in DISPLAY_SETTINGS
+               if not same(value, before[key]) or not deep_equal(value, before_status.get(field))]
+    report = {
+        "command": "display-settings", "target": a.target,
+        "mode": "apply" if a.apply else "plan", "version": INVARIANTS_FOR_VERSION,
+        "settings": [{"key": key, "desired": value,
+                      "option_matches": same(value, before[key]),
+                      "runtime_matches": deep_equal(value, before_status.get(field))}
+                     for key, field, value in DISPLAY_SETTINGS],
+        "would_write": [key for key, _, _ in pending], "attempted": [], "applied": [],
+    }
+    if not a.apply:
+        report["result"] = "plan"
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 0
+
+    # Retain only an in-memory baseline; no broad option dump/snapshot. Check
+    # every other visible option, including pricing, after the bounded writes.
+    display_keys = {key for key, _, _ in DISPLAY_SETTINGS}
+    baseline = {k: v for k, v in before.items() if k not in display_keys | SYNTHETIC_KEYS}
+    failure = None
+    for key, _, value in pending:
+        report["attempted"].append(key)
+        try:
+            answer = c.req("PUT", "/api/option/", {"key": key, "value": value}, allow_error=True)
+            if not isinstance(answer, dict) or answer.get("success") is not True:
+                failure = "display update rejected; stopped before any further write"
+                break
+            report["applied"].append(key)
+        except Fatal:
+            # A timeout can occur after the server committed. Do not retry or
+            # echo a potentially sensitive upstream response. Read back below.
+            failure = "display update outcome uncertain; stopped before any further write"
+            break
+    try:
+        after_status = _display_status(c, a)
+        after = _display_options(c)
+        report["remaining"] = [key for key, field, value in DISPLAY_SETTINGS
+                               if not same(value, after[key]) or not deep_equal(value, after_status.get(field))]
+        report["other_options_unchanged"] = (
+            baseline == {k: v for k, v in after.items() if k not in display_keys | SYNTHETIC_KEYS})
+        if report["remaining"] or not report["other_options_unchanged"]:
+            failure = failure or "readback failed; inspect current state before rerunning"
+    except Fatal:
+        failure = failure or "readback unavailable or target/status changed; inspect current state"
+    report["result"] = "failed" if failure else "verified"
+    if failure:
+        report["reason"] = failure
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 1 if failure else 0
+
+
 def cmd_get_options(a):
     c = client_from_args(a)
     opts = get_options(c)
@@ -1308,6 +1418,10 @@ def build_parser():
     p.add_argument("--snapshot", metavar="OUT")
     p.add_argument("keys", nargs="*")
     p.set_defaults(fn=cmd_get_options)
+
+    p = sub.add_parser("display-settings", help="plan two fixed display values; PAT only, no price writes")
+    p.add_argument("--apply", action="store_true", help="write only CUSTOM / 32 and verify; default is read-only")
+    p.set_defaults(fn=cmd_display_settings)
 
     p = sub.add_parser("verify-settings", help="check settings files, PaaS invariants, status, pricing")
     p.add_argument("files", nargs="+")

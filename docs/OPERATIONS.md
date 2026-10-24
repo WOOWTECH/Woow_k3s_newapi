@@ -2,7 +2,7 @@
 
 適用：release `newapi`、namespace `new-api`、網址 <https://newapi.woowtech.io>。
 
-> **NA-04 正式寫入暫停中：** `newapi_admin.py --target prod` 只允許使用 PAT 的唯讀操作；`apply-settings`、`apply-pricing`、非 dry-run 的 `apply-channels` 及任何非 GET 的 `call` 一律在寫入前拒絕，原始 GET 也限 `/api/status`、`/api/option/`、`/api/pricing`、`/api/channel/` 四條已確認唯讀路徑，沒有覆寫參數。正式站即使尚未開 2FA 也禁止 `--creds`，以免登入產生 session。下方正式套用與回滾命令是尚未開放的流程紀錄，不能照抄執行。須先有負責人／法務定稿、AI 分頁公告、全體受影響者可信寄信回執、七天成熟、現價與受眾重核，以及覆蓋 console／直接 API／其他腳本的全寫入者互鎖，再另行審核受信任的寫入流程。這支 CLI 的拒絕只保護它自己，不代表服務端已有互鎖；staging 寫入與正式唯讀對帳仍可使用。
+> **NA-04 正式一般寫入暫停中：** `newapi_admin.py --target prod` 的 `apply-settings`、`apply-pricing`、非 dry-run 的 `apply-channels` 及任何非 GET 的 `call` 一律在寫入前拒絕，原始 GET 也限 `/api/status`、`/api/option/`、`/api/pricing`、`/api/channel/` 四條已確認唯讀路徑，沒有覆寫參數。唯一限定例外是 `display-settings --apply`：只接受 PAT、已知目標與 rc.44，固定修正 `CUSTOM`／`32` 兩項顯示值，無法帶入任何價格設定，預設不加 `--apply` 只預覽；見 [NA04-DISPLAY-SETTINGS.md](NA04-DISPLAY-SETTINGS.md)。正式站即使尚未開 2FA 也禁止 `--creds`，以免登入產生 session。下方正式套用與回滾命令是尚未開放的流程紀錄，不能照抄執行。須先有負責人／法務定稿、AI 分頁公告、全體受影響者可信寄信回執、七天成熟、現價與受眾重核，以及覆蓋 console／直接 API／其他腳本的全寫入者互鎖，再另行審核受信任的調價流程。這支 CLI 的拒絕只保護它自己，不代表服務端已有互鎖；staging 寫入與正式唯讀對帳仍可使用。
 
 ## 機密資料放哪裡
 
@@ -72,6 +72,7 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
    |---|---|
    | `get-options`、`verify-settings` | `option:read` |
    | `apply-settings`、`apply-pricing`（目前僅 staging 可執行） | `option:read`、`option:write` |
+   | `display-settings`（固定兩項顯示值；預設預覽） | `option:read`；加 `--apply` 才需 `option:write`，僅 PAT |
    | `apply-channels --dry-run`（渠道漂移檢查） | `channel:read` |
    | `apply-channels`（目前僅 staging 可執行） | `channel:read`、`channel:sensitive_write`（加 `--update` 時再加 `channel:write`；`--rekey` 兩個都要） |
 

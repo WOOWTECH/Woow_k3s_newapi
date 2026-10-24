@@ -937,6 +937,241 @@ class TestProdDenyOnly(Base):
                 self.assertEqual(self.writes(), [])
 
 
+class TestDisplaySettings(Base):
+    def setUp(self):
+        super().setUp()
+        self.fake.status.update(server_address=PROD, quota_display_type="USD", custom_currency_exchange_rate=1)
+        self.fake.options.update({"ServerAddress": PROD, "GroupRatio": '{"default":1,"free":0}',
+                                  "general_setting.quota_display_type": "USD",
+                                  "general_setting.custom_currency_exchange_rate": "1"})
+        self.hook = lambda method, path, body, answer: answer
+        original = na.Client.req
+
+        def request(client, method, path, body=None, **kwargs):
+            answer = original(client, method, path, body, **kwargs)
+            # The fake transport normally keeps status independent. These two
+            # rc.44 settings also update the effective anonymous display fields.
+            if method == "PUT" and path == "/api/option/" and answer.get("success"):
+                for key, field, _ in na.DISPLAY_SETTINGS:
+                    if body["key"] == key:
+                        self.fake.status[field] = body["value"]
+            return self.hook(method, path, body, answer)
+
+        patch = mock.patch.object(na.Client, "req", request)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def display(self, *extra, target="prod"):
+        return self.run_tool("display-settings", *extra, target=target)
+
+    def test_default_plan_is_read_only_and_prints_only_fixed_values(self):
+        self.fake.options["UnknownSensitiveThing"] = PAT
+        rc, out, err = self.display()
+        self.assertEqual((rc, err), (0, ""))
+        report = json.loads(out)
+        self.assertEqual(report["result"], "plan")
+        self.assertEqual(report["would_write"], [key for key, _, _ in na.DISPLAY_SETTINGS])
+        self.assertEqual(self.writes(), [])
+        self.assertNotIn("GroupRatio", out)
+        self.assertNotIn("UnknownSensitiveThing", out)
+
+    def test_apply_changes_only_fixed_values_and_preserves_existing_prices(self):
+        before = dict(self.fake.options)
+        rc, out, err = self.display("--apply")
+        self.assertEqual((rc, err), (0, ""))
+        report = json.loads(out)
+        self.assertEqual(report["result"], "verified")
+        self.assertEqual(report["remaining"], [])
+        self.assertTrue(report["other_options_unchanged"])
+        self.assertEqual([(r[0], r[1], r[3]) for r in self.writes()], [
+            ("PUT", "/api/option/", {"key": "general_setting.custom_currency_exchange_rate", "value": 32}),
+            ("PUT", "/api/option/", {"key": "general_setting.quota_display_type", "value": "CUSTOM"}),
+        ])
+        for key in set(before) - {k for k, _, _ in na.DISPLAY_SETTINGS}:
+            self.assertEqual(self.fake.options[key], before[key], key)
+        self.assertEqual(len(self.calls("GET", "/api/status")), 2)
+        self.fake.requests.clear()
+        self.assertEqual(self.display("--apply")[0], 0)
+        self.assertEqual(self.writes(), [])
+
+    def test_staging_uses_the_same_bounded_command(self):
+        self.fake.status["server_address"] = STG
+        self.assertEqual(self.display("--apply", target="stg")[0], 0)
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_requires_explicit_target_even_for_plan(self):
+        rc, _, err = self.display(target=None)
+        self.assertEqual(rc, 2)
+        self.assertIn("requires --target", err)
+        self.assertEqual(self.fake.requests, [])
+
+    def test_password_sessions_are_never_created_for_this_command(self):
+        for target in ("stg", "prod"):
+            rc, _, err = self.run_tool("--base", self.base, "--creds", self.creds(),
+                                       "display-settings", "--apply", auth=False, target=target)
+            self.assertEqual(rc, 2)
+            self.assertIn("requires --token-file", err)
+        self.assertEqual(self.fake.requests, [])
+
+    def test_unknown_mismatched_or_path_server_address_refused_before_auth(self):
+        for address in (STG, "http://localhost:3000", PROD + "/other", "https://other.example"):
+            with self.subTest(address=address):
+                self.fake.status["server_address"] = address
+                self.fake.requests.clear()
+                rc, _, _ = self.display("--apply")
+                self.assertEqual(rc, 2)
+                self.assertFalse(any(r[2] for r in self.fake.requests))
+                self.assertEqual(self.writes(), [])
+
+    def test_mismatched_and_unknown_public_bases_are_refused_before_any_request(self):
+        for base in (STG, "https://attacker.example", PROD + ":444", "http://127.0.0.1.evil.example"):
+            with self.subTest(base=base), mock.patch.object(na.Client, "__init__", autospec=True) as init:
+                def create(client, supplied_base, token=None, creds=None):
+                    client.base, client.token = base, token
+                    client.creds, client.sid, client._status = creds, None, None
+                init.side_effect = create
+                with mock.patch.object(na.Client, "req", return_value={"success": True, "data": self.fake.status}) as req:
+                    self.assertEqual(self.display("--apply")[0], 2)
+                    self.assertEqual(req.call_count, 0)
+
+    def test_matching_public_origin_is_allowed(self):
+        with mock.patch.object(na.Client, "__init__", autospec=True) as init:
+            def create(client, supplied_base, token=None, creds=None):
+                client.base, client.token = PROD, token
+                client.creds, client.sid, client._status = creds, None, None
+            init.side_effect = create
+            options = self.fake.option_list()
+            with mock.patch.object(na.Client, "req", side_effect=[
+                    {"success": True, "data": self.fake.status}, {"success": True, "data": options}]) as req:
+                self.assertEqual(self.display()[0], 0)
+                self.assertEqual(req.call_count, 2)
+
+    def test_initial_http_errors_with_arbitrary_sensitive_body_are_not_echoed(self):
+        import urllib.error
+        sensitive = b'private-backend-value-not-a-recognized-token'
+        for path in ("/api/status", "/api/option/"):
+            with self.subTest(path=path):
+                original = na._OPENER.open
+                def open_request(req, **kwargs):
+                    if req.full_url.endswith(path):
+                        raise urllib.error.HTTPError(req.full_url, 503, "Unavailable", {}, io.BytesIO(sensitive))
+                    return original(req, **kwargs)
+                with mock.patch.object(na._OPENER, "open", side_effect=open_request):
+                    rc, out, err = self.display("--apply")
+                self.assertEqual(rc, 2)
+                self.assertNotIn(sensitive.decode(), out + err)
+                self.assertIn("details withheld", err)
+                self.assertEqual(self.writes(), [])
+
+    def test_version_and_non_display_status_guards_precede_authenticated_reads(self):
+        for field, value in (("version", "v1.0.0-rc.45"), ("register_enabled", True), ("checkin_enabled", True)):
+            with self.subTest(field=field):
+                original = self.fake.status[field]
+                self.fake.status[field] = value
+                self.fake.requests.clear()
+                self.assertEqual(self.display("--apply")[0], 2)
+                self.assertFalse(any(r[2] for r in self.fake.requests))
+                self.fake.status[field] = original
+
+    def test_runtime_drift_is_repaired_even_when_stored_option_already_matches(self):
+        self.fake.options["general_setting.quota_display_type"] = "CUSTOM"
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_missing_or_ambiguous_options_are_refused_without_writes(self):
+        original = self.fake.option_list
+        for response in (original() + [original()[0]], [{"key": "bad", "value": 32}], []):
+            with self.subTest(response_type=type(response).__name__):
+                with mock.patch.object(self.fake, "option_list", return_value=response):
+                    self.assertEqual(self.display("--apply")[0], 2)
+                    self.assertEqual(self.writes(), [])
+
+    def test_unsuccessful_status_or_option_envelopes_are_refused(self):
+        for endpoint in ("/api/status", "/api/option/"):
+            def hook(method, path, body, answer):
+                return {**answer, "success": False, "message": PAT} if path == endpoint else answer
+            self.hook = hook
+            rc, _, _ = self.display("--apply")
+            self.assertEqual(rc, 2)
+            self.assertEqual(self.writes(), [])
+
+    def test_rejection_stops_after_first_attempt_and_redacts_upstream_error(self):
+        def hook(method, path, body, answer):
+            if method == "PUT":
+                return {"success": False, "message": PAT}
+            return answer
+        self.hook = hook
+        rc, out, err = self.display("--apply")
+        self.assertEqual((rc, err), (1, ""))
+        report = json.loads(out)
+        self.assertEqual(report["result"], "failed")
+        self.assertEqual(report["applied"], [])
+        self.assertEqual(len(self.writes()), 1)
+        self.assertEqual(report["remaining"], ["general_setting.quota_display_type"])
+
+    def test_timeout_after_commit_is_uncertain_and_never_blindly_retried(self):
+        def hook(method, path, body, answer):
+            if method == "PUT":
+                raise na.Fatal("timeout " + PAT)
+            return answer
+        self.hook = hook
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("uncertain", json.loads(out)["reason"])
+        self.assertEqual(len(self.writes()), 1)
+
+    def test_second_failure_reports_partial_progress(self):
+        def hook(method, path, body, answer):
+            if method == "PUT" and body["key"].endswith("quota_display_type"):
+                raise na.Fatal("transport unavailable")
+            return answer
+        self.hook = hook
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 1)
+        report = json.loads(out)
+        self.assertEqual(report["applied"], ["general_setting.custom_currency_exchange_rate"])
+        self.assertEqual(report["remaining"], [])
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_runtime_readback_failure_is_not_success(self):
+        def hook(method, path, body, answer):
+            if method == "PUT":
+                self.fake.status["quota_display_type"] = "USD"
+            return answer
+        self.hook = hook
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out)["remaining"], ["general_setting.quota_display_type"])
+
+    def test_other_option_drift_is_reported_without_rollback(self):
+        def hook(method, path, body, answer):
+            if method == "PUT":
+                self.fake.options["GroupRatio"] = '{"default":1.3}'
+            return answer
+        self.hook = hook
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 1)
+        self.assertFalse(json.loads(out)["other_options_unchanged"])
+        self.assertEqual(len(self.writes()), 2)
+
+    def test_post_write_status_target_change_fails_verification(self):
+        def hook(method, path, body, answer):
+            if method == "PUT":
+                self.fake.status["server_address"] = STG
+            return answer
+        self.hook = hook
+        rc, out, _ = self.display("--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("readback", json.loads(out)["reason"])
+
+    def test_arbitrary_files_keys_and_values_cannot_be_supplied(self):
+        for extra in (("--only", "GroupRatio"), ("--value", "1.3"), (SETTINGS,), ("--force",)):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.display("--apply", *extra)[0], 2)
+                self.assertEqual(self.fake.requests, [])
+
+
 class TestChannels(Base):
     def setUp(self):
         super().setUp()
