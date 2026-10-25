@@ -3,6 +3,17 @@ set -euo pipefail
 : "${RETENTION_DAYS:?}" "${BATCH_SIZE:?}" "${BATCH_SLEEP_SECONDS:?}" "${MAX_BATCHES:?}"
 for v in "$RETENTION_DAYS" "$BATCH_SIZE" "$MAX_BATCHES"; do [[ $v =~ ^[1-9][0-9]*$ ]]; done
 [[ $BATCH_SLEEP_SECONDS =~ ^[0-9]+$ ]] && (( BATCH_SLEEP_SECONDS >= 1 && BATCH_SIZE <= 10000 ))
+# New maintenance pods can precede NetworkPolicy convergence. Do not issue
+# SQL until PostgreSQL is reachable; each probe and the total attempts are bounded.
+attempt=0
+until pg_isready -q -t 1; do
+  attempt=$((attempt + 1))
+  if (( attempt >= 30 )); then
+    echo 'postgres unreachable after 30 readiness probes' >&2
+    exit 1
+  fi
+  sleep 1
+done
 psql=(psql -X -qAt -v ON_ERROR_STOP=1)
 # Fail closed on a missing/migrated schema (including timestamp rather than bigint).
 "${psql[@]}" <<'SQL'

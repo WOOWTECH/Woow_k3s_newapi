@@ -149,10 +149,16 @@ class ProdRenderTests(unittest.TestCase):
         text=re.sub(r'(?m)^(  (?:SESSION_SECRET|CRYPTO_SECRET|POSTGRES_PASSWORD|REDIS_PASSWORD|PROXY_VALKEY_PASSWORD):).*$',r'\1 <redacted>',text)
         return sorted('\n'.join(l.rstrip() for l in d.splitlines() if l.strip() and not l.lstrip().startswith('#')) for d in text.split('---') if 'kind:' in d)
 
-    def test_default_prod_and_stg_render_unchanged_from_pr18(self):
+    def test_default_and_core_site_render_unchanged_from_pr18(self):
+        # PR18 protects the core/proxy resources. Retention was dormant in
+        # that baseline; exercise its active policy and script separately in
+        # tests/maintenance instead of comparing it to the historical script.
+        dormant_retention={'retention': {'enabled': False}}
         for site in [None,'prod','stg']:
-            before=self.render(self.base/'chart',site);after=self.render(ROOT/'chart',site)
+            before=self.render(self.base/'chart',site,dormant_retention)
+            after=self.render(ROOT/'chart',site,dormant_retention)
             self.assertEqual(before.returncode,0,before.stderr);self.assertEqual(after.returncode,0,after.stderr)
+            self.assertNotIn('  name: newapi-retention\n',after.stdout)
             with self.subTest(site=site):self.assertEqual(self.normalized(before.stdout),self.normalized(after.stdout))
             if site is None:
                 self.assertNotIn('  name: newapi-proxy\n',after.stdout)

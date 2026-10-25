@@ -120,5 +120,5 @@ encryptedBackup:
     requestedSize: 5Gi
 
 retention:
-  enabled: false
-  suspend: true
+  enabled: true
+  suspend: false
