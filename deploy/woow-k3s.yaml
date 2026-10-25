@@ -17,7 +17,7 @@ networkPolicy:
 
 backup:
   schedule: "45 3 * * *"
-  keepDays: 14
+  keepDays: 7
   suspend: false
 
 # NA-07 stg-first rollout; original daily backup above remains active.
@@ -29,7 +29,8 @@ encryptedBackup:
   pruneEnabled: false
 
 retention:
-  enabled: false
+  enabled: true
+  suspend: false
 
 # NA-05 preparation only: no proxy workloads/NetworkPolicies/Valkey ACL yet.
 # Do not copy the scratch enabled candidate into this file. Activation is a

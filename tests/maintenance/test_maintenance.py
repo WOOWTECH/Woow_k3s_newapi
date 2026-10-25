@@ -52,21 +52,28 @@ class HelmTests(unittest.TestCase):
             'verifiedAt': '2026-10-21T12:00:00Z'}
         return enc
 
-    def test_default_prod_dormant_stg_suspended_and_legacy_backup_preserved(self):
+    def test_site_retention_enabled_default_dormant_and_encryption_preserved(self):
         for site in [None, 'deploy/woow-k3s.yaml', 'deploy/woow-k3s-stg.yaml']:
             with self.subTest(site=site):
                 p = self.render(site=site)
                 self.assertEqual(p.returncode, 0, p.stderr)
                 jobs = [d for d in p.stdout.split('---') if 'kind: CronJob' in d]
-                self.assertEqual(len(jobs), 2 if site == 'deploy/woow-k3s-stg.yaml' else 1)
+                self.assertEqual(len(jobs), 3 if site == 'deploy/woow-k3s-stg.yaml' else (2 if site else 1))
                 legacy = next(d for d in jobs if '  name: newapi-pg-backup\n' in d)
                 self.assertIn('  name: newapi-pg-backup\n', legacy)
                 self.assertIn('schedule: "45 3 * * *"', legacy)
                 self.assertIn('suspend: false', legacy)
-                self.assertIn('value: "7"' if site == 'deploy/woow-k3s-stg.yaml' else 'value: "14"', legacy)
+                self.assertIn('value: "7"' if site else 'value: "14"', legacy)
                 self.assertIn('claimName: newapi-backup\n', legacy)
-                self.assertNotIn('  name: newapi-retention', p.stdout)
-                self.assertNotIn('app.kubernetes.io/component: retention', p.stdout)
+                if site:
+                    retention = next(d for d in jobs if '  name: newapi-retention\n' in d)
+                    self.assertIn('suspend: false', retention)
+                    self.assertIn('value: "180"', retention)
+                    self.assertIn('name: RETENTION_DAYS', retention)
+                    self.assertIn('app.kubernetes.io/component: retention', p.stdout)
+                else:
+                    self.assertNotIn('  name: newapi-retention', p.stdout)
+                    self.assertNotIn('app.kubernetes.io/component: retention', p.stdout)
                 if site == 'deploy/woow-k3s-stg.yaml':
                     encrypted = next(d for d in jobs if '  name: newapi-pg-backup-age\n' in d)
                     self.assertIn('schedule: "45 */6 * * *"', encrypted)
@@ -116,6 +123,12 @@ class HelmTests(unittest.TestCase):
                         ('ConfigMap', 'newapi-backup-age-script'),
                         ('CronJob', 'newapi-pg-backup-age'),
                         ('NetworkPolicy', 'newapi-backup-age'),
+                    }
+                if site:
+                    expected |= {
+                        ('ConfigMap', 'newapi-retention-script'),
+                        ('CronJob', 'newapi-retention'),
+                        ('NetworkPolicy', 'newapi-retention'),
                     }
                 self.assertEqual(identities(current.stdout),expected)
 
@@ -386,6 +399,28 @@ class BackupTests(unittest.TestCase):
         self.assertNotEqual(self.execute(AGE_RECIPIENT=recipient,MODE='dump-fail').returncode,0)
         self.assertEqual(set(self.backups.iterdir()),before)
 
+
+
+
+class RetentionStartupTests(unittest.TestCase):
+    def test_unreachable_database_is_bounded_and_never_runs_sql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            probes=folder/'probes'
+            sql=folder/'sql-attempted'
+            (folder/'pg_isready').write_text('#!/bin/sh\nprintf x >> "'+str(probes)+'"\nexit 1\n')
+            (folder/'sleep').write_text('#!/bin/sh\nexit 0\n')
+            (folder/'psql').write_text('#!/bin/sh\ntouch "'+str(sql)+'"\nexit 99\n')
+            for name in ('pg_isready','sleep','psql'):
+                (folder/name).chmod(0o755)
+            env=dict(os.environ,PATH=str(folder)+':'+os.environ['PATH'],
+                     RETENTION_DAYS='180',BATCH_SIZE='10000',
+                     BATCH_SLEEP_SECONDS='1',MAX_BATCHES='1000')
+            p=run(['bash',str(SCRIPTS/'retention.sh')],env=env,timeout=10)
+            self.assertNotEqual(p.returncode,0)
+            self.assertIn('postgres unreachable after 30 readiness probes',p.stderr)
+            self.assertEqual(probes.read_text(),'x'*30)
+            self.assertFalse(sql.exists())
 
 if __name__ == '__main__':
     unittest.main()
