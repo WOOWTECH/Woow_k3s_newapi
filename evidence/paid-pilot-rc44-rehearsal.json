@@ -1,0 +1,43 @@
+{
+  "passed_stages": [
+    "fresh_rc44_sqlite_status",
+    "setup_login_root",
+    "short_lived_pod_local_pat",
+    "production_like_baseline_http",
+    "paid_http_apply_readback",
+    "ap_default_user_normalizer_15_paid_models",
+    "paid_idempotent_noop"
+  ],
+  "failed_stage": null,
+  "failure_label": null,
+  "image": "v1.0.0-rc.44@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84",
+  "database": "fresh SQLite emptyDir",
+  "upstream": "local HTTP mock, no real inference",
+  "paid_plan_steps": 4,
+  "postcreate_elapsed_seconds": 50.171,
+  "postcreate_fixed_failure_label": null,
+  "normalized_paid_models": 15,
+  "normalized_paid_model_names": [
+    "anthropic/claude-fable-5.1",
+    "anthropic/claude-haiku-5.5",
+    "anthropic/claude-opus-5.5",
+    "anthropic/claude-sonnet-5.5",
+    "chatgpt/gpt-5.5",
+    "chatgpt/gpt-5.6-luna",
+    "chatgpt/gpt-5.6-sol",
+    "chatgpt/gpt-5.6-terra",
+    "chatgpt/gpt-6-astra",
+    "chatgpt/gpt-6-luna",
+    "chatgpt/gpt-6-sol",
+    "chatgpt/gpt-6.1-sol",
+    "deepseek/deepseek-v4-flash-0731",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4.1-flash"
+  ],
+  "paid_model_count": 18,
+  "mock_http_calls": 0,
+  "configured_not_inference_tested": true,
+  "scope": "isolated development sandbox; no production mutation",
+  "script_sha256": "fd17ef95a0e5d71100faef499f8e5c0b2c5a31c2eeaf70d6340ddf92435a7adc",
+  "paas_pricing_sha256": "eedd66f8c3625a41125ee747b0a1c304db96fb934508147c23213bbbbf7d24fd"
+}

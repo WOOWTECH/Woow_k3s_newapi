@@ -4,8 +4,9 @@
 Nothing has a default target: every command that talks to a server needs
 --base and one credential, and every write also needs --target.
 General production mutations are disabled until the approved price-notice gate
-and all-writer interlock exist. Bounded exceptions are display-settings --apply
-and free-pilot --apply; neither permits arbitrary settings or paid price edits.
+and all-writer interlock exist. Bounded exceptions are display-settings,
+free-pilot and paid-pilot --apply. The paid command adds only the fixed
+DeepSeek Pro ratios and the exact requested route; none permits arbitrary edits.
 
   --base URL         the new-api origin itself, e.g. a port-forward
                      http://127.0.0.1:3301. Plain http only to 127.0.0.1, ::1
@@ -36,6 +37,9 @@ Commands:
   free-pilot [--apply --expected-plan SHA256 --journal NEWFILE --upstream-key-file FILE]
     PAT scopes: option:read, channel:read; apply also option:write and
     channel:sensitive_write when creating the fixed Qwen channel. Read-only by default.
+  paid-pilot [--apply --expected-plan SHA256 --journal NEWFILE --upstream-key-file FILE]
+    Production only; same PAT scopes, plus /api/pricing read. Verified evidence,
+    fixed paid ratios and route, durable journal; read-only by default.
   verify-settings [--offline] [--plan PLAN | --no-plan] [-v] FILE [FILE ...]
   apply-settings [--snapshot OUT] [--only KEY[,KEY...] | --only-keys-of FILE] FILE [FILE ...]
   apply-pricing [--plan PLAN] [--backup-dir DIR]
@@ -1433,6 +1437,14 @@ def build_parser():
     p.add_argument("--journal", help="exclusive new intent journal; never overwritten or auto-resumed")
     p.add_argument("--upstream-key-file", help="private LiteLLM key file; only needed for channel creation")
     p.set_defaults(fn=cmd_free_pilot)
+
+    from paid_pilot import cmd_paid_pilot
+    p = sub.add_parser("paid-pilot", help="fixed paid ChatGPT/DeepSeek route; journaled rc.44 transition")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--expected-plan", help="SHA256 of current read-only plan")
+    p.add_argument("--journal", help="exclusive new intent journal; no resume or retry")
+    p.add_argument("--upstream-key-file", help="user-approved private LiteLLM key file for channel creation")
+    p.set_defaults(fn=cmd_paid_pilot)
 
     p = sub.add_parser("verify-settings", help="check settings files, PaaS invariants, status, pricing")
     p.add_argument("files", nargs="+")

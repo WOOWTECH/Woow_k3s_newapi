@@ -1,0 +1,252 @@
+{
+  "configured": [],
+  "chatgpt_enabled": true,
+  "chatgpt_default_models": [
+    "visible"
+  ],
+  "live_info": [
+    {
+      "model": "anthropic/claude-fable-5.1",
+      "upstream_model": "openrouter/anthropic/claude-fable-5.1",
+      "costs": {
+        "input_cost_per_token": 1e-05,
+        "output_cost_per_token": 5e-05,
+        "cache_read_input_token_cost": 2.5e-07,
+        "cache_creation_input_token_cost": 1.25e-05,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "anthropic/claude-haiku-5.5",
+      "upstream_model": "openrouter/anthropic/claude-haiku-5.5",
+      "costs": {
+        "input_cost_per_token": 1e-07,
+        "output_cost_per_token": 5e-07,
+        "cache_read_input_token_cost": 1e-08,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "anthropic/claude-opus-5.5",
+      "upstream_model": "openrouter/anthropic/claude-opus-5.5",
+      "costs": {
+        "input_cost_per_token": 4e-06,
+        "output_cost_per_token": 2e-05,
+        "cache_read_input_token_cost": 2e-07,
+        "cache_creation_input_token_cost": 5e-06,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "anthropic/claude-sonnet-5.5",
+      "upstream_model": "openrouter/anthropic/claude-sonnet-5.5",
+      "costs": {
+        "input_cost_per_token": 2e-06,
+        "output_cost_per_token": 1e-05,
+        "cache_read_input_token_cost": 1e-07,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-5.5",
+      "upstream_model": "chatgpt/gpt-5.5",
+      "costs": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-5.6-luna",
+      "upstream_model": "chatgpt/gpt-5.6-luna",
+      "costs": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-5.6-sol",
+      "upstream_model": "chatgpt/gpt-5.6-sol",
+      "costs": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-5.6-terra",
+      "upstream_model": "chatgpt/gpt-5.6-terra",
+      "costs": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-6-astra",
+      "upstream_model": "chatgpt/gpt-6-astra",
+      "costs": {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-6-luna",
+      "upstream_model": "chatgpt/gpt-6-luna",
+      "costs": {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-6-sol",
+      "upstream_model": "chatgpt/gpt-6-sol",
+      "costs": {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "chatgpt/gpt-6.1-sol",
+      "upstream_model": "chatgpt/gpt-6.1-sol",
+      "costs": {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "mode": "responses"
+      }
+    },
+    {
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "upstream_model": "openrouter/deepseek/deepseek-v4-flash-0731",
+      "costs": {
+        "input_cost_per_token": 1.6e-08,
+        "output_cost_per_token": 6.4e-07,
+        "cache_read_input_token_cost": 1.6e-08,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "deepseek/deepseek-v4-pro",
+      "upstream_model": "openrouter/deepseek/deepseek-v4-pro",
+      "costs": {
+        "input_cost_per_token": 9.5526e-07,
+        "output_cost_per_token": 1.91052e-06,
+        "cache_read_input_token_cost": 7.0412e-08,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "upstream_model": "openrouter/deepseek/deepseek-v4.1-flash",
+      "costs": {
+        "input_cost_per_token": 2.376e-08,
+        "output_cost_per_token": 7.2e-07,
+        "cache_read_input_token_cost": 5.4e-09,
+        "cache_creation_input_token_cost": null,
+        "mode": "chat"
+      }
+    }
+  ],
+  "live_models": [
+    {
+      "model": "anthropic/claude-fable-5.1",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "anthropic/claude-haiku-5.5",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "anthropic/claude-opus-5.5",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "anthropic/claude-sonnet-5.5",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-5.5",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-5.6-luna",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-5.6-sol",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-5.6-terra",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-6-astra",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-6-luna",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-6-sol",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "chatgpt/gpt-6.1-sol",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "deepseek/deepseek-v4-flash-0731",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "deepseek/deepseek-v4-pro",
+      "upstream_model": null,
+      "costs": {}
+    },
+    {
+      "model": "deepseek/deepseek-v4.1-flash",
+      "upstream_model": null,
+      "costs": {}
+    }
+  ],
+  "checked_at": "2026-10-25T15:11:17.744666+00:00"
+}
