@@ -1,0 +1,92 @@
+{
+  "source_hashes": {
+    "models/llm_swr.py": "48a34c6456368ddabdd051e198140d213bb1648633b7ccbffc31ba9c4520343c",
+    "models/llm_common.py": "8a43c1946d3686218d3192eccdb9280224b964245720551469ba38aac2a1725c",
+    "models/llm_api_key.py": "87d40a1ea4d10cb37946656b5a0863d1dedd2ae11dc076a8a830dcf29efc5e31",
+    "services/llm_pricing.py": "7bc7d19e43f0dbaa4b5d6d87a4085ee032c83270ae1c74c419fe5572ceee78e6"
+  },
+  "version": "18.0.1.0.261",
+  "pilot_ids": "3,10",
+  "options_ok": true,
+  "pricing_options": {
+    "UserUsableGroups": {
+      "default": "預設"
+    },
+    "GroupRatio": {
+      "default": 1,
+      "internal": 1
+    },
+    "CompletionRatio": {
+      "anthropic/claude-fable-5.1": 5,
+      "anthropic/claude-haiku-5.5": 5,
+      "anthropic/claude-opus-5.5": 5,
+      "anthropic/claude-sonnet-5.5": 5,
+      "chatgpt/gpt-5.5": 5,
+      "chatgpt/gpt-5.6-luna": 6,
+      "chatgpt/gpt-5.6-sol": 5,
+      "chatgpt/gpt-5.6-terra": 5,
+      "chatgpt/gpt-6-astra": 5,
+      "chatgpt/gpt-6-luna": 5,
+      "chatgpt/gpt-6-sol": 5,
+      "chatgpt/gpt-6.1-sol": 5,
+      "deepseek/deepseek-v4-flash-0731": 40,
+      "deepseek/deepseek-v4.1-flash": 30.30303
+    },
+    "CacheRatio": {
+      "anthropic/claude-fable-5.1": 0.025,
+      "anthropic/claude-haiku-5.5": 0.1,
+      "anthropic/claude-opus-5.5": 0.05,
+      "anthropic/claude-sonnet-5.5": 0.05,
+      "chatgpt/gpt-5.5": 0.1,
+      "chatgpt/gpt-5.6-luna": 0.1,
+      "chatgpt/gpt-5.6-sol": 0.1,
+      "chatgpt/gpt-5.6-terra": 0.1,
+      "chatgpt/gpt-6-astra": 0.1,
+      "chatgpt/gpt-6-luna": 0.1,
+      "chatgpt/gpt-6-sol": 0.1,
+      "chatgpt/gpt-6.1-sol": 0.05,
+      "deepseek/deepseek-v4-flash-0731": 1,
+      "deepseek/deepseek-v4.1-flash": 0.227273
+    },
+    "CreateCacheRatio": {},
+    "ModelRatio": {
+      "anthropic/claude-fable-5.1": 5,
+      "anthropic/claude-haiku-5.5": 0.05,
+      "anthropic/claude-opus-5.5": 2,
+      "anthropic/claude-sonnet-5.5": 1,
+      "chatgpt/gpt-5.5": 1,
+      "chatgpt/gpt-5.6-luna": 0.1,
+      "chatgpt/gpt-5.6-sol": 1,
+      "chatgpt/gpt-5.6-terra": 1,
+      "chatgpt/gpt-6-astra": 5,
+      "chatgpt/gpt-6-luna": 0.05,
+      "chatgpt/gpt-6-sol": 1,
+      "chatgpt/gpt-6.1-sol": 1,
+      "deepseek/deepseek-v4-flash-0731": 0.008,
+      "deepseek/deepseek-v4.1-flash": 0.01188
+    }
+  },
+  "payment_providers": [
+    {
+      "name": "Wire Transfer",
+      "code": "custom",
+      "state": "enabled",
+      "published": true
+    },
+    {
+      "name": "ECPay 綠界第三方支付",
+      "code": "ECPay",
+      "state": "enabled",
+      "published": true
+    }
+  ],
+  "odoo_images": [
+    "jcr-prod.woowtech.io/woow-paas-docker-local/paas-odoo-official:20261025.1154@sha256:b3f024223d296f3a094ae6f2d43af76321db2568644a622ffa53207234028ac0"
+  ],
+  "local_source_matches": {
+    "models/llm_swr.py": true,
+    "models/llm_common.py": true,
+    "models/llm_api_key.py": true,
+    "services/llm_pricing.py": true
+  }
+}
