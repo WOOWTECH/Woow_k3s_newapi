@@ -154,10 +154,59 @@ class ProdRenderTests(unittest.TestCase):
             before=self.render(self.base/'chart',site);after=self.render(ROOT/'chart',site)
             self.assertEqual(before.returncode,0,before.stderr);self.assertEqual(after.returncode,0,after.stderr)
             with self.subTest(site=site):self.assertEqual(self.normalized(before.stdout),self.normalized(after.stdout))
-            if site!='stg':
+            if site is None:
                 self.assertNotIn('  name: newapi-proxy\n',after.stdout)
                 self.assertNotIn('PROXY_VALKEY_PASSWORD:',after.stdout)
                 self.assertNotIn('app.kubernetes.io/component: proxy',after.stdout)
+
+    def test_prod_proxy_activation_runtime_contract(self):
+        rendered=self.render(ROOT/'chart','prod')
+        self.assertEqual(rendered.returncode,0,rendered.stderr)
+        docs=[d for d in rendered.stdout.split('---') if re.search(r'(?m)^kind: ',d)]
+
+        def document(kind,name):
+            matches=[d for d in docs if re.search(rf'(?m)^kind: {re.escape(kind)}$',d)
+                     and re.search(rf'(?m)^  name: {re.escape(name)}$',d)]
+            self.assertEqual(len(matches),1,f'expected one {kind}/{name}')
+            return matches[0]
+
+        deployment=document('Deployment','newapi-proxy')
+        self.assertRegex(deployment,r'(?m)^  replicas: 2$')
+        env={}
+        for name,secret,key in re.findall(
+                r'(?ms)^            - name: (PROXY_[A-Z_]+)\n'
+                r'\s+valueFrom:\n\s+secretKeyRef:\n'
+                r'\s+name: ([^\n]+)\n\s+key: ([^\n]+)',deployment):
+            env[name]=(secret.strip(),key.strip())
+        self.assertEqual(env.get('PROXY_AP_TOKEN'),('newapi-proxy-pats','ap'))
+        self.assertEqual(env.get('PROXY_OP_TOKEN'),('newapi-proxy-pats','op'))
+        self.assertEqual(env.get('PROXY_AUTH_WEB'),('newapi-proxy-hmac','web'))
+        self.assertEqual(env.get('PROXY_AUTH_CRON'),('newapi-proxy-hmac','cron'))
+
+        policy=document('NetworkPolicy','newapi-proxy')
+        ingress=re.search(r'(?ms)^  ingress:\n(.*?)^  egress:',policy)
+        self.assertIsNotNone(ingress)
+        ingress=ingress.group(1)
+        client=re.search(
+            r'(?ms)^(?P<indent> +)- namespaceSelector:\n(?P<namespace>.*?)'
+            r'^(?P=indent)  podSelector:\n(?P<pod>.*?)(?=^(?P=indent)- |\Z)',ingress)
+        self.assertIsNotNone(client,'namespace AND pod selectors must share one peer')
+        self.assertRegex(client['namespace'],
+            r'(?m)^\s+kubernetes\.io/metadata\.name: paas-system$')
+        # toYaml may reorder mapping keys: both fields must belong to this
+        # same pod selector, regardless of their serialized order.
+        self.assertRegex(client['pod'],
+            r'(?m)^\s+app\.kubernetes\.io/instance: paas-odoo-platform$')
+        self.assertRegex(client['pod'],
+            r'(?ms)\s+matchExpressions:\n'
+            r'\s+- key: app\.kubernetes\.io/component\n'
+            r'\s+operator: In\n'
+            r'\s+values:\n'
+            r'\s+- server\n'
+            r'\s+- cron(?:\n|$)')
+        namespaces=re.findall(r'(?m)^\s+kubernetes\.io/metadata\.name: ([^\s]+)$',ingress)
+        self.assertEqual(namespaces,['paas-system'])
+        self.assertNotIn('new-api-stg',ingress)
 
     def test_invalid_enable_or_zero_replica_cannot_masquerade_as_dormant(self):
         for proxy,err in [({'enabled':'false'},'proxy.enabled must be a boolean'),
