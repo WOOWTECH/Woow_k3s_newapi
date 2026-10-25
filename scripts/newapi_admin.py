@@ -4,8 +4,8 @@
 Nothing has a default target: every command that talks to a server needs
 --base and one credential, and every write also needs --target.
 General production mutations are disabled until the approved price-notice gate
-and all-writer interlock exist. The sole bounded exception is display-settings
---apply: two fixed display values, never prices, with before/after checks.
+and all-writer interlock exist. Bounded exceptions are display-settings --apply
+and free-pilot --apply; neither permits arbitrary settings or paid price edits.
 
   --base URL         the new-api origin itself, e.g. a port-forward
                      http://127.0.0.1:3301. Plain http only to 127.0.0.1, ::1
@@ -33,6 +33,9 @@ and all-writer interlock exist. The sole bounded exception is display-settings
 Commands:
   get-options [--snapshot OUT] [KEY ...]
   display-settings [--apply] (PAT only; fixed CUSTOM / 32; default read-only)
+  free-pilot [--apply --expected-plan SHA256 --journal NEWFILE --upstream-key-file FILE]
+    PAT scopes: option:read, channel:read; apply also option:write and
+    channel:sensitive_write when creating the fixed Qwen channel. Read-only by default.
   verify-settings [--offline] [--plan PLAN | --no-plan] [-v] FILE [FILE ...]
   apply-settings [--snapshot OUT] [--only KEY[,KEY...] | --only-keys-of FILE] FILE [FILE ...]
   apply-pricing [--plan PLAN] [--backup-dir DIR]
@@ -1423,6 +1426,14 @@ def build_parser():
     p.add_argument("--apply", action="store_true", help="write only CUSTOM / 32 and verify; default is read-only")
     p.set_defaults(fn=cmd_display_settings)
 
+    from free_pilot import cmd_free_pilot
+    p = sub.add_parser("free-pilot", help="bounded Qwen free route; preserves paid prices; PAT only")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--expected-plan", help="SHA256 of the current read-only plan")
+    p.add_argument("--journal", help="exclusive new intent journal; never overwritten or auto-resumed")
+    p.add_argument("--upstream-key-file", help="private LiteLLM key file; only needed for channel creation")
+    p.set_defaults(fn=cmd_free_pilot)
+
     p = sub.add_parser("verify-settings", help="check settings files, PaaS invariants, status, pricing")
     p.add_argument("files", nargs="+")
     p.add_argument("--offline", action="store_true", help="check the files against the invariants only (CI)")
@@ -1489,4 +1500,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # The bounded command module shares this client's exception/transport
+    # identity when this file is executed as a script rather than imported.
+    sys.modules.setdefault("newapi_admin", sys.modules[__name__])
     sys.exit(main())
