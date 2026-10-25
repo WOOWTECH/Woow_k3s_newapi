@@ -35,4 +35,28 @@ retention:
 # Do not copy the scratch enabled candidate into this file. Activation is a
 # separate reviewed PR after owner Secrets/identity/expiry and contract gates.
 proxy:
-  enabled: false
+  enabled: true
+  replicas: 2
+  image:
+    tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb
+    digest: sha256:0fdf5e12da8c8fec9d4b1650d2a134d6dc58d1ba86b82d54ea62b8b6fb8ce3bd
+  imagePullSecrets:
+    - name: newapi-proxy-registry
+  patsSecret: newapi-proxy-pats
+  hmacSecret: newapi-proxy-hmac
+  usernameRegex: '^wp\d{10}$'
+  tenantIpRange: 198.18.1.0-198.19.255.255
+  apExpiresAt: "1808450171"
+  opExpiresAt: "1808450171"
+  clients:
+    - name: paas-odoo
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: paas-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/instance: paas-odoo-platform
+        matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [server, cron]

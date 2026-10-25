@@ -51,20 +51,24 @@ jobs:
             if [ -n "$bad" ]; then echo "unpinned images in $f:"; echo "$bad"; exit 1; fi
           done
 
-      # newapi-proxy (templates/proxy.yaml): off in prod until NA-05, on in stg.
+      # newapi-proxy must be active with a real pinned image in both environments.
       - name: newapi-proxy component
         run: |
           set -euo pipefail
-          if grep -q '^  name: newapi-proxy$' /tmp/rendered.yaml; then
-            echo "newapi-proxy must stay disabled in deploy/woow-k3s.yaml for now"; exit 1
-          fi
-          for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
-            awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
-              /tmp/rendered-stg.yaml || { echo "stg render lacks the newapi-proxy $kind"; exit 1; }
+          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml; do
+            for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
+              awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
+                "$f" || { echo "$f lacks the newapi-proxy $kind"; exit 1; }
+            done
+            image=$(grep -E '^[[:space:]]+image: .*woow-paas-docker-local/newapi-proxy:' "$f")
+            count=$(printf '%s\n' "$image" | grep -c .)
+            if [ "$count" -ne 1 ] || ! printf '%s\n' "$image" | grep -Eq 'newapi-proxy:[0-9a-f]{40}@sha256:[0-9a-f]{64}"?$'; then
+              echo "::error::$f must render one newapi-proxy image with a commit tag and full digest"; exit 1
+            fi
+            if printf '%s\n' "$image" | grep -q '@sha256:0\{64\}'; then
+              echo "::error::$f renders the placeholder proxy digest"; exit 1
+            fi
           done
-          if grep -q 'newapi-proxy[^@]*@sha256:0\{64\}' /tmp/rendered-stg.yaml; then
-            echo "::error::rendered stg values carry the placeholder proxy digest"; exit 1
-          fi
 
       # The chart's fail() guards (digest, client selectors, username regex):
       # unsafe values must keep failing, the real shapes must keep rendering.
