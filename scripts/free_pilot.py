@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.parse
 
@@ -261,6 +263,77 @@ class Journal:
         os.close(self.fd)
 
 
+def checked_state(c, target, expected_opts, expected_channels, paid_hash):
+    opts, channels, prices = read_state(c, target)
+    if (opts != expected_opts or channel_state(channels) != expected_channels
+            or digest(paid_pricing(prices)) != paid_hash):
+        reject("state drift or incomplete write; stop and reconcile read-only")
+    return opts, channels, prices
+
+
+def wait_for_final_pricing(c, target, expected_opts, expected_channels, paid_hash, poll_seconds):
+    # The parent owns the absolute deadline, including DNS and response bodies.
+    while True:
+        _, channels, prices = checked_state(c, target, expected_opts, expected_channels, paid_hash)
+        if free_channel(channels) is None:
+            reject("final free channel absent")
+        free_models = [row["model_name"] for row in prices["data"] if "free" in row["enable_groups"]]
+        if (set(free_models) - set(MODELS) or len(free_models) != len(set(free_models))
+                or ("free" in prices["group_ratio"]
+                    and not na.close(prices["group_ratio"]["free"], 0))):
+            reject("final effective free routing drift")
+        if (na.close(prices["group_ratio"].get("free"), 0)
+                and "free" in prices["usable_group"] and set(free_models) == set(MODELS)):
+            return
+        time.sleep(poll_seconds)
+
+
+class ReadOnlyClient(na.Client):
+    def req(self, method, *args, **kwargs):
+        if method != "GET":
+            reject("final verification permits GET requests only")
+        return super().req(method, *args, **kwargs)
+
+
+def verification_worker():
+    # Private stdin pipe only: no PAT in argv, files, output or exception text.
+    # Popen closes unrelated descriptors, including the parent's journal.
+    try:
+        payload = json.load(sys.stdin)
+        client = ReadOnlyClient(payload["base"], token=payload["token"])
+        wait_for_final_pricing(client, payload["target"], payload["options"],
+                               payload["channels"], payload["paid_hash"], payload["poll_seconds"])
+        return 0
+    except BaseException:
+        return 2
+
+
+def verify_final(c, target, expected_opts, expected_channels, paid_hash):
+    deadline = time.monotonic() + PRICING_WAIT_SECONDS
+    payload = json.dumps({"base": c.base, "token": c.token, "target": target,
+                          "options": expected_opts, "channels": expected_channels,
+                          "paid_hash": paid_hash, "poll_seconds": PRICING_POLL_SECONDS}).encode()
+    with subprocess.Popen([sys.executable, os.path.abspath(__file__)], stdin=subprocess.PIPE,
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True) as worker:
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reject("final verification deadline expired; reconcile read-only")
+            try:
+                worker.communicate(input=payload, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                reject("final verification deadline expired; reconcile read-only")
+            # A response/process exit after expiry must never become success.
+            if time.monotonic() >= deadline:
+                reject("final verification deadline expired; reconcile read-only")
+            if worker.returncode != 0:
+                reject("final verification failed; reconcile read-only")
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+            worker.wait()
+
+
 def cmd_free_pilot(a):
     if not a.target or not a.token_file or a.creds:
         reject("requires --target and a PAT file; password sessions are forbidden")
@@ -291,11 +364,7 @@ def cmd_free_pilot(a):
     paid_hash = digest(paid_pricing(pricing))
 
     def check():
-        now_opts, now_channels, now_prices = read_state(c, a.target)
-        if (now_opts != expected_opts or channel_state(now_channels) != expected_channels
-                or digest(paid_pricing(now_prices)) != paid_hash):
-            reject("state drift or incomplete write; stop and reconcile read-only")
-        return now_opts, now_channels, now_prices
+        return checked_state(c, a.target, expected_opts, expected_channels, paid_hash)
 
     try:
         for index, step in enumerate(plan["steps"]):
@@ -327,27 +396,8 @@ def cmd_free_pilot(a):
             report["confirmed"].append(index)
             report["state"] = "step-confirmed"
             journal.save()
-        # rc.44's pricing cache can lag the committed channel/group writes.
-        # Poll only reads after every mutation has been confirmed; each read
-        # still checks exact options, all channels and every paid price field.
-        deadline = time.monotonic() + PRICING_WAIT_SECONDS
-        while True:
-            _, after_channels, after_prices = check()
-            if free_channel(after_channels) is None:
-                reject("final free channel absent")
-            free_models = [row["model_name"] for row in after_prices["data"]
-                           if "free" in row["enable_groups"]]
-            if (set(free_models) - set(MODELS) or len(free_models) != len(set(free_models))
-                    or ("free" in after_prices["group_ratio"]
-                        and not na.close(after_prices["group_ratio"]["free"], 0))):
-                reject("final effective free routing drift")
-            if (na.close(after_prices["group_ratio"].get("free"), 0)
-                    and "free" in after_prices["usable_group"] and set(free_models) == set(MODELS)):
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                reject("free pricing cache did not converge; reconcile read-only")
-            time.sleep(min(PRICING_POLL_SECONDS, remaining))
+        # Only the final read-only phase moves to the independently bounded worker.
+        verify_final(c, a.target, expected_opts, expected_channels, paid_hash)
         report["state"] = "configured-not-inference-tested"
         journal.save()
     except Exception:
@@ -360,3 +410,7 @@ def cmd_free_pilot(a):
         journal.close()
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(verification_worker())
