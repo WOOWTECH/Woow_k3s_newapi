@@ -3,6 +3,10 @@ import json
 import os
 import tempfile
 import sys
+import signal
+import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import unittest
 import urllib.error
@@ -125,6 +129,47 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn("private-upstream-error-payload", out.getvalue())
         self.assertEqual(json.loads(out.getvalue())["error"], "http_failure")
         self.opener.error = None
+
+    def test_real_slow_body_has_total_deadline(self):
+        # Run the actual urllib path, unlike the response fixture tests above.
+        self.patcher.stop()
+        stop = threading.Event()
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "100000")
+                self.end_headers()
+                try:
+                    while not stop.wait(.02):
+                        self.wfile.write(b" "); self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True)
+        worker.start()
+        prior = signal.getsignal(signal.SIGALRM)
+        started = time.monotonic()
+        try:
+            with mock.patch.object(check, "TIMEOUT", .25):
+                with self.assertRaisesRegex(check.CheckError, "deadline_exceeded"):
+                    check.bounded_fetch_models("http://127.0.0.1:" + str(server.server_port), "sk-test-secret-value")
+            self.assertLess(time.monotonic()-started, 2)
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+            self.assertEqual(signal.getsignal(signal.SIGALRM), prior)
+        finally:
+            stop.set(); server.shutdown(); server.server_close(); worker.join(timeout=1)
+            self.patcher.start()
+
+    def test_existing_alarm_is_preserved(self):
+        with mock.patch.object(check.signal, "getitimer", return_value=(5.0, 0.0)):
+            with mock.patch.object(check.signal, "signal") as change:
+                with self.assertRaisesRegex(check.CheckError, "deadline_conflict"):
+                    check.bounded_fetch_models(self.base, "sk-test-secret-value")
+                change.assert_not_called()
 
 
 if __name__ == "__main__":

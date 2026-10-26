@@ -2,7 +2,7 @@
 
 `check_free_upstream.py` 以唯讀 `GET /v1/models` 確認目前提供的 LiteLLM key 是否可見 `qwen3-4b-aicoder` 和 `qwen3-4b-cluster1`。它是**權限 inventory gate**：兩模型都出現在模型清單才通過；這不代表 GPU 已能完成推論。正常 completion（含實際需要的串流情境）仍須另外測試。
 
-工具只接受固定 LiteLLM service URL，或明確的 `http://127.0.0.1:<port>`。不使用環境代理、不跟隨 redirect、不重試；請求 timeout 為 5 秒，回應上限 1 MiB。key 檔必須是目前使用者擁有的 regular file，權限恰為 `0600`，並以 no-follow 開啟。
+工具只接受固定 LiteLLM service URL，或明確的 `http://127.0.0.1:<port>`。不使用環境代理、不跟隨 redirect、不重試；單次網路檢查包含 DNS、連線、HTTP headers 與 body 的總等待上限為 5 秒，回應上限 1 MiB。以 POSIX alarm 避免持續慢速傳輸繞過 socket timeout；既有 alarm 會拒絕執行，原 handler 會還原。本工具供 Linux/macOS 主執行緒 CLI 使用。key 檔必須是目前使用者擁有的 regular file，權限恰為 `0600`，並以 no-follow 開啟。
 
 ## 透過 kubectl port-forward
 

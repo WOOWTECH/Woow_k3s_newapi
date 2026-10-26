@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import stat
 import sys
 import urllib.error
@@ -100,6 +101,22 @@ def fetch_models(base, key):
     return {model: model in ids for model in MODELS}
 
 
+def bounded_fetch_models(base, key):
+    # This POSIX CLI already requires O_NOFOLLOW and owner/mode checks. A
+    # socket timeout alone does not bound a peer sending one byte at a time.
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        raise CheckError("deadline_conflict")
+    def expired(signum, frame):
+        raise CheckError("deadline_exceeded")
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, TIMEOUT)
+        return fetch_models(base, key)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--key-file", required=True, help="owner-owned regular file with mode 0600")
@@ -110,7 +127,7 @@ def main(argv=None):
     try:
         base = validate_base(args.base)
         key = read_key(args.key_file)
-        visible = fetch_models(base, key)
+        visible = bounded_fetch_models(base, key)
         if all(visible.values()):
             status = "pass"
         else:
