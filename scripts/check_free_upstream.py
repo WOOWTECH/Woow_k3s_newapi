@@ -5,7 +5,8 @@ import argparse
 import json
 import os
 import re
-import signal
+import subprocess
+from pathlib import Path
 import stat
 import sys
 import urllib.error
@@ -101,20 +102,56 @@ def fetch_models(base, key):
     return {model: model in ids for model in MODELS}
 
 
-def bounded_fetch_models(base, key):
-    # This POSIX CLI already requires O_NOFOLLOW and owner/mode checks. A
-    # socket timeout alone does not bound a peer sending one byte at a time.
-    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
-        raise CheckError("deadline_conflict")
-    def expired(signum, frame):
-        raise CheckError("deadline_exceeded")
-    previous = signal.signal(signal.SIGALRM, expired)
+WORKER_ERRORS = frozenset(("http_failure", "redirect", "network_failure", "response_too_large", "invalid_response", "invalid_url", "worker_failure"))
+
+
+def fetch_worker():
     try:
-        signal.setitimer(signal.ITIMER_REAL, TIMEOUT)
-        return fetch_models(base, key)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        raw = sys.stdin.buffer.read(16385)
+        if len(raw) > 16384:
+            raise CheckError("worker_failure")
+        payload = json.loads(raw)
+        base = validate_base(payload["base"])
+        key = payload["key"]
+        if not isinstance(key, str) or not re.fullmatch(r"sk-[A-Za-z0-9_-]{10,256}", key):
+            raise CheckError("worker_failure")
+        result = {"models_visible": fetch_models(base, key)}
+    except CheckError as exc:
+        result = {"error": exc.category if exc.category in WORKER_ERRORS else "worker_failure"}
+    except Exception:
+        result = {"error": "worker_failure"}
+    print(json.dumps(result))
+
+
+def bounded_fetch_models(base, key):
+    # A parent deadline also covers native DNS resolution and slow-drip bodies.
+    # Credentials travel only through stdin; never through argv or environment.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", str(Path(__file__).resolve()), "--_fetch-worker"],
+            input=json.dumps({"base": base, "key": key}).encode(),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=TIMEOUT,
+            check=False)
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and reaps the child before raising.
+        raise CheckError("deadline_exceeded") from None
+    except (OSError, ValueError):
+        raise CheckError("worker_failure") from None
+    try:
+        if result.returncode or len(result.stdout) > 4096:
+            raise ValueError()
+        decoded = json.loads(result.stdout)
+        if not isinstance(decoded, dict):
+            raise ValueError()
+        if "error" in decoded:
+            error = decoded["error"]
+            raise CheckError(error if isinstance(error, str) and error in WORKER_ERRORS else "worker_failure")
+        visible = decoded["models_visible"]
+        if not isinstance(visible, dict) or set(visible) != set(MODELS) or any(type(v) is not bool for v in visible.values()):
+            raise ValueError()
+        return visible
+    except (ValueError, KeyError, TypeError):
+        raise CheckError("worker_failure") from None
 
 
 def main(argv=None):
@@ -139,4 +176,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if sys.argv[1:] == ["--_fetch-worker"]:
+        fetch_worker()
+    else:
+        sys.exit(main())

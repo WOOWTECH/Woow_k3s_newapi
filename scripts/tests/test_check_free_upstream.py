@@ -122,7 +122,7 @@ class PreflightTests(unittest.TestCase):
         self.opener.error = urllib.error.HTTPError(
             self.base, 500, "sk-test-secret-value private-upstream-error-payload", {}, None)
         out = io.StringIO()
-        with mock.patch("sys.stdout", out):
+        with mock.patch("sys.stdout", out), mock.patch.object(check, "bounded_fetch_models", side_effect=check.CheckError("http_failure")):
             rc = check.main(["--key-file", self.key_path, "--base", self.base])
         self.assertEqual(rc, 1)
         self.assertNotIn("sk-test-secret-value", out.getvalue())
@@ -164,12 +164,37 @@ class PreflightTests(unittest.TestCase):
             stop.set(); server.shutdown(); server.server_close(); worker.join(timeout=1)
             self.patcher.start()
 
-    def test_existing_alarm_is_preserved(self):
-        with mock.patch.object(check.signal, "getitimer", return_value=(5.0, 0.0)):
-            with mock.patch.object(check.signal, "signal") as change:
-                with self.assertRaisesRegex(check.CheckError, "deadline_conflict"):
-                    check.bounded_fetch_models(self.base, "sk-test-secret-value")
-                change.assert_not_called()
+    def test_worker_result_cannot_echo_unknown_errors(self):
+        fake = mock.Mock(returncode=0, stdout=b'{"error":"private secret upstream payload"}')
+        with mock.patch.object(check.subprocess, "run", return_value=fake) as run:
+            with self.assertRaisesRegex(check.CheckError, "worker_failure"):
+                check.bounded_fetch_models(self.base, "sk-test-secret-value")
+            args, kw = run.call_args
+            self.assertNotIn("sk-test-secret-value", str(args))
+            self.assertNotIn("env", kw)
+            self.assertIn(b"sk-test-secret-value", kw["input"])
+
+    def test_real_worker_accepts_both_models(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                self.server.expected_auth = self.headers.get("Authorization") == "Bearer sk-test-secret-value"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(VALID_BODY)))
+                self.end_headers(); self.wfile.write(VALID_BODY)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01), daemon=True)
+        worker.start()
+        try:
+            visible = check.bounded_fetch_models("http://127.0.0.1:"+str(server.server_port), "sk-test-secret-value")
+            self.assertEqual(visible, {m: True for m in check.MODELS})
+            self.assertTrue(server.expected_auth)
+        finally:
+            server.shutdown(); server.server_close(); worker.join(timeout=1)
+
 
 
 if __name__ == "__main__":
