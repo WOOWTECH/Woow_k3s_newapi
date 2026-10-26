@@ -5,6 +5,8 @@ import os
 import stat
 import subprocess
 import sys
+import threading
+import time
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -141,23 +143,25 @@ class TestFreePilot(common.Base):
         self.assertEqual(rc, 0, err + out)
         self.assertEqual(json.loads(out)["confirmed"], list(range(len(report["plan"]["steps"]))))
 
-    def delayed_free_pricing(self):
-        original = fp.checked_request
-        state = {"published": False, "remaining": 3}
+    def delayed_free_pricing(self, after_stale=None, remaining=3):
+        original = self.fake.pricing
+        state = {"remaining": remaining, "stale_reads": 0}
 
-        def cached(c, method, path, body=None, auth=True):
-            answer = original(c, method, path, body, auth)
-            if method == "PUT" and body["key"] == "UserUsableGroups":
-                state["published"] = True
-            if method == "GET" and path == "/api/pricing" and state["published"] and state["remaining"]:
+        def cached():
+            answer = original()
+            if "free" in json.loads(self.fake.options["UserUsableGroups"]) and state["remaining"]:
                 state["remaining"] -= 1
+                state["stale_reads"] += 1
                 answer = copy.deepcopy(answer)
                 answer["group_ratio"].pop("free", None)
                 answer["usable_group"].pop("free", None)
                 for row in answer["data"]:
                     row["enable_groups"] = [g for g in row["enable_groups"] if g != "free"]
                 answer["data"] = [row for row in answer["data"] if row["enable_groups"]]
+                if state["stale_reads"] == 2 and after_stale:
+                    after_stale()
             return answer
+        cached.state = state
         return cached
 
     def test_delayed_final_free_pricing_converges_without_extra_writes_and_replans_noop(self):
@@ -165,12 +169,13 @@ class TestFreePilot(common.Base):
         self.pilot_options(dormant_global=True)
         report = self.plan()
         keyfile = self.private("cache-key", common.UPSTREAM_KEY)
-        with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
-                mock.patch("free_pilot.time.sleep") as sleep:
+        cached = self.delayed_free_pricing()
+        with mock.patch.object(self.fake, "pricing", cached), \
+                mock.patch.object(fp, "PRICING_POLL_SECONDS", 0.01):
             rc, out, err = self.run_tool(*self.apply_args(
                 report, os.path.join(self.tmp, "cache.jsonl"), keyfile), target="prod")
         self.assertEqual(rc, 0, err + out)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(cached.state["stale_reads"], 3)
         self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
         self.assertEqual(len(self.calls("POST", "/api/channel/")), 1)
         self.assertEqual(self.plan()["plan"]["steps"], [])
@@ -181,12 +186,13 @@ class TestFreePilot(common.Base):
         report = self.plan()
         keyfile = self.private("timeout-key", common.UPSTREAM_KEY)
         journal = os.path.join(self.tmp, "cache-timeout.jsonl")
-        with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
-                mock.patch("free_pilot.time.monotonic", side_effect=[0, 76]), \
-                mock.patch("free_pilot.time.sleep") as sleep:
+        cached = self.delayed_free_pricing(remaining=10000)
+        with mock.patch.object(self.fake, "pricing", cached), \
+                mock.patch.object(fp, "PRICING_WAIT_SECONDS", 0.3), \
+                mock.patch.object(fp, "PRICING_POLL_SECONDS", 0.01):
             rc, out, _ = self.run_tool(*self.apply_args(report, journal, keyfile), target="prod")
         self.assertEqual(rc, 2)
-        sleep.assert_not_called()
+        self.assertGreaterEqual(cached.state["stale_reads"], 2)
         result = json.loads(out)
         self.assertEqual(result["state"], "stopped-reconcile-read-only")
         self.assertEqual(result["confirmed"], list(range(len(report["plan"]["steps"]))))
@@ -202,18 +208,19 @@ class TestFreePilot(common.Base):
                 self.fake.requests.clear()
                 report = self.plan()
                 keyfile = self.private("drift-key-" + kind, common.UPSTREAM_KEY)
+                original_pricing = self.fake.pricing
+                drifted = []
 
-                def drift(_):
+                def drift():
+                    drifted.append(kind)
                     if kind == "option-json":
                         groups = json.loads(self.fake.options["GroupRatio"])
                         self.fake.options["GroupRatio"] = json.dumps(groups, separators=(",", ":"))
                     elif kind == "channel":
                         self.fake.channels[0]["base_url"] = "http://drift.invalid"
                     elif kind in ("paid-price", "paid-row-field", "paid-membership"):
-                        # Runtime-only drift: stored options remain byte-identical.
-                        original = self.fake.pricing
                         def changed():
-                            answer = original()
+                            answer = original_pricing()
                             if kind == "paid-price":
                                 answer["data"][0]["model_ratio"] += 0.000001
                             elif kind == "paid-membership":
@@ -225,17 +232,157 @@ class TestFreePilot(common.Base):
                     else:
                         self.fake.live_group_ratio = {"default": 1.01, "internal": 1}
 
-                original_pricing = self.fake.pricing
-                with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
-                        mock.patch("free_pilot.time.sleep", side_effect=drift) as sleep:
+                with mock.patch.object(self.fake, "pricing", self.delayed_free_pricing(after_stale=drift)), \
+                        mock.patch.object(fp, "PRICING_POLL_SECONDS", 0.01):
                     rc, out, _ = self.run_tool(*self.apply_args(report,
                         os.path.join(self.tmp, "drift-" + kind + ".jsonl"), keyfile), target="prod")
-                self.fake.pricing = original_pricing
                 self.fake.live_group_ratio = None
                 self.assertEqual(rc, 2)
-                sleep.assert_called_once()
+                self.assertEqual(drifted, [kind])
                 self.assertEqual(json.loads(out)["state"], "stopped-reconcile-read-only")
                 self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
+
+    def assert_final_http_deadline(self, mode):
+        self.prod()
+        self.pilot_options(dormant_global=True)
+        report = self.plan()
+        keyfile = self.private("stalled-key", common.UPSTREAM_KEY)
+        journal = os.path.join(self.tmp, "stalled.jsonl")
+        final = threading.Event()
+        stalled = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original_save = fp.Journal.save
+        handler_class = self.server.srv.RequestHandlerClass
+        original_send = handler_class._send
+        original_popen = subprocess.Popen
+        workers = []
+
+        def save(current):
+            original_save(current)
+            if current.report["confirmed"] == list(range(len(report["plan"]["steps"]))):
+                final.set()
+
+        def send(handler, code, obj):
+            if not final.is_set() or handler.path != "/api/pricing":
+                return original_send(handler, code, obj)
+            stalled.set()
+            try:
+                if mode == "stall":
+                    release.wait(3)
+                    return original_send(handler, code, obj)
+                raw = json.dumps(obj).encode()
+                handler.send_response(code)
+                handler.send_header("Content-Length", str(len(raw) + 150))
+                handler.end_headers()
+                # Each byte arrives before a socket inactivity timeout; the
+                # whole valid JSON response would only complete after 3s.
+                for _ in range(150):
+                    handler.wfile.write(b" ")
+                    handler.wfile.flush()
+                    if release.wait(0.02):
+                        return
+                handler.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Expected when the parent kills the reader on expiry.
+            finally:
+                finished.set()
+
+        def popen(*args, **kwargs):
+            worker = original_popen(*args, **kwargs)
+            workers.append(worker)
+            return worker
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(fp, "PRICING_WAIT_SECONDS", 0.5), \
+                    mock.patch.object(fp.Journal, "save", save), \
+                    mock.patch.object(handler_class, "_send", send), \
+                    mock.patch.object(fp.subprocess, "Popen", popen):
+                rc, out, _ = self.run_tool(*self.apply_args(report, journal, keyfile), target="prod")
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            finished.wait(1)
+        self.assertTrue(stalled.is_set())
+        self.assertEqual(rc, 2)
+        self.assertLess(elapsed, 2.5)
+        self.assertEqual(len(workers), 1)
+        self.assertIsNotNone(workers[0].returncode)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(workers[0].pid, os.WNOHANG)
+        self.assertNotIn(common.PAT, repr(workers[0].args))
+        self.assertNotIn(common.UPSTREAM_KEY, repr(workers[0].args))
+        result = json.loads(out)
+        self.assertEqual(result["state"], "stopped-reconcile-read-only")
+        self.assertEqual(result["confirmed"], list(range(len(report["plan"]["steps"]))))
+        self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
+        self.assertEqual(json.loads(self.read(journal).splitlines()[-1]), result)
+        self.assertNotIn(common.PAT, self.read(journal))
+        self.assertNotIn(common.UPSTREAM_KEY, self.read(journal))
+
+    def test_stalled_final_http_read_stops_at_deadline_with_confirmed_journal(self):
+        self.assert_final_http_deadline("stall")
+
+    def test_slow_drip_final_http_body_cannot_extend_deadline(self):
+        self.assert_final_http_deadline("drip")
+
+    def test_successful_worker_observed_after_deadline_is_rejected(self):
+        report = self.plan("stg")
+        original_popen = subprocess.Popen
+        workers = []
+
+        def popen(*args, **kwargs):
+            worker = original_popen(*args, **kwargs)
+            original_communicate = worker.communicate
+            def delayed_observer(*args, **kwargs):
+                answer = original_communicate(*args, **kwargs)
+                time.sleep(0.6)  # Parent scheduling delay after a real success.
+                return answer
+            worker.communicate = delayed_observer
+            workers.append(worker)
+            return worker
+
+        with mock.patch.object(fp, "PRICING_WAIT_SECONDS", 0.5), \
+                mock.patch.object(fp.subprocess, "Popen", popen):
+            rc, out, _ = self.run_tool(*self.apply_args(
+                report, os.path.join(self.tmp, "late-success.jsonl")), target="stg")
+        self.assertEqual(workers[0].returncode, 0)
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["state"], "stopped-reconcile-read-only")
+        self.assertEqual(self.writes(), [])
+
+    def test_worker_is_reaped_when_parent_communication_fails(self):
+        report = self.plan("stg")
+        original_popen = subprocess.Popen
+        workers = []
+
+        def popen(*args, **kwargs):
+            worker = original_popen(*args, **kwargs)
+            worker.communicate = mock.Mock(side_effect=OSError(common.PAT))
+            workers.append(worker)
+            return worker
+
+        with mock.patch.object(fp.subprocess, "Popen", popen):
+            rc, out, err = self.run_tool(*self.apply_args(
+                report, os.path.join(self.tmp, "reader-error.jsonl")), target="stg")
+        self.assertEqual(rc, 2)
+        self.assertEqual(json.loads(out)["state"], "stopped-reconcile-read-only")
+        self.assertNotIn(common.PAT, out + err)
+        self.assertIsNotNone(workers[0].returncode)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(workers[0].pid, os.WNOHANG)
+        self.assertEqual(self.writes(), [])
+
+    def test_worker_rejects_writes_and_suppresses_raw_input_errors(self):
+        client = fp.ReadOnlyClient(self.base, token=common.PAT)
+        with self.assertRaises(na.Fatal):
+            client.req("POST", "/api/channel/", {"key": common.UPSTREAM_KEY})
+        self.assertEqual(self.fake.requests, [])
+        result = subprocess.run([sys.executable, fp.__file__], input=common.PAT,
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout + result.stderr, "")
 
     def test_configured_staging_is_noop_and_existing_channel_is_byte_preserved(self):
         self.pilot_options(configured=True)

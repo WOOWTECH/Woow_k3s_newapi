@@ -34,7 +34,7 @@ python3 scripts/newapi_admin.py --base http://127.0.0.1:3301 \
 
 任何未知寫入結果、非目標選項／付費價格／既有渠道漂移，立即停止。原 journal 不能覆蓋，也沒有自動 retry、resume、rollback；不得換新 journal 盲目重送 POST。先唯讀核對 journal 每行的 attempted/confirmed、最後完整事件與上游實況。不要透過廣泛正式 writer 或臨時 raw API 腳本繞過限制；需修正計畫或另外審查的復原流程。
 
-每次 option PUT 都精確讀回；channel POST 後核對唯一新渠道、全部原渠道、精確 options 與付費價格。最後以最多 75 秒、每次間隔最多 1 秒的唯讀輪詢，等待 runtime pricing 的 free 倍率、可用群組與恰好兩個 Qwen 模型。每次讀取仍嚴格核對所有 option 字串、渠道與付費價格／群組；只忽略已證實會移動的 row `pricing_version`。逾時或任何真正漂移都保存 journal 並停止，沒有額外寫入或 mutation retry。完整驗收另含零餘額一般／串流推論、免費限流、用量與撤銷金鑰。既有 50 點轉換已成功一次，不得重複扣款或新建 request UUID。
+每次 option PUT 都精確讀回；channel POST 後核對唯一新渠道、全部原渠道、精確 options 與付費價格。最後以最多 75 秒、每次間隔最多 1 秒的唯讀輪詢，等待 runtime pricing 的 free 倍率、可用群組與恰好兩個 Qwen 模型。整個最終讀取階段由獨立、僅允許 GET 的 Python 子程序執行；父程序以單一 deadline 限制包含 DNS、連線及 response body 的等待，逾時終止並回收子程序，且不接受逾時才觀察到的成功。PAT 與比對基線只經私密 stdin pipe 傳入，子程序無 journal 檔案描述元，所有寫入與 journal 仍由父程序持有。每次讀取仍嚴格核對所有 option 字串、渠道與付費價格／群組；只忽略已證實會移動的 row `pricing_version`。逾時或任何真正漂移都保存 journal 並停止，沒有額外寫入或 mutation retry。完整驗收另含零餘額一般／串流推論、免費限流、用量與撤銷金鑰。既有 50 點轉換已成功一次，不得重複扣款或新建 request UUID。
 
 版本語義依據：new-api `v1.0.0-rc.44` 的 [model-rate-limit.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/middleware/model-rate-limit.go) 與 [price.go](https://github.com/QuantumNous/new-api/blob/v1.0.0-rc.44/relay/helper/price.go)。此 PR 不變更 image pin，不把離線測試宣稱為新映像 contract gate。
 
@@ -53,3 +53,5 @@ python3 scripts/newapi_admin.py --base http://127.0.0.1:3301 \
 [去識別結果與來源雜湊](validation/free-pilot-rc44-20261026.json) 記錄同一 rc.44 digest、SQLite emptyDir、Redis 與 loopback mock upstream 的完整演練：八步 apply 成功、重新 plan 無變更、原渠道及付費有效價格未變。同一使用者交錯呼叫，免費前 10 次 200、第 11／12 次 429，付費 12 次均 200；測試鍵撤銷後 401。零餘額使用者對兩個 Qwen 各一般／串流 200 且串流 DONE，餘額仍為 0。短期憑證撤銷、私密測試檔清除。
 
 完整 admin 工具回歸 229 項通過，離線 contract self-check 11 項通過；已有設定的 staging no-op 是離線測試。此次沒有正式設定變更，mock 成功不代表正式 GPU 推論已成功，也未驗證 PaaS 每日 200 次 meter 或作為映像升版 gate。
+
+後續 deadline 修正以本機真實 HTTP stalled response／持續 slow-drip body 測試驗證，另涵蓋晚到成功拒絕、子程序回收與既有漂移檢查。新增 5 項回歸後，free-pilot 28 項、完整 admin 234 項及 contract self-check 11 項皆通過。上述 rc.44 隔離演練 receipt 保留原來源雜湊；它沒有驗證後續子程序實作。
