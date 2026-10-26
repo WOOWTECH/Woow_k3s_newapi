@@ -1,6 +1,6 @@
 # rc.44 免費試用修復
 
-正式目前只有 default/internal 倍率 1、免費群組與渠道缺漏、零餘額預扣開啟、模型限流關閉。PaaS 免費金鑰因此無法完成 Qwen 請求。`free-pilot` 是從這個實際基線出發的限定維運命令；既有 `apply-settings`、`apply-pricing`、`apply-channels` 及任意 `call` 正式寫入禁令不變。
+本命令的原始正式基線只有 default/internal 倍率 1、免費群組與渠道缺漏、零餘額預扣開啟、模型限流關閉。在該基線下，PaaS 免費金鑰無法完成 Qwen 請求。`free-pilot` 是從這個實際基線出發的限定維運命令；既有 `apply-settings`、`apply-pricing`、`apply-channels` 及任意 `call` 正式寫入禁令不變。
 
 ## 範圍與邊界
 
@@ -9,6 +9,14 @@
 - 保留原來全部付費倍率、模型價格及既有路由。正式 default 1 不會升為 1.3。預設關閉的限流改為啟用時，先將全域 count/success 設為 0（rc.44 的不限流），free 改為 `[10,10]`（rc.44 的群組設定驗證要求第二項至少 1；全域 0 仍表示不限流），避免意外啟動原本 dormant 的付費 1000 次上限。已啟用限流的 staging 保留既有限流值與正數 free success 上限；free success 為 0 時改為 10，以符合 rc.44 寫入驗證。每天 200 次仍由 PaaS meter cron 執行，不在此命令實作。
 - `enable_free_model_pre_consume=false` 是全站設定：既有零價格模型也可在零餘額下使用。計畫會列出這些非 free 模型。這不是已完成 D20 清理或正式公開販售的證據。既有 Qwen paid 路由也仍保留；此命令不掩蓋完整 pricing contract 的倍率／通路落差。
 - 不修改映像、LiteLLM、帳戶、金鑰、錢包、條款或正式 PaaS pilot 名單。設定成功不等於推論成功；輸出明確為 `configured-not-inference-tested`。
+
+## 上游金鑰預檢
+
+2026-10-26 實際接線發現：可使用付費模型的 LiteLLM key，不一定可使用免費 Qwen。new-api 設定與 no-op 讀回成功後，仍可能由上游回傳 `key_model_access_denied`。
+
+套用前先使用同一把預定接線的 key 執行 [免費上游權限預檢](FREE-UPSTREAM-CHECK.md)，確認兩個 Qwen 都可見；保留安全結果，不能以付費模型成功代替。這是操作者需執行的獨立步驟，`free-pilot` 本身仍不會自動呼叫預檢。清單通過後，仍需用受控帳戶實測一般與串流推論、免費不扣付費 quota 及刪鍵失效。
+
+已建立的通道若接錯金鑰，不要重跑建立或擴大上游 key 權限。先正常認證確認原核可金鑰的 Qwen 權限，再走另外審查的單一通道金鑰替換流程；不更動 LiteLLM 設定、不從資料庫抽取憑證。
 
 ## 執行
 
