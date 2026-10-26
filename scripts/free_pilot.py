@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import urllib.parse
 
 import newapi_admin as na
@@ -24,6 +25,8 @@ CHANNEL = {
 SPECIAL = "group_ratio_setting.group_special_usable_group"
 PRECONSUME = "quota_setting.enable_free_model_pre_consume"
 RATE = "ModelRequestRateLimit"
+PRICING_WAIT_SECONDS = 75
+PRICING_POLL_SECONDS = 1
 ALLOWED_OPTIONS = frozenset(("GroupRatio", "UserUsableGroups", SPECIAL, PRECONSUME,
                            RATE + "Enabled", RATE + "Count", RATE + "SuccessCount", RATE + "Group"))
 VOLATILE_CHANNEL = frozenset(("key", "test_time", "response_time", "used_quota"))
@@ -129,7 +132,10 @@ def paid_pricing(pricing):
             reject("invalid model pricing entry")
         groups = sorted(g for g in row["enable_groups"] if g != "free")
         if groups:
-            rows.append({**row, "enable_groups": groups})
+            # rc.44 puts this cache marker on an arbitrary first row; its
+            # movement is not a paid price or routing change.
+            rows.append({**{k: v for k, v in row.items() if k != "pricing_version"},
+                         "enable_groups": groups})
     result["data"] = sorted(rows, key=lambda row: row["model_name"])
     return result
 
@@ -194,10 +200,13 @@ def build_plan(opts, channels, pricing, target):
             reject("requires the observed single legacy default Qwen route before production migration")
 
     new_rates = copy.deepcopy(rates)
-    # Disabled -> enabled must NOT activate the dormant global 1000/min cap.
-    # rc.44 skips both count and success limit when they are zero.
+    # Global zero bypasses counters, but rc.44's option validator requires
+    # group success >= 1. With paid counters bypassed, [10,10] is free-only.
+    # Preserve an already-enabled free success cap (or its global fallback).
     success = (rates.get("free", [0, int(opts[RATE + "SuccessCount"])])[1]
-               if enabled == "true" else 0)
+               if enabled == "true" else 10)
+    if success == 0:
+        success = 10
     new_rates["free"] = [10, success]
     desired = [(RATE + "Count", int(opts[RATE + "Count"]) if enabled == "true" else 0),
                (RATE + "SuccessCount", int(opts[RATE + "SuccessCount"]) if enabled == "true" else 0),
@@ -303,7 +312,10 @@ def cmd_free_pilot(a):
                 body = {**CHANNEL, "remark": "free-pilot rc.44; fixed Qwen route", "key": upstream}
                 checked_request(c, "POST", "/api/channel/", {"mode": "single", "channel": body})
                 del body
-                _, observed, _ = read_state(c, a.target)
+                observed_opts, observed, observed_prices = read_state(c, a.target)
+                if (observed_opts != expected_opts
+                        or digest(paid_pricing(observed_prices)) != paid_hash):
+                    reject("state drift after create; stop and reconcile read-only")
                 created = free_channel(observed)
                 if created is None:
                     reject("channel create not observable; never retry blindly")
@@ -315,11 +327,27 @@ def cmd_free_pilot(a):
             report["confirmed"].append(index)
             report["state"] = "step-confirmed"
             journal.save()
-        _, after_channels, after_prices = check()
-        if (free_channel(after_channels) is None or not na.close(after_prices["group_ratio"].get("free"), 0)
-                or "free" not in after_prices["usable_group"]
-                or {row["model_name"] for row in after_prices["data"] if "free" in row["enable_groups"]} != set(MODELS)):
-            reject("final effective free routing check failed")
+        # rc.44's pricing cache can lag the committed channel/group writes.
+        # Poll only reads after every mutation has been confirmed; each read
+        # still checks exact options, all channels and every paid price field.
+        deadline = time.monotonic() + PRICING_WAIT_SECONDS
+        while True:
+            _, after_channels, after_prices = check()
+            if free_channel(after_channels) is None:
+                reject("final free channel absent")
+            free_models = [row["model_name"] for row in after_prices["data"]
+                           if "free" in row["enable_groups"]]
+            if (set(free_models) - set(MODELS) or len(free_models) != len(set(free_models))
+                    or ("free" in after_prices["group_ratio"]
+                        and not na.close(after_prices["group_ratio"]["free"], 0))):
+                reject("final effective free routing drift")
+            if (na.close(after_prices["group_ratio"].get("free"), 0)
+                    and "free" in after_prices["usable_group"] and set(free_models) == set(MODELS)):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                reject("free pricing cache did not converge; reconcile read-only")
+            time.sleep(min(PRICING_POLL_SECONDS, remaining))
         report["state"] = "configured-not-inference-tested"
         journal.save()
     except Exception:

@@ -178,6 +178,20 @@ def make_handler(fake):
                 key = body["key"]
                 if key.startswith("payment_setting.compliance_"):
                     return self._send(200, {"success": False, "message": "Compliance fields cannot be changed"})
+                if key == "ModelRequestRateLimitGroup":
+                    # setting/rate_limit.go: CheckModelRequestRateLimitGroup
+                    # validates the option before it is stored (rc.44).
+                    try:
+                        rates = json.loads(go_string(body["value"]))
+                        valid = isinstance(rates, dict) and all(
+                            isinstance(pair, list) and len(pair) == 2
+                            and all(type(n) is int and n <= (2**63 - 1) // 86400 for n in pair)
+                            and pair[0] >= 0 and pair[1] >= 1
+                            for pair in rates.values())
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid:
+                        return self._send(200, {"success": False, "message": "invalid group rate limit"})
                 fake.options[key] = go_string(body["value"])
                 return self._send(200, {"success": True, "message": ""})
             if (method, path) == ("GET", "/api/pricing"):
