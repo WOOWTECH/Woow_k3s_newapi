@@ -1,0 +1,110 @@
+{
+  "verified_at": "2026-10-26T06:00:20.074695+00:00",
+  "scope": "owned isolated rc44 SQLite emptyDir + loopback mock + Redis",
+  "source_sha256": "e53aac7359ad9a83cb9cb6e6fb63d55dc8e660e8fbea88e87761ed74da2fd3c2",
+  "pinned_image": "docker.io/calciumion/new-api:v1.0.0-rc.44@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84",
+  "runtime_image_id": "docker.io/calciumion/new-api@sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84",
+  "passed": [
+    "pinned_rc44_runtime",
+    "root_setup",
+    "root_login",
+    "normal_api_root_session_and_short_lived_pat",
+    "production_like_baseline",
+    "old_free_10_0_rejected_by_actual_api",
+    "candidate_plan_read_only",
+    "candidate_apply",
+    "candidate_noop",
+    "free_10_minute_paid_interleaved_unthrottled",
+    "free_key_revoked",
+    "zero_balance_both_qwen_streams",
+    "zero_balance_both_qwen"
+  ],
+  "old_invalid_group": {
+    "http": 200,
+    "success": false,
+    "unchanged": true
+  },
+  "plan_steps": 8,
+  "apply_exit_code": 0,
+  "paid_prices_unchanged": true,
+  "legacy_channel_unchanged": true,
+  "final_limiter": {
+    "ModelRequestRateLimitSuccessCount": "0",
+    "ModelRequestRateLimitGroup": "{\"free\": [10, 10]}",
+    "ModelRequestRateLimitEnabled": "true",
+    "ModelRequestRateLimitCount": "0",
+    "ModelRequestRateLimitDurationMinutes": "1"
+  },
+  "same_user_interleaving": {
+    "free_http": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      429,
+      429
+    ],
+    "paid_http": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200,
+      200
+    ]
+  },
+  "revoked_key_http": 401,
+  "zero_balance": {
+    "before": 0,
+    "results": [
+      {
+        "http": 200,
+        "mock_ok": true,
+        "error_code": null
+      },
+      {
+        "http": 200,
+        "mock_ok": true,
+        "error_code": null
+      }
+    ],
+    "after": 0
+  },
+  "zero_balance_streams": [
+    {
+      "model": "qwen3-4b-aicoder",
+      "http": 200,
+      "mock_ok": true,
+      "done": true
+    },
+    {
+      "model": "qwen3-4b-cluster1",
+      "http": 200,
+      "mock_ok": true,
+      "done": true
+    }
+  ],
+  "credentials_revoked": true,
+  "private_files_removed": true,
+  "unit_tests": 229,
+  "offline_contract_selfchecks": 11,
+  "limits": [
+    "Mock upstream; not real GPU inference.",
+    "No production mutation or image-pin change.",
+    "Not an image-upgrade contract gate.",
+    "PaaS daily-200 meter not exercised.",
+    "Existing-staging no-op covered offline, not against live staging."
+  ]
+}

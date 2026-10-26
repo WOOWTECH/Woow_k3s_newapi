@@ -43,7 +43,7 @@ class TestFreePilot(common.Base):
             fp.RATE + "Count": 0,
             fp.RATE + "SuccessCount": 1000 if dormant_global else 0,
             fp.RATE + "DurationMinutes": 1,
-            fp.RATE + "Group": {"free": [10, 0]} if configured else {},
+            fp.RATE + "Group": {"free": [10, 10]} if configured else {},
             fp.PRECONSUME: not configured,
             "RegisterEnabled": False,
         }
@@ -100,8 +100,14 @@ class TestFreePilot(common.Base):
         self.assertEqual(json.loads(self.fake.options["GroupRatio"])["internal"], 1)
         self.assertEqual(self.fake.options[fp.RATE + "Count"], "0")
         self.assertEqual(self.fake.options[fp.RATE + "SuccessCount"], "0")
-        self.assertEqual(self.fake.options[fp.RATE + "Group"], '{"free": [10, 0]}')
+        self.assertEqual(self.fake.options[fp.RATE + "Group"], '{"free": [10, 10]}')
         self.assertEqual(self.fake.options[fp.RATE + "Enabled"], "true")
+        option_writes = [body for _, _, _, body in self.calls("PUT", "/api/option/")]
+        enabled_at = next(i for i, body in enumerate(option_writes)
+                          if body["key"] == fp.RATE + "Enabled")
+        self.assertEqual({body["key"]: body["value"] for body in option_writes[:enabled_at]}, {
+            fp.RATE + "SuccessCount": 0, fp.RATE + "Group": '{"free": [10, 10]}',
+        })
         self.assertEqual(self.fake.options[fp.PRECONSUME], "false")
         self.assertEqual([c for c in self.fake.channels if c["group"] != "free"], before_channels)
         self.assertEqual(sum(c["group"] == "free" for c in self.fake.channels), 1)
@@ -113,6 +119,123 @@ class TestFreePilot(common.Base):
         self.assertEqual(stat.S_IMODE(os.stat(journal).st_mode), 0o600)
         self.assertNotIn(common.UPSTREAM_KEY, self.read(journal))
         self.assertEqual(len(self.calls("POST", "/api/channel/")), 1)
+
+    def test_pricing_version_movement_does_not_stop_apply(self):
+        self.prod()
+        self.pilot_options(dormant_global=True)
+        original = self.fake.pricing
+        reads = 0
+
+        def moving_metadata():
+            nonlocal reads
+            answer = original()
+            answer["data"][reads % len(answer["data"])]["pricing_version"] = "same-cache-hash"
+            reads += 1
+            return answer
+
+        with mock.patch.object(self.fake, "pricing", moving_metadata):
+            report = self.plan()
+            keyfile = self.private("metadata-key", common.UPSTREAM_KEY)
+            rc, out, err = self.run_tool(*self.apply_args(
+                report, os.path.join(self.tmp, "metadata.jsonl"), keyfile), target="prod")
+        self.assertEqual(rc, 0, err + out)
+        self.assertEqual(json.loads(out)["confirmed"], list(range(len(report["plan"]["steps"]))))
+
+    def delayed_free_pricing(self):
+        original = fp.checked_request
+        state = {"published": False, "remaining": 3}
+
+        def cached(c, method, path, body=None, auth=True):
+            answer = original(c, method, path, body, auth)
+            if method == "PUT" and body["key"] == "UserUsableGroups":
+                state["published"] = True
+            if method == "GET" and path == "/api/pricing" and state["published"] and state["remaining"]:
+                state["remaining"] -= 1
+                answer = copy.deepcopy(answer)
+                answer["group_ratio"].pop("free", None)
+                answer["usable_group"].pop("free", None)
+                for row in answer["data"]:
+                    row["enable_groups"] = [g for g in row["enable_groups"] if g != "free"]
+                answer["data"] = [row for row in answer["data"] if row["enable_groups"]]
+            return answer
+        return cached
+
+    def test_delayed_final_free_pricing_converges_without_extra_writes_and_replans_noop(self):
+        self.prod()
+        self.pilot_options(dormant_global=True)
+        report = self.plan()
+        keyfile = self.private("cache-key", common.UPSTREAM_KEY)
+        with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
+                mock.patch("free_pilot.time.sleep") as sleep:
+            rc, out, err = self.run_tool(*self.apply_args(
+                report, os.path.join(self.tmp, "cache.jsonl"), keyfile), target="prod")
+        self.assertEqual(rc, 0, err + out)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
+        self.assertEqual(len(self.calls("POST", "/api/channel/")), 1)
+        self.assertEqual(self.plan()["plan"]["steps"], [])
+
+    def test_final_free_pricing_timeout_stops_with_confirmed_writes_and_safe_journal(self):
+        self.prod()
+        self.pilot_options(dormant_global=True)
+        report = self.plan()
+        keyfile = self.private("timeout-key", common.UPSTREAM_KEY)
+        journal = os.path.join(self.tmp, "cache-timeout.jsonl")
+        with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
+                mock.patch("free_pilot.time.monotonic", side_effect=[0, 76]), \
+                mock.patch("free_pilot.time.sleep") as sleep:
+            rc, out, _ = self.run_tool(*self.apply_args(report, journal, keyfile), target="prod")
+        self.assertEqual(rc, 2)
+        sleep.assert_not_called()
+        result = json.loads(out)
+        self.assertEqual(result["state"], "stopped-reconcile-read-only")
+        self.assertEqual(result["confirmed"], list(range(len(report["plan"]["steps"]))))
+        self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
+        self.assertEqual(json.loads(self.read(journal).splitlines()[-1]), result)
+        self.assertNotIn(common.UPSTREAM_KEY, self.read(journal))
+
+    def test_each_final_pricing_poll_checks_exact_options_channels_and_paid_prices(self):
+        for kind in ("option-json", "channel", "paid-price", "paid-group-ratio", "paid-row-field", "paid-membership"):
+            with self.subTest(kind=kind):
+                self.prod()
+                self.pilot_options(dormant_global=True)
+                self.fake.requests.clear()
+                report = self.plan()
+                keyfile = self.private("drift-key-" + kind, common.UPSTREAM_KEY)
+
+                def drift(_):
+                    if kind == "option-json":
+                        groups = json.loads(self.fake.options["GroupRatio"])
+                        self.fake.options["GroupRatio"] = json.dumps(groups, separators=(",", ":"))
+                    elif kind == "channel":
+                        self.fake.channels[0]["base_url"] = "http://drift.invalid"
+                    elif kind in ("paid-price", "paid-row-field", "paid-membership"):
+                        # Runtime-only drift: stored options remain byte-identical.
+                        original = self.fake.pricing
+                        def changed():
+                            answer = original()
+                            if kind == "paid-price":
+                                answer["data"][0]["model_ratio"] += 0.000001
+                            elif kind == "paid-membership":
+                                answer["data"][0]["enable_groups"] = ["internal"]
+                            else:
+                                answer["data"][0]["unknown_metadata"] = "must-not-ignore"
+                            return answer
+                        self.fake.pricing = changed
+                    else:
+                        self.fake.live_group_ratio = {"default": 1.01, "internal": 1}
+
+                original_pricing = self.fake.pricing
+                with mock.patch.object(fp, "checked_request", side_effect=self.delayed_free_pricing()), \
+                        mock.patch("free_pilot.time.sleep", side_effect=drift) as sleep:
+                    rc, out, _ = self.run_tool(*self.apply_args(report,
+                        os.path.join(self.tmp, "drift-" + kind + ".jsonl"), keyfile), target="prod")
+                self.fake.pricing = original_pricing
+                self.fake.live_group_ratio = None
+                self.assertEqual(rc, 2)
+                sleep.assert_called_once()
+                self.assertEqual(json.loads(out)["state"], "stopped-reconcile-read-only")
+                self.assertEqual(len(self.writes()), len(report["plan"]["steps"]))
 
     def test_configured_staging_is_noop_and_existing_channel_is_byte_preserved(self):
         self.pilot_options(configured=True)
