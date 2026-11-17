@@ -2265,6 +2265,17 @@ class DailyValuesTest(Harness):
 
 
 class TemplateTest(unittest.TestCase):
+    def test_every_file_of_the_sync_is_an_apporo_file(self):
+        # After the Apporo values PR (#44) its CI checks a change strictly only when a path contains
+        # "apporo" (scripts/apporo_checks.py is_apporo): the sync's own modules must, or a change to
+        # one of them alone would count as a WOOW change and the Apporo checks would only warn.
+        for module in (aps, nc):
+            self.assertIn("apporo", os.path.relpath(module.__file__, REPO), module.__file__)
+        for rel in ("scripts/apporo-sync-daily.sh", "deploy/apporo-sync/profile.json", "docs/APPORO-SYNC.md",
+                    "tests/apporo_sync/sandbox.py", "tests/apporo_sync/rc44_price_tables.py"):
+            self.assertTrue(os.path.exists(os.path.join(REPO, rel)), rel)
+        self.assertFalse(os.path.exists(os.path.join(REPO, "scripts", "newapi_content.py")))
+
     def test_the_daily_templates_default_to_report(self):
         script = read_text(os.path.join(REPO, "scripts", "apporo-sync-daily.sh"))
         self.assertIn('${APPORO_SYNC_MODE:-report}', script)
