@@ -132,6 +132,15 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(self.repo.changed('main'), ['README.md', 'scripts/apporo_new_tool.py'])
         self.assertTrue(self.repo.strict('main')[0])
 
+    def test_bytecode_caches_never_count(self):
+        # CI compiles scripts/apporo_*.py before this step; this repository has no .gitignore.
+        self.repo.write('chart/values.yaml', 'a chart change\n')
+        self.repo.commit('woow')
+        self.repo.write('scripts/__pycache__/apporo_checks.cpython-312.pyc', 'bytecode')
+        self.repo.write('scripts/apporo_checks.pyc', 'bytecode')
+        self.assertEqual(self.repo.changed('main'), ['chart/values.yaml'])
+        self.assertFalse(self.repo.strict('main')[0])
+
     def test_changes_merged_to_the_base_after_the_branch_point_are_not_this_change(self):
         # main moves on with an Apporo change; this branch, started earlier,
         # changes only WOOW: compared with main's tip it would look like an

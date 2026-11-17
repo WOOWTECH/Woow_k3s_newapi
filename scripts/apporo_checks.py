@@ -101,7 +101,11 @@ def changed_paths(base_ref, cwd=None):
         raise UsageError(f'base ref {base_ref} not found (fetch it with full history, as the contract gate does)')
     base = git('merge-base', base_ref, 'HEAD', cwd=cwd).strip()
     tracked = git('diff', '--name-only', '--no-renames', '-z', base, '--', cwd=cwd).split('\0')
-    untracked = git('ls-files', '--others', '--exclude-standard', '-z', cwd=cwd).split('\0')
+    # Untracked files count too (a local run before the commit), except bytecode
+    # caches: CI's earlier steps compile scripts/apporo_*.py, and a cache must
+    # never turn a WOOW change into an Apporo one, .gitignore or not.
+    untracked = [path for path in git('ls-files', '--others', '--exclude-standard', '-z', cwd=cwd).split('\0')
+                 if '__pycache__/' not in path and not path.endswith('.pyc')]
     return base, sorted({path for path in tracked + untracked if path})
 
 
