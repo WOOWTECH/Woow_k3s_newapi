@@ -92,21 +92,6 @@ EOF
             operator: In
             values: [server, cron]
 EOF
-# Apporo (deploy/apporo-k3s.yaml): apun web (application) + cron pods.
-{ head_; cat <<'EOF'; } | check apporo-shape pass -
-  clients:
-    - name: apun-odoo
-      namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: apun
-      podSelector:
-        matchLabels:
-          app.kubernetes.io/name: apun
-        matchExpressions:
-          - key: app.kubernetes.io/component
-            operator: In
-            values: [application, cron]
-EOF
 
 n=0
 for rx in '^.+$' '^wp\d{10}$|^root$' '^w.*$' '^(wp|ws)\d{10}$' '^wp\S{10}$' '^wp\d{10}' '^[a-z]{2}\d{10}$'; do

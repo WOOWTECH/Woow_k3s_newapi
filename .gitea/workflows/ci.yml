@@ -39,53 +39,23 @@ jobs:
           helm lint ./chart
           helm lint ./chart -f deploy/woow-k3s.yaml
           helm lint ./chart -f deploy/woow-k3s-stg.yaml
-          helm lint ./chart -f deploy/apporo-k3s.yaml
           helm template newapi ./chart -n new-api -f deploy/woow-k3s.yaml > /tmp/rendered.yaml
           helm template newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml > /tmp/rendered-stg.yaml
-          # Apporo instance (docs/APPORO-K3S.md): its own values are checked by
-          # scripts/tests/test_apporo_values.py (blocking); whether it still
-          # follows WOOW prod by the warn-only step below.
-          helm template newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml > /tmp/rendered-apporo.yaml
-          grep -c '^kind:' /tmp/rendered.yaml /tmp/rendered-stg.yaml /tmp/rendered-apporo.yaml
-
-      # Does deploy/apporo-k3s.yaml still equal WOOW prod plus the documented
-      # Apporo differences (docs/APPORO-K3S.md)? Warn-only by owner decision
-      # (2026-11-17): a WOOW change that leaves Apporo behind (values, the
-      # LiteLLM ingress copy, the proxy pin, or a proxy value the chart now
-      # requires while Apporo's proxy is dormant) prints a ::warning:: and the
-      # job stays green. Nothing syncs these values automatically yet: Apporo
-      # follows in a PR of its own, checked with --strict before its install or
-      # helm upgrade. An Apporo file that does not render as committed still
-      # fails here (exit 2): the shared chart must render every committed values
-      # file, like WOOW stg.
-      - name: Apporo follows WOOW prod (warn-only)
-        run: python3 scripts/apporo_parity.py
+          grep -c '^kind:' /tmp/rendered.yaml /tmp/rendered-stg.yaml
 
       - name: Images are pinned by digest
         run: |
           set -euo pipefail
-          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml /tmp/rendered-apporo.yaml; do
+          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml; do
             bad=$(grep -E '^\s+image: ' "$f" | grep -v '@sha256:' || true)
             if [ -n "$bad" ]; then echo "unpinned images in $f:"; echo "$bad"; exit 1; fi
           done
 
-      # newapi-proxy must be active with a real pinned image in every WOOW
-      # environment. Apporo stays dormant (proxy.enabled: false) until its own
-      # activation PR (docs/APPORO-K3S.md 〈打開 proxy〉); from then on it is
-      # checked like the others. While dormant, scripts/apporo_parity.py also
-      # renders it with the proxy switched on (the chart's proxy guards; warn-only).
+      # newapi-proxy must be active with a real pinned image in both environments.
       - name: newapi-proxy component
         run: |
           set -euo pipefail
-          renders="/tmp/rendered.yaml /tmp/rendered-stg.yaml"
-          if python3 -c 'import sys; from tests.contract import gate_check; sys.exit(not gate_check.proxy_enabled(open("deploy/apporo-k3s.yaml").read()))'; then
-            renders="$renders /tmp/rendered-apporo.yaml"
-          elif grep -q '^  name: newapi-proxy$' /tmp/rendered-apporo.yaml; then
-            echo "::error::deploy/apporo-k3s.yaml is dormant but renders newapi-proxy objects"; exit 1
-          else
-            echo "deploy/apporo-k3s.yaml: newapi-proxy dormant until its activation PR"
-          fi
-          for f in $renders; do
+          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml; do
             for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
               awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
                 "$f" || { echo "$f lacks the newapi-proxy $kind"; exit 1; }
@@ -157,11 +127,6 @@ jobs:
       # newapi.image or a deploy/woow-k3s*.yaml proxy.image must commit the
       # green stg report for exactly those digests
       # (tests/contract/reports/<tag>_<sha>.json; docs/OPERATIONS.md 〈升版〉).
-      # deploy/apporo-k3s.yaml's proxy pin needs the same green report and must
-      # be a pin deploy/woow-k3s.yaml has or had; the admin tool unit tests
-      # check it (scripts/tests/test_apporo_values.py). Whether it is WOOW prod's
-      # current pin is scripts/apporo_parity.py (warn-only; it also catches a
-      # WOOW rollback that leaves Apporo ahead).
       - name: Contract gate (image bump needs a green stg report)
         run: |
           set -euo pipefail
@@ -172,3 +137,23 @@ jobs:
             base="HEAD~1"
           fi
           python3 tests/contract/gate_check.py --base-ref "$base"
+
+      # Apporo's new-api (deploy/apporo-k3s.yaml, docs/APPORO-K3S.md): all of
+      # its checks are here and none of the steps above looks at it. Owner
+      # decision 2026-11-17: Apporo never turns a WOOW PR red. A change that
+      # touches no Apporo file (a path containing "apporo") gets them warn-only:
+      # ::warning:: lines and a green step, also when a chart or image change
+      # leaves Apporo's committed or dormant values behind. A change to an
+      # Apporo file gets them strictly, parity with WOOW prod included.
+      # Changed files are taken against the merge base with the PR base, the
+      # base fetched as the contract gate does it.
+      - name: Apporo checks (strict only when the change touches Apporo files)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD~1"
+          fi
+          python3 scripts/apporo_checks.py --base-ref "$base"

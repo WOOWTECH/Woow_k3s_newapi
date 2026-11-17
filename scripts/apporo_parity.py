@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Does Apporo's new-api (deploy/apporo-k3s.yaml) still follow WOOW prod?
 
-Owner decision 2026-11-17: Apporo follows WOOW prod, but this comparison never
-blocks a WOOW pull request. CI runs it warn-only: when Apporo is behind it
-prints a warning and exits 0. Nothing closes that gap automatically yet: the
-daily sync tool (scripts/apporo_sync.py, Woow_k3s_newapi PR #45) covers the
-New API database content and the image pins, not these values. Until it runs
-this with --strict, run --strict yourself before every Apporo install or helm
-upgrade, and bring deploy/apporo-k3s.yaml up to date in a PR of its own
-(docs/APPORO-K3S.md 〈跟著 WOOW 改〉). Apporo's own values are checked
-separately, and those checks do block: scripts/tests/test_apporo_values.py.
+Owner decision 2026-11-17: Apporo follows WOOW prod, but Apporo never blocks a
+WOOW pull request. CI runs this with --strict as the "parity" check of
+scripts/apporo_checks.py, which fails only a change that touches an Apporo file
+and turns the result into a warning for any other change. Nothing closes the
+gap a WOOW change leaves automatically yet: the daily sync tool
+(scripts/apporo_sync.py, Woow_k3s_newapi PR #45) covers the New API database
+content and the image pins, not these values. Bring deploy/apporo-k3s.yaml up
+to date in a PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉), and before
+every Apporo install or helm upgrade run scripts/apporo_checks.py --strict,
+which runs this with --strict and checks Apporo's own values
+(scripts/tests/test_apporo_values.py) as well.
 
 Offline: helm template only, no cluster, credentials or network.
 
@@ -31,14 +33,13 @@ Offline: helm template only, no cluster, credentials or network.
   scripts/apporo_parity.py [--strict]
 
 Exit: 0 in sync, or behind without --strict (warning printed); 1 behind with
---strict; 2 error.
+--strict; 2 error. Whether a result blocks a pull request is
+scripts/apporo_checks.py's call, not this tool's.
 - An Apporo file that cannot be read, or does not render as committed, is an
-  error in both modes: that is what helm would deploy, and the shared chart
-  must render every committed values file (WOOW stg likewise).
+  error in both modes: that is what helm would deploy.
 - While Apporo's proxy is dormant, a render that fails only with the proxy
-  switched on is a warning without --strict: a chart change made for WOOW, such
-  as a new required proxy value, must not block the WOOW PR. With --strict it
-  is an error (Apporo cannot be activated like that).
+  switched on is a warning without --strict and an error with it (Apporo cannot
+  be activated like that).
 - A WOOW side that cannot be rendered is a warning without --strict: the WOOW
   lint/render step reports a broken WOOW file on its own.
 """
@@ -235,7 +236,7 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
         message = f'{what}: {err}'.strip()
         print(f'ERROR   {message}')
         print(f'::error file={rel(apporo)},title=Apporo values do not render::'
-              + one_line(message.splitlines()[0] + ' (Apporo\'s own validity: this fails in every mode)'))
+              + one_line(message.splitlines()[0] + ' (Apporo\'s own validity: an error in every mode of this tool)'))
         return 2
 
     try:
@@ -364,9 +365,9 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
     if strict:
         print('FAILED  ' + '. '.join(summary))
         return 2 if (errors or cannot) else 1
-    note = ('. Warn-only (owner decision 2026-11-17): this does not block the PR. Nothing syncs these values '
+    note = ('. Warn-only (owner decision 2026-11-17: Apporo never blocks a WOOW PR). Nothing syncs these values '
             'automatically yet: bring deploy/apporo-k3s.yaml up to date in a PR of its own, and run '
-            'scripts/apporo_parity.py --strict before any Apporo install or helm upgrade '
+            'scripts/apporo_checks.py --strict before any Apporo install or helm upgrade '
             '(docs/APPORO-K3S.md 〈跟著 WOOW 改〉)')
     print('WARNING (not blocking) ' + '. '.join(summary) + note)
     print(f'::warning file={rel(apporo)},title=Apporo does not follow WOOW prod::' + one_line('. '.join(summary) + note))
@@ -376,7 +377,7 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--strict', action='store_true',
-                        help='exit 1 when Apporo is behind (before an Apporo install or helm upgrade)')
+                        help='exit 1 when Apporo is behind (scripts/apporo_checks.py runs it so)')
     parser.add_argument('--woow', type=Path, default=WOOW, help=argparse.SUPPRESS)
     parser.add_argument('--apporo', type=Path, default=APPORO, help=argparse.SUPPRESS)
     parser.add_argument('--litellm-woow', type=Path, default=LITELLM_WOOW, help=argparse.SUPPRESS)
