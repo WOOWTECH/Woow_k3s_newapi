@@ -219,6 +219,15 @@ class ModeTests(unittest.TestCase):
         rc, out = self.main('--strict', which=(('c', 'C', crash),))
         self.assertEqual(rc, 1, out)
 
+    def test_checks_that_cannot_start_are_still_warn_only(self):
+        with mock.patch.object(checks, 'Checks', side_effect=RuntimeError('no setup')):
+            rc, out = self.main('--warn-only', which=(('a', 'A', fake('ok', 'fine')),))
+            self.assertEqual(rc, 0, out)
+            self.assertIn("could not start: RuntimeError('no setup')", out)
+            self.assertIn('::warning file=deploy/apporo-k3s.yaml,title=Apporo setup (not blocking)::', out)
+            rc, out = self.main('--strict', which=(('a', 'A', fake('ok', 'fine')),))
+            self.assertEqual(rc, 1, out)
+
     def test_all_passed_prints_no_annotation(self):
         rc, out = self.main('--strict', which=(('a', 'A', fake('ok', 'fine')), ('s', 'S', fake('skip', 'n/a'))))
         self.assertEqual(rc, 0, out)
@@ -275,12 +284,77 @@ class ProxyObjectsTests(unittest.TestCase):
         self.assertEqual(checks.proxy_problems(self.render(images=(zero,))), ['renders the placeholder proxy digest'])
 
 
+class ChecksTests(unittest.TestCase):
+    """Each check's verdicts, with helm replaced (the real runs are the step itself)."""
+
+    PROXY = ''.join(f'---\nkind: {kind}\nmetadata:\n  name: newapi-proxy\n' for kind in checks.PROXY_KINDS) + (
+        '---\nkind: Deployment\nmetadata:\n  name: newapi-proxy\nspec:\n  containers:\n    - name: proxy\n'
+        '      image: jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy:' + 'a' * 40 + '@sha256:' + 'b' * 64 + '\n')
+    BASE = '---\nkind: Deployment\nmetadata:\n  name: newapi-master\nspec:\n  containers:\n    - name: new-api\n' \
+           '      image: docker.io/calciumion/new-api:v1@sha256:' + 'c' * 64 + '\n'
+
+    def state(self, enabled, render=None):
+        state = checks.Checks(strict=True)
+        state.enabled, state.render = enabled, render
+        return state
+
+    def helm(self, rc, stdout='', stderr=''):
+        return mock.patch.object(checks, 'helm_template', return_value=subprocess.CompletedProcess([], rc, stdout, stderr))
+
+    def test_render_failure_names_the_first_error_and_later_checks_skip(self):
+        lint = subprocess.CompletedProcess([], 0, '1 chart(s) linted, 0 chart(s) failed', '')
+        with mock.patch.object(checks, 'run', return_value=lint), \
+                self.helm(1, stderr='Error: execution error at (newapi/templates/x.yaml:2:4): boom\nmore'):
+            state = self.state(False)
+            status, messages = state.render_check()
+        self.assertEqual(status, 'fail')
+        self.assertIn('does not render in new-api-apporo as committed: Error: execution error at', messages[0])
+        for check in (state.proxy_on_check, state.images_check, state.proxy_check):
+            self.assertEqual(check()[0], 'skip')
+
+    def test_proxy_on_fails_on_a_chart_refusal_or_missing_proxy_objects(self):
+        with self.helm(1, stderr='Error: proxy.clients: component application is not a woow-odoo role'):
+            status, messages = self.state(False, self.BASE).proxy_on_check()
+        self.assertEqual(status, 'fail')
+        self.assertIn('would not render with the proxy switched on', messages[0])
+        with self.helm(0, stdout=self.BASE):
+            status, messages = self.state(False, self.BASE).proxy_on_check()
+        self.assertEqual(status, 'fail')
+        self.assertIn('no newapi-proxy ConfigMap', messages[0])
+        with self.helm(0, stdout=self.BASE + self.PROXY):
+            self.assertEqual(self.state(False, self.BASE).proxy_on_check()[0], 'ok')
+        self.assertEqual(self.state(True, self.BASE + self.PROXY).proxy_on_check()[0], 'skip')
+
+    def test_an_unreadable_proxy_switch_fails_the_proxy_check(self):
+        state = self.state(None, self.BASE)
+        state.enabled_error = 'cannot tell dormant from active: boom'
+        self.assertEqual(state.proxy_check(), ('fail', ['cannot tell dormant from active: boom']))
+        self.assertEqual(state.proxy_on_check()[0], 'skip')
+        with mock.patch('tests.contract.gate_check.proxy_enabled', side_effect=AttributeError('gone')):
+            enabled, error = checks.proxy_state('proxy:\n  enabled: false\n')
+        self.assertIsNone(enabled)
+        self.assertIn('gate_check.proxy_enabled failed', error)
+        self.assertEqual(checks.proxy_state('proxy:\n  enabled: false\n'), (False, None))
+        self.assertEqual(checks.proxy_state('proxy:\n  enabled: true\n'), (True, None))
+
+    def test_images_and_proxy_objects_follow_the_switch(self):
+        self.assertEqual(self.state(False, self.BASE).images_check()[0], 'ok')
+        unpinned = self.BASE.replace('@sha256:' + 'c' * 64, '')
+        self.assertEqual(self.state(False, unpinned).images_check()[0], 'fail')
+        self.assertEqual(self.state(False, self.BASE).proxy_check()[0], 'ok')
+        self.assertEqual(self.state(False, self.BASE + self.PROXY).proxy_check()[0], 'fail')
+        self.assertEqual(self.state(True, self.BASE + self.PROXY).proxy_check()[0], 'ok')
+        self.assertEqual(self.state(True, self.BASE).proxy_check()[0], 'fail')
+
+
 class CommittedFilesTests(unittest.TestCase):
-    def test_render_and_proxy_checks_pass_on_the_committed_files(self):
-        proc = subprocess.run([sys.executable, str(TOOL), '--strict', '--only', 'render,proxy-on,images,proxy'],
+    def test_every_check_reports_on_the_committed_files(self):
+        # Plumbing only: whether they pass is the step's own verdict, not repeated here.
+        proc = subprocess.run([sys.executable, str(TOOL), '--warn-only', '--only', 'render,proxy-on,images,proxy'],
                               cwd=ROOT, text=True, capture_output=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn('all Apporo checks passed', proc.stdout)
+        for name in ('render', 'proxy-on', 'images', 'proxy'):
+            self.assertRegex(proc.stdout, rf'(?m)^-- {name}: .*\n   (OK|FAIL|SKIP) ')
 
     def test_ci_runs_apporo_only_in_its_own_step(self):
         # WOOW's steps never look at Apporo; the Apporo step resolves the base

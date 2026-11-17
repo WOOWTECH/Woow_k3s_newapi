@@ -54,7 +54,6 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests.contract import gate_check  # noqa: E402  (stdlib only; CI tells dormant from active with it)
 
 APPORO = 'deploy/apporo-k3s.yaml'
 NAMESPACE = 'new-api-apporo'
@@ -134,6 +133,18 @@ def documents(render):
     return re.split(r'(?m)^---\s*$', render)
 
 
+def proxy_state(text):
+    """(enabled, error): proxy.enabled as CI reads it (tests/contract/gate_check.proxy_enabled, fail-closed).
+
+    Imported here, not at the top: the contract tools are WOOW's, and a change
+    to them must leave a warn-only run able to report instead of crashing."""
+    try:
+        from tests.contract import gate_check
+        return bool(gate_check.proxy_enabled(text)), None
+    except Exception as err:
+        return None, f'cannot tell dormant from active: tests/contract/gate_check.proxy_enabled failed ({err!r})'
+
+
 def proxy_problems(render):
     """Why ``render`` lacks a working newapi-proxy ([] = it has one): the CI check WOOW's renders get."""
     out = []
@@ -158,9 +169,11 @@ class Checks:
         self.strict = strict
         self.render = None
         try:
-            self.enabled = gate_check.proxy_enabled((ROOT / APPORO).read_text())
-        except OSError:
-            self.enabled = None
+            text = (ROOT / APPORO).read_text()
+        except OSError as err:
+            self.enabled, self.enabled_error = None, f'{APPORO} cannot be read: {err}'
+        else:
+            self.enabled, self.enabled_error = proxy_state(text)
 
     def render_check(self):
         out = []
@@ -177,8 +190,10 @@ class Checks:
         return 'ok', [f'renders in {NAMESPACE} as committed ({len(re.findall(r"(?m)^kind:", self.render))} objects)']
 
     def proxy_on_check(self):
-        if self.enabled is not False:
-            return 'skip', ['the proxy is on (or the file cannot be read): the committed render is checked below']
+        if self.enabled is None:
+            return 'skip', [self.enabled_error or 'proxy.enabled unknown']
+        if self.enabled:
+            return 'skip', ['the proxy is on: the committed render is checked below']
         if self.render is None:
             return 'skip', ['needs the committed render']
         with tempfile.NamedTemporaryFile('w', suffix='.yaml') as on:
@@ -205,6 +220,8 @@ class Checks:
     def proxy_check(self):
         if self.render is None:
             return 'skip', ['needs the committed render']
+        if self.enabled is None:
+            return 'fail', [self.enabled_error or 'proxy.enabled unknown']
         if self.enabled:
             problems = proxy_problems(self.render)
             if problems:
@@ -292,9 +309,15 @@ def main(argv=None, checks=CHECKS):
     print(f'Apporo checks ({"strict" if strict else "warn-only"}; docs/APPORO-K3S.md 〈CI 與檢查〉)')
     print(f'mode: {why}')
 
-    state = Checks(strict)
-    failed = []
-    for name, title, check in checks:
+    try:
+        state = Checks(strict)
+    except Exception as err:  # never expected; a warn-only run still must not turn red
+        state = None
+        failed = [('setup', f'the checks could not start: {err!r}')]
+        print(f'   FAIL the checks could not start:\n{quoted(traceback.format_exc())}')
+    else:
+        failed = []
+    for name, title, check in checks if state is not None else ():
         if only and name not in only:
             continue
         print(f'\n-- {name}: {title}')

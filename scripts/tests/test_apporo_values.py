@@ -282,7 +282,10 @@ class ApporoValuesTests(unittest.TestCase):
         # The pods that call LiteLLM (new-api master, and slaves when there are
         # any) carry every label the ingress above selects.
         enabled = self.proxy.get('enabled')
-        objects = rendered_objects(parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}}))
+        try:
+            objects = rendered_objects(parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}}))
+        except parity.RenderError:
+            self.skipTest('deploy/apporo-k3s.yaml does not render as committed; see test_renders_as_committed')
         master = parsed(objects, 'Deployment', 'newapi-master')
         labels = master['spec']['template']['metadata']['labels']
         self.assertEqual({k: labels.get(k) for k in RELAY_LABELS}, RELAY_LABELS,
@@ -326,7 +329,10 @@ class AiTermsTests(unittest.TestCase):
 
     def setUp(self):
         if self.objects is None and self._testMethodName.startswith('test_render'):
-            self.fail(f'deploy/apporo-k3s.yaml does not render as committed: {self.render_error}')
+            # The render check and ApporoValuesTests.test_renders_as_committed fail
+            # already; nothing to look at in the render.
+            self.skipTest(f'deploy/apporo-k3s.yaml does not render as committed ({self.render_error}); '
+                          'see ApporoValuesTests.test_renders_as_committed')
 
     def test_terms_values_are_written_out_in_the_apporo_file(self):
         for key, want in TERMS_VALUES.items():
