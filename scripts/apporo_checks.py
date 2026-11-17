@@ -3,7 +3,11 @@
 
 Owner decision 2026-11-17: Apporo never fails a WOOW pull request. CI runs
 these checks in a step of their own ("Apporo checks", .gitea/workflows/ci.yml)
-and none of WOOW's steps looks at Apporo:
+and none of WOOW's steps runs an Apporo check. Two of them read Apporo's files
+as files ("Scripts parse" compiles scripts/apporo_*.py and the Apporo tests,
+"No placeholder image digests" greps deploy/*.yaml), so a change that touches
+no Apporo file leaves their verdict on those files as it was on the base; the
+Apporo test modules skip themselves in "Admin tool unit tests".
 
 - A change that touches no Apporo file runs them warn-only: every failure is
   printed with a ::warning:: and the step stays green. That covers a WOOW chart
@@ -13,8 +17,9 @@ and none of WOOW's steps looks at Apporo:
 - A change that adds, edits or deletes an Apporo file runs them strictly: any
   failure fails the step. Apporo's files are the paths that contain "apporo"
   (any case): deploy/apporo-k3s.yaml, deploy/litellm-from-newapi-apporo-ingress.yaml,
-  deploy/apun-odoo-to-newapi-apporo-egress.yaml, scripts/apporo_*.py,
-  scripts/tests/test_apporo_*.py, docs/APPORO-*.md. Such a change also has to
+  deploy/apun-odoo-to-newapi-apporo-egress.yaml, scripts/apporo_* (the drift
+  check scripts/apporo_check_drift.sh too), scripts/tests/test_apporo_*.py,
+  docs/APPORO-*.md. Such a change also has to
   leave Apporo in step with WOOW prod (parity below): a gap a WOOW change left
   behind is closed in the next Apporo change, or written down as a documented
   difference.
@@ -36,7 +41,8 @@ The checks (docs/APPORO-K3S.md 〈CI 與檢查〉):
   proxy     newapi-proxy objects: none while dormant; when on, all five kinds and
             one image pinned by commit tag and digest
   values    Apporo's own decided values and what its AI terms state about the
-            gateway, and these tools' own tests: scripts/tests/test_apporo_*.py
+            gateway, and these tools' own tests (the drift check's too):
+            scripts/tests/test_apporo_*.py
   parity    everything else equals WOOW prod: scripts/apporo_parity.py --strict
 
 Offline: git, helm template and python only; no cluster, credentials or network.

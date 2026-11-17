@@ -82,8 +82,9 @@ class ScopeTests(unittest.TestCase):
         apporo = sorted(path for path in files if checks.is_apporo(path))
         for want in ('deploy/apporo-k3s.yaml', 'deploy/litellm-from-newapi-apporo-ingress.yaml',
                      'deploy/apun-odoo-to-newapi-apporo-egress.yaml', 'docs/APPORO-K3S.md',
-                     'scripts/apporo_checks.py', 'scripts/apporo_parity.py', 'scripts/tests/test_apporo_checks.py',
-                     'scripts/tests/test_apporo_values.py'):
+                     'scripts/apporo_checks.py', 'scripts/apporo_parity.py', 'scripts/apporo_check_drift.sh',
+                     'scripts/tests/test_apporo_checks.py', 'scripts/tests/test_apporo_values.py',
+                     'scripts/tests/test_apporo_check_drift.py'):
             self.assertIn(want, apporo)
         for path in WOOW_PATHS:
             with self.subTest(path=path):

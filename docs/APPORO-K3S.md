@@ -126,8 +126,9 @@ Apporo 的 AI 條款（v2.2，草稿）對顧客寫了幾件關於 AI 閘道的�
   1. 排程 pod 自己的出口規則 `allow-odoo-cron-to-mailcow`（照抄 `allow-odoo-to-mailcow`、選 component `cron`，odoo-tenant 那邊負責）已經套了。一個 pod 只要被任何一條 Egress policy 選到，就只能連這些 policy 允許的地方；排程 pod 在跑、卻只有這一條時，它的 DNS、資料庫、寄信全部會斷。
   2. apun 已經切換完成，網頁和排程兩個 pod 都帶著四個 `WOOW_LLM_EXTRA_*` 變數在跑。這四個變數讓平台的 MCP 網址防護把 `new-api-apporo` 當成受保護的 namespace；沒有它們的 pod 一連得到 proxy，就只剩 proxy 自己的簽章檢查在擋。
   - 回退 apun 切換時，**第一個刪這條**（回退後的網頁 pod 沒有那四個變數）。
-- `scripts/check-drift.sh --context woow-k3s --apporo` 比對這兩個檔（唯讀）。Apporo 上線（〈apun 那一側〉做完）之後才用：Apporo 的 AI 分頁進維護、或簽章呼叫逾時時，第一步先跑它。上線前這兩個物件本來就還沒建，會顯示 DRIFT；安裝中途只比對已經套用的那一個，例如 `scripts/check-drift.sh --context woow-k3s deploy/litellm-from-newapi-apporo-ingress.yaml`。
-- 不加 `--apporo` 的預設執行只比對 WOOW 的兩個檔，Apporo 裝到哪一步都不影響 WOOW 的結果。Apporo 的檔案出現 DRIFT 時，輸出不會叫你直接重新 apply：照本節的順序做，並先取得負責人同意。
+- `scripts/apporo_check_drift.sh --context woow-k3s` 比對這兩個檔（唯讀，`kubectl diff`）。Apporo 上線（〈apun 那一側〉做完）之後才用：Apporo 的 AI 分頁進維護、或簽章呼叫逾時時，第一步先跑它。上線前這兩個物件本來就還沒建，會顯示 DRIFT；安裝中途只比對已經套用的那一個，例如 `scripts/apporo_check_drift.sh --context woow-k3s deploy/litellm-from-newapi-apporo-ingress.yaml`。
+- 它是 Apporo 自己的包裝：拿 WOOW 的 `scripts/check-drift.sh` 跑 Apporo 的檔，DRIFT 那一行換成 Apporo 的提示，不會叫你直接重新 apply：照本節的順序做，並先取得負責人同意。WOOW 的 `scripts/check-drift.sh` 和 main 一樣，預設只比對 WOOW 的兩個檔，Apporo 裝到哪一步都不影響 WOOW 的結果。
+- 包裝的測試（`scripts/tests/test_apporo_check_drift.py`）在「Apporo checks」步驟跑：WOOW 改 `check-drift.sh` 而弄壞了包裝，那個 PR 只會警告，之後 Apporo 另開 PR 修好（〈CI 與檢查〉）。
 - 回程封包：WOOW 正式站的 Odoo namespace 也有 ingress default-deny，不需要額外規則。如果 apun 端對端測試時連得到 proxy、卻等不到回應，再加一條 apun 的 ingress：放行 `new-api-apporo` 的 proxy pod 到網頁／排程 pod 的 32768–60999（和 chart 裡 proxy NetworkPolicy 的鏡射是同一招），先給負責人看再套。
 - `paas-ws-32e92be2` 是 PaaS 管的 namespace。WOOW 那兩條手建的 policy 到 2026-11-17 都還在，但 operator 會不會清掉手建的物件沒有驗證過，所以靠 check-drift 盯。
 
@@ -248,14 +249,17 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ## CI 與檢查
 
-Apporo 的檢查全部在 CI 最後一個步驟「Apporo checks」（`scripts/apporo_checks.py`）。前面 WOOW 的步驟完全不看 Apporo。
+Apporo 的檢查全部在 CI 最後一個步驟「Apporo checks」（`scripts/apporo_checks.py`）。前面 WOOW 的步驟不跑任何 Apporo 的檢查：
+
+- Apporo 的測試模組（`scripts/tests/test_apporo_*.py`）在 WOOW 的「Admin tool unit tests」整個 skip。WOOW 的工具（例如 `scripts/check-drift.sh`）和它們的測試裡沒有 Apporo 的東西；Apporo 要的行為放在 Apporo 自己的檔案（例如 `scripts/apporo_check_drift.sh`）。
+- 只有兩個 WOOW 步驟會讀到 Apporo 的檔案本身：「Scripts parse」編譯 `scripts/apporo_*` 與 Apporo 的測試，「No placeholder image digests」掃 `deploy/*.yaml`。只改 WOOW 的 PR 不會改到這些檔，所以這兩步對它們的結果和 base 一樣。
 
 - **只改 WOOW 的 PR 一律不會因為 Apporo 變紅**（負責人 2026-11-17 決定）。檢查照跑，失敗只印 `WARNING (not blocking)` 與 `::warning::`，步驟仍是綠的。包括：
   - WOOW 的 values、LiteLLM 那條 NP、proxy pin 改了，Apporo 沒跟上；
   - 共用 chart 改了之後，`deploy/apporo-k3s.yaml` 照提交的狀態 render 不出來，或休眠中的 proxy 設定打開後過不了 chart 的檢查；
   - WOOW 升 new-api 映像，而 Apporo 落後的 proxy pin 配新映像沒有綠色 stg 報告。
 - **動到 Apporo 檔案的 PR 嚴格檢查**，任何一項失敗都是紅燈。
-  - Apporo 的檔案＝路徑含 `apporo`（不分大小寫）：`deploy/apporo-k3s.yaml`、兩個 Apporo 的 NetworkPolicy 檔、`scripts/apporo_*.py`、`scripts/tests/test_apporo_*.py`、`docs/APPORO-*.md`，以及 PR #45 的 `deploy/apporo-sync/`。
+  - Apporo 的檔案＝路徑含 `apporo`（不分大小寫）：`deploy/apporo-k3s.yaml`、兩個 Apporo 的 NetworkPolicy 檔、`scripts/apporo_*`（含 `scripts/apporo_check_drift.sh`）、`scripts/tests/test_apporo_*.py`、`docs/APPORO-*.md`，以及 PR #45 的 `deploy/apporo-sync/`。
   - 這樣的 PR 也要讓 Apporo 和 WOOW 正式站一致（`parity`）：WOOW 之前留下的差距，要在這個 PR 一起補上，或寫成文件化的差異。
 - **怎麼判斷改了哪些檔**：和 contract gate（`tests/contract/gate_check.py`）判斷映像升版一樣，拿 base 已提交的檔案和工作目錄比，base 的取法也相同（PR 用 `origin/<base>`，push 到 main 用 `HEAD~1`）。不同的是從 PR 分支和 base 的 merge base 開始比：PR 開了之後才合進 main 的別人的改動，不算這個 PR 的。
 
