@@ -266,6 +266,8 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
 
 只有最新版收安全修補，請至少每月升一次。
 
+Apporo 那套（`deploy/apporo-k3s.yaml`）用的是 chart 的 new-api 映像。升版 PR 不必改 Apporo 的檔案：CI 的「Apporo checks」對它只會警告（例如 Apporo 的 proxy pin 落後時，這個組合沒有 stg 報告），不會讓 PR 變紅。Apporo 之後另開 PR 跟上，再自己 `helm upgrade`（[APPORO-K3S.md](APPORO-K3S.md)〈跟著 WOOW 改〉）。
+
 ## 資料保留、備份與還原（NA-07）
 
 ### 雙軌遷移：原每日備份保持運作
@@ -647,6 +649,7 @@ stg 與 prod 的簽章金鑰、AP、OP、Valkey 密碼必須全部不同（NA-05
   3. 把合併報告 commit 成 `tests/contract/reports/<newapi tag>_<新 sha 前 12 碼>.json`，和 stg 的 pin 同一個 PR（CI 的 contract gate 會核對 digest）；
   4. 之後才送改 `deploy/woow-k3s.yaml`（prod）的 PR，CI 一樣要找到同一個 sha 的綠色報告。
 - chart 拒絕沒有 digest、全 0 的佔位 digest、或 tag 不是 40 位 sha 的設定；CI 也一樣（佔位 digest 是錯誤，不是警告）。
+- Apporo 的 pin（`deploy/apporo-k3s.yaml`）不在 prod PR 裡跟著改：「Apporo checks」只警告，Apporo 等 WOOW 正式站換好之後，另開 PR 改成同一個 pin（[APPORO-K3S.md](APPORO-K3S.md)〈跟著 WOOW 改〉）。
 - PaaS 的 develop 一律用 merge commit：feature branch 的 image 只給 stg 驗收用；**合併後 stg 與 prod 都改釘 develop 合併 commit 的 sha 與 digest**。
 
 ### 輪替：AP／OP（180 天，或疑似外洩時立刻）
