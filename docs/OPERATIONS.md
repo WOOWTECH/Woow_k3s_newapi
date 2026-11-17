@@ -713,47 +713,88 @@ shred -u "$f" 2>/dev/null || rm -f "$f"; unset nw nc
 
    Odoo 端的舊值留著無害（不會拿來簽），下次輪替時自然被擠掉。
 
-**正式站與 Apporo**：Odoo 端的 Secret（正式站 `paas-system/paas-odoo-platform-llm`，Apporo `apun/apun-newapi-llm`）同一份裡還有 `fernet-keys`，兩個 Odoo pod 都讀它、不是 optional。照上面 stg 的 `create … | replace` 只放兩把簽章金鑰，會把 `fernet-keys` 和 label 一起刪掉：Odoo 重啟後起不來（`CreateContainerConfigError`；兩個 Deployment 都是 Recreate，舊 pod 先停），Fernet 金鑰沒有離線備份就救不回來。所以這兩套一律用 `kubectl patch` 只換那兩個 key，其他 key 與 label 不動：
+**正式站與 Apporo**：Odoo 端的 Secret（正式站 `paas-system/paas-odoo-platform-llm`，Apporo `apun/apun-newapi-llm`）同一份裡還有 `fernet-keys`，兩個 Odoo pod 都讀它、不是 optional。照上面 stg 的 `create … | replace` 只放兩把簽章金鑰，會把 `fernet-keys` 和 label 一起刪掉：Odoo 重啟後起不來（`CreateContainerConfigError`；兩個 Deployment 都是 Recreate，舊 pod 先停），Fernet 金鑰沒有離線備份就救不回來。所以這兩套一律用 `kubectl patch` 只換那兩個 key，其他 key 與 label 不動。
+
+這段和上面 stg 的寫法還有三個不同，都是為了不帶著錯的值往下改：
+
+- `cur()` 只讓 kubectl 輸出 JSON、交給 python 取一個 key，**不用 `-o jsonpath`／`go-template`**：template 一出錯，kubectl 會把整個 Secret（含所有值）印出來（2026-11-17 事故）。Secret 或 key 不在、值是空的、或不是 `kid:secret[,kid:secret]`，`cur()` 都以 exit 1 停下，訊息裡沒有值。
+- `setkeys()` 寫入前再檢查每個值的格式，不對就整個不改；`kubectl patch` 失敗時回傳失敗（不會被後面的刪暫存檔蓋掉）。
+- 第 1、2 步放在 `( set -euo pipefail … )` 裡，而且先把四個現用值讀齊才開始改：任何一步失敗就停在那裡，不會把 `web=,<新>` 這種值寫進正式站，也不會在代理還不認得新金鑰時改 Odoo 端。新產生的金鑰隨子 shell 一起消失。
 
 ```bash
 k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
-cur() { kubectl -n "$1" get secret "$2" -o jsonpath="{.data.$3}" | base64 -d; }
-# setkeys <ns> <secret> <key>=<value> ...: merge-patch only these keys. The values
-# ([A-Za-z0-9_:,-], no JSON escaping needed) go through printf, a shell builtin,
-# into a 0600 temp file: never into argv, never into last-applied-configuration.
+# cur <ns> <secret> <key>: that key's value, only ever into a variable (never printed).
+# kubectl hands python the Secret as JSON on a pipe. Missing Secret or key, empty, or not
+# kid:secret[,kid:secret]: exit 1 with a message that has no value in it.
+cur() {
+  kubectl -n "$1" get secret "$2" -o json 2>/dev/null | python3 -c '
+import base64, json, re, sys
+try:
+    value = base64.b64decode(json.load(sys.stdin)["data"][sys.argv[1]], validate=True).decode()
+except Exception:
+    value = ""
+pair = r"[A-Za-z0-9_-]{1,64}:[A-Za-z0-9_-]{32,256}"
+if not re.fullmatch(pair + "(," + pair + ")*", value):
+    sys.exit("cur: " + sys.argv[1] + ": Secret or key missing, empty, or not kid:secret[,...] (value not shown)")
+print(value)' "$3"
+}
+# setkeys <ns> <secret> <key>=<value> ...: merge-patch only these keys. Every value must be
+# kid:secret[,kid:secret] ([A-Za-z0-9_:,-], no JSON escaping needed), or nothing is patched.
+# The values go through printf, a shell builtin, into a 0600 temp file: never into argv, never
+# into last-applied-configuration. Returns kubectl patch's status.
 setkeys() {
-  local ns=$1 s=$2 f kv sep=
+  local ns=$1 s=$2 f kv sep= rc=0 pair='[A-Za-z0-9_-]{1,64}:[A-Za-z0-9_-]{32,256}'
   shift 2
+  for kv in "$@"; do
+    [[ ${kv#*=} =~ ^$pair(,$pair)*$ ]] || { echo "setkeys: ${kv%%=*}: empty or not kid:secret[,...]; nothing patched" >&2; return 1; }
+  done
   f=$(mktemp)
   { printf '{"stringData":{'
     for kv in "$@"; do printf '%s"%s":"%s"' "$sep" "${kv%%=*}" "${kv#*=}"; sep=,; done
     printf '}}'; } > "$f"
-  kubectl -n "$ns" patch secret "$s" --type merge --patch-file "$f"
+  kubectl -n "$ns" patch secret "$s" --type merge --patch-file "$f" || rc=$?
   shred -u "$f" 2>/dev/null || rm -f "$f"
+  return $rc
 }
-keys() { kubectl -n "$1" get secret "$2" -o json | python3 -c 'import json, sys; print(*sorted(json.load(sys.stdin)["data"]))'; }
+keys() { kubectl -n "$1" get secret "$2" -o json 2>/dev/null | python3 -c 'import json, sys; print(*sorted(json.load(sys.stdin).get("data", {})))'; }
 P=new-api O=paas-system S=paas-odoo-platform-llm        # Apporo: P=new-api-apporo O=apun S=apun-newapi-llm
-stamp=$(date +%Y%m%d%H%M); nw=$(k web-$stamp); nc=$(k cron-$stamp)
-# 1. Proxy side: current first, new last
-setkeys $P newapi-proxy-hmac "web=$(cur $P newapi-proxy-hmac web),$nw" "cron=$(cur $P newapi-proxy-hmac cron),$nc"
-kubectl -n $P rollout restart deploy/newapi-proxy && kubectl -n $P rollout status deploy/newapi-proxy
-# 2. Odoo side: new first (Odoo signs with it), old after; fernet-keys untouched
-setkeys $O $S "proxy-auth-web=$nw,$(cur $O $S proxy-auth-web | cut -d, -f1)" \
-  "proxy-auth-cron=$nc,$(cur $O $S proxy-auth-cron | cut -d, -f1)"
-unset nw nc
-keys $O $S   # must print: fernet-keys proxy-auth-cron proxy-auth-web
+(
+  set -euo pipefail
+  stamp=$(date +%Y%m%d%H%M%S); nw=$(k web-$stamp); nc=$(k cron-$stamp)   # a re-run never repeats a kid
+  # Read all four current values first: nothing is changed unless every one is there.
+  pw=$(cur $P newapi-proxy-hmac web); pc=$(cur $P newapi-proxy-hmac cron)
+  ow=$(cur $O $S proxy-auth-web | cut -d, -f1); oc=$(cur $O $S proxy-auth-cron | cut -d, -f1)
+  # 1. Proxy side: current first, new last
+  setkeys $P newapi-proxy-hmac "web=$pw,$nw" "cron=$pc,$nc"
+  kubectl -n $P rollout restart deploy/newapi-proxy
+  kubectl -n $P rollout status deploy/newapi-proxy
+  # 2. Odoo side: new first (Odoo signs with it), old after; fernet-keys untouched
+  setkeys $O $S "proxy-auth-web=$nw,$ow" "proxy-auth-cron=$nc,$oc"
+  keys $O $S   # must print: fernet-keys proxy-auth-cron proxy-auth-web
+)
 ```
 
+- 子 shell 停在半途時：只做完第 1 步也無害（代理同時接受新舊兩把，Odoo 仍用舊的簽），修好原因後整段重跑即可：會再產生一組新的，kid 帶到秒，不會和上一組重複（代理拒絕重複的 kid，起不來）。
 - 第 3 步：重啟兩個 Odoo。正式站同上；Apporo 是 `kubectl -n apun rollout restart deploy/apun-odoo-cron deploy/apun-odoo`。兩套的 Odoo 都是 Recreate，重啟時網站會短暫中斷：Apporo 是官網，要排在台北 15:00–18:00 並先通知。
 - 第 4 步相同，namespace 換成 `$P`。
-- 第 5 步：代理端只留 Odoo 端的第一把：
+- 第 5 步：代理端只留 Odoo 端的第一把（同一個 shell，上面的函式與 `P`／`O`／`S` 還在）：
 
   ```bash
-  setkeys $P newapi-proxy-hmac "web=$(cur $O $S proxy-auth-web | cut -d, -f1)" "cron=$(cur $O $S proxy-auth-cron | cut -d, -f1)"
-  kubectl -n $P rollout restart deploy/newapi-proxy && kubectl -n $P rollout status deploy/newapi-proxy
+  (
+    set -euo pipefail
+    ow=$(cur $O $S proxy-auth-web | cut -d, -f1); oc=$(cur $O $S proxy-auth-cron | cut -d, -f1)
+    setkeys $P newapi-proxy-hmac "web=$ow" "cron=$oc"
+    kubectl -n $P rollout restart deploy/newapi-proxy
+    kubectl -n $P rollout status deploy/newapi-proxy
+  )
   ```
 
-- 這段指令 2026-11-17 在 `dev-sandbox-*` 用假的 Secret 照抄跑過：第 1、2、5 步後兩邊的金鑰順序都對，`fernet-keys` 與 label 不變，也沒有 `last-applied-configuration`。同一個沙盒用 stg 的 `create … | replace` 重建，`fernet-keys` 和 label 都不見了。
+- 這段指令（2026-11-18 版）在 `dev-sandbox-*` 用假的 Secret 照抄跑過，只換了 `P`／`O`／`S` 那一行：
+  - 第 1、2、5 步之後兩邊的金鑰順序都對，`fernet-keys` 與 label 不變，也沒有 `last-applied-configuration`。
+  - Odoo 端少了 `proxy-auth-cron`、代理端 `web` 是空值、Odoo 端的 Secret 不在、代理端的 Secret 改不動（`immutable`）：四種都在改任何東西之前就停下。兩個 Secret 的 resourceVersion 不變，proxy 沒有重啟，暫存檔沒有留下，訊息裡也沒有值。
+  - 第 1 步做完、第 2 步失敗（Odoo 端改不動）：停在那裡，代理端是舊＋新、Odoo 端沒動。整段重跑之後代理端三把、kid 都不同，Odoo 端換成最新那把在前；第 5 步後代理端只剩那一把。
+  - 同樣輸入，2026-11-17 的舊版在前兩種情況會照樣跑完，寫進 `proxy-auth-cron=<新>,` 與 `web=,<新>`。
+  - 用 stg 的 `create … | replace` 重建，`fernet-keys` 和 label 都會不見（2026-11-17 在沙盒實測）。
 
 ### break-glass
 

@@ -231,7 +231,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 這些屬於 apun 切換（一次停機，台北 15:00–18:00，先通知）。odoo-tenant 那邊負責拆 pod、接環境變數、排程 pod 的出口規則，步驟寫在 Woow_k3s_odoo PR #4 的 `deploy/woow-k3s/planned/apun/cron-split.yaml` 檔頭（下面的「步驟 N」指那裡）；本 repo 只提供 `deploy/apun-odoo-to-newapi-apporo-egress.yaml`。
 
-1. 窗口之前：建 `apun-newapi-llm`（步驟 1）：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈輪替：簽章金鑰〉的 `cur()`），不印出；兩邊用 sha256 前 12 碼核對。排程 pod 的出口規則 `allow-odoo-cron-to-mailcow` 也在窗口之前套（步驟 2）。
+1. 窗口之前：建 `apun-newapi-llm`（步驟 1）：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈輪替：簽章金鑰〉最後〈正式站與 Apporo〉那段的 `cur()`：Secret 或 key 不在、空值、格式不對都會停），不印出；兩邊用 sha256 前 12 碼核對。排程 pod 的出口規則 `allow-odoo-cron-to-mailcow` 也在窗口之前套（步驟 2）。
 2. 窗口內：切換後確認兩個 pod 都帶著四個 `WOOW_LLM_EXTRA_*` 變數在跑（步驟 8；只印變數名稱與這四個非機密的值）：
 
    | 變數 | 值 |
