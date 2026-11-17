@@ -21,7 +21,7 @@ differences (deploy/apporo-sync/profile.json, docs/APPORO-SYNC.md):
     symbol "$" are Apporo's own; instance rows (passkey.*,
     LegacyAccessTokenRetireAt) are never copied.
 
-Reads are read-only SQL through `kubectl exec ... psql` (scripts/newapi_content.py:
+Reads are read-only SQL through `kubectl exec ... psql` (scripts/apporo_newapi_content.py:
 whitelisted statement shape, no channel key, no user/token/log table). Writes go
 only to the target, through the New API admin API over a `kubectl port-forward`,
 as root: a PAT from the Secret newapi-sync-pat (key token), or before root has
@@ -66,6 +66,14 @@ scripts/apporo_checks.py --strict (or scripts/apporo_parity.py --strict in an
 older checkout: Helm values drift) and checks that the New API image is one
 whose built-in price tables this tool knows.
 
+Versions: each side's New API version is the one it RUNS, read from the image
+digest its Deployments pin (running_version; the supported images are
+apporo_newapi_content.SEED_IMAGES), never setups.version (rc.44 writes that row
+once, at /api/setup). WOOW's built-in prices come from WOOW's running version,
+Apporo's from Apporo's. A side running an image the tool does not know stops
+every command that compares or writes (fail closed); writes also need the
+target's /api/status version to equal the version its Deployments run.
+
 Writes run in an order that never leaves an offered model without its price:
 options and new or changed prices, then channels, then removed price entries.
 
@@ -94,7 +102,7 @@ import urllib.parse
 import urllib.request
 
 import newapi_admin as na
-import newapi_content as nc
+import apporo_newapi_content as nc
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -156,6 +164,7 @@ PSQL_FACTORY = None        # (side, profile) -> object with query_json(sql)
 SECRET_READER = None       # (namespace, name, key) -> str
 ANNOTATION_READER = None   # (namespace, name, annotation) -> str | None
 SECRET_WRITER = None       # (namespace, name, manifest) -> (ok, message)
+WORKLOAD_READER = None     # (namespace) -> {"Kind/name/container": image} | None (kubectl get failed)
 
 
 class SyncError(Exception):
@@ -346,31 +355,118 @@ def psql_for(a, profile, side):
                    s.get("container", "postgres"), s.get("user", "newapi"), s.get("db", "newapi"))
 
 
+UPGRADE_STEPS = ("check the new version first (docs/APPORO-SYNC.md 〈映像〉: tests/apporo_sync/rc44_price_tables.py and "
+                 "the other rc.44 rules), add it to apporo_newapi_content.SEED_IMAGES, TOOL_PRICE_SEEDS and "
+                 "VIOLATION_FEE_DEFAULTS, then upgrade WOOW before Apporo. Until then the sync stops here: nothing "
+                 "is compared or written")
+
+
+def workload_images(kube, namespace):
+    """{"Kind/name/container": image} of a namespace's Deployments, StatefulSets and CronJobs (init
+    containers too), or None when kubectl cannot list them (list verbs: deploy/apporo-sync/rbac.yaml)."""
+    if WORKLOAD_READER is not None:
+        return WORKLOAD_READER(namespace)
+    try:
+        r = subprocess.run(kube + ["-n", namespace, "get", "deploy,statefulset,cronjob", "-o", "json"],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return None
+        got = {}
+        for obj in json.loads(r.stdout or b"{}").get("items", []):
+            spec = obj["spec"].get("jobTemplate", {}).get("spec", obj["spec"])
+            pod = spec.get("template", {}).get("spec", {})
+            for c in pod.get("containers", []) + pod.get("initContainers", []):
+                got[f"{obj['kind']}/{obj['metadata']['name']}/{c['name']}"] = c.get("image")
+        return got
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def running_version(kube, namespace):
+    """(version, image) of the New API a namespace runs: the image digest its Deployments pin (the
+    master and any slaves, all the same digest), mapped by apporo_newapi_content.SEED_IMAGES. Never
+    setups.version: rc.44 writes that row once, at /api/setup, and never updates it, so after an
+    upgrade it still names the first version. Unknown, missing or mixed digests: SyncError."""
+    images = workload_images(kube, namespace)
+    if images is None:
+        raise SyncError(f"{namespace}: kubectl cannot list its Deployments, so the New API version it runs (which "
+                        "selects the built-in prices) is unknown")
+    found = sorted({img for k, img in images.items()
+                    if k.startswith("Deployment/") and NEWAPI_IMAGE_RE.search(img or "")})
+    if not found:
+        raise SyncError(f"{namespace}: no Deployment runs a New API image (calciumion/new-api), so the version it "
+                        "runs is unknown")
+    digests = {img.rpartition("@")[2] if "@" in img else "" for img in found}
+    if "" in digests:
+        raise SyncError(f"{namespace} runs New API {', '.join(found)} without an image digest: the version it runs "
+                        "cannot be checked (pin newapi.image.digest)")
+    if len(digests) > 1:
+        raise SyncError(f"{namespace}: its Deployments pin {len(digests)} different New API images "
+                        f"({', '.join(found)}): a rollout in progress or a half-done upgrade; retry when one image "
+                        "runs everywhere")
+    version = nc.version_of_digest(digests.pop())
+    if version is None or not nc.supported_version(version):
+        raise SyncError(f"{namespace} runs New API {found[0]}: not an image whose rules and built-in prices this "
+                        "tool knows (apporo_newapi_content.SEED_IMAGES): " + UPGRADE_STEPS)
+    return version, found[0]
+
+
+def load_snapshot(path, version=None):
+    """An `export --out` file as the source. It records the New API version its source ran
+    (running_version); an export taken before the tool recorded it needs `version` (--source-version)."""
+    with open(path) as f:
+        snap = json.load(f)
+    snap.pop("_meta", None)
+    if "setup_version" not in snap:                 # exports before 2026-11-18 call setups.version "version"
+        snap["setup_version"] = snap.pop("version", None)
+    recorded = snap.get("running_version")
+    if version and recorded and version != recorded:
+        raise SyncError(f"--source-version {version} contradicts {path} (its source ran {recorded})")
+    snap["running_version"] = version or recorded
+    if not snap["running_version"]:
+        raise SyncError(f"{path} does not record the New API version its source ran (an export taken before the "
+                        "tool recorded it; its setups.version is not that version): pass --source-version <the "
+                        "version the source ran then>, or take a new export")
+    if not nc.supported_version(snap["running_version"]):
+        raise SyncError(f"{path}: its source ran New API {snap['running_version']!r}, not a version this tool "
+                        "supports (apporo_newapi_content.SEED_IMAGES)")
+    snap["channels"] = {int(k): v for k, v in snap["channels"].items()}
+    snap["unsafe_channels"] = {int(k): v for k, v in (snap.get("unsafe_channels") or {}).items()}
+    for cid, ch in snap["channels"].items():   # snapshots older than the current checks
+        bad = nc.channel_unsafe_fields(ch)
+        if bad and cid not in snap["unsafe_channels"]:
+            snap["unsafe_channels"][cid] = bad
+            snap["channels"][cid] = {f: ("[redacted]" if f in bad else v) for f, v in ch.items()}
+    return snap
+
+
+def read_side(a, profile, side, key_hashes=False):
+    """One side's content plus the New API version it runs (checked before any SQL is sent)."""
+    version, image = running_version(kubectl_argv(a), profile[side]["namespace"])
+    snap = nc.read_snapshot(psql_for(a, profile, side), profile, key_hashes=key_hashes)
+    snap.update(running_version=version, running_image=image)
+    return snap
+
+
 def read_source(a, profile):
     if getattr(a, "source_snapshot", None):
-        with open(a.source_snapshot) as f:
-            snap = json.load(f)
-        snap.pop("_meta", None)
-        snap["channels"] = {int(k): v for k, v in snap["channels"].items()}
-        snap["unsafe_channels"] = {int(k): v for k, v in (snap.get("unsafe_channels") or {}).items()}
-        for cid, ch in snap["channels"].items():   # snapshots older than the current checks
-            bad = nc.channel_unsafe_fields(ch)
-            if bad and cid not in snap["unsafe_channels"]:
-                snap["unsafe_channels"][cid] = bad
-                snap["channels"][cid] = {f: ("[redacted]" if f in bad else v) for f, v in ch.items()}
-        return snap
-    return nc.read_snapshot(psql_for(a, profile, "source"), profile)
+        return load_snapshot(a.source_snapshot, getattr(a, "source_version", None))
+    if getattr(a, "source_version", None):
+        raise SyncError("--source-version only goes with --source-snapshot (a live source's version is read from "
+                        "its Deployments)")
+    return read_side(a, profile, "source")
 
 
 def read_target(a, profile):
-    return nc.read_snapshot(psql_for(a, profile, "target"), profile, key_hashes=True)
+    return read_side(a, profile, "target", key_hashes=True)
 
 
 def check_versions(src, tgt):
+    """Both sides must run a New API version this tool supports (running_version, not setups.version)."""
     for name, snap in (("source", src), ("target", tgt)):
-        if snap is not None and snap.get("version") != nc.NEWAPI_VERSION:
-            raise SyncError(f"{name} runs {snap.get('version')!r}; this tool is for {nc.NEWAPI_VERSION} "
-                            "(rc.44 storage rules): re-check docs/APPORO-SYNC.md before an upgrade")
+        if snap is not None and not nc.supported_version(snap.get("running_version")):
+            raise SyncError(f"{name} runs New API {snap.get('running_version')!r}: not a version this tool supports "
+                            "(apporo_newapi_content.SEED_IMAGES): " + UPGRADE_STEPS)
 
 
 # ------------------------------------------------------------ the target
@@ -405,12 +501,15 @@ def make_client(a, profile, base):
 
 
 def guard_target(client, profile, tgt, bootstrap):
-    """Write only to the profile's target: rc.44, its own ServerAddress (or a fresh one)."""
+    """Write only to the profile's target: the supported New API version its Deployments run (its
+    /api/status must say the same), its own ServerAddress (or a fresh one)."""
     st = client.status()
     sa = (st.get("server_address") or "").rstrip("/")
     want = profile["target"]["server_address"].rstrip("/")
-    if st.get("version") != nc.NEWAPI_VERSION:
-        raise SyncError(f"target runs {st.get('version')!r}, not {nc.NEWAPI_VERSION}")
+    if not nc.supported_version(tgt.get("running_version")) or st.get("version") != tgt.get("running_version"):
+        raise SyncError(f"the target's /api/status says New API {st.get('version')!r}, its Deployments run "
+                        f"{tgt.get('running_version')!r} ({tgt.get('running_image')}): a rollout in progress, or "
+                        "the port-forward and kubectl reach different instances; nothing written (retry later)")
     if sa in WOOW_ORIGINS or want in WOOW_ORIGINS:
         raise SyncError(f"refusing to write to a WOOW site ({sa or want})")
     if sa != want and not (bootstrap and sa in FRESH_ORIGINS):
@@ -824,10 +923,10 @@ def price_outcome(it, ctx, ups, downs, what):
 
 
 def tool_state(state):
-    """(the target's operator tool prices as stored, rc.44's seed for the target's version)."""
+    """(the target's operator tool prices as stored, the built-in seed of the version it runs)."""
     text = state["options"].get(nc.TOOL_PRICE_KEY)
     cur = nc.parse_object(text, nc.TOOL_PRICE_KEY) if _is_object(text) else {}
-    return cur, nc.tool_price_seed(state.get("version") or nc.NEWAPI_VERSION)
+    return cur, nc.tool_price_seed(state.get("running_version"))
 
 
 def tool_index(seed, operator):
@@ -861,13 +960,13 @@ def classify_tool_price(it, ctx):
 
 def classify_price_option(it, ctx):
     """grok.violation_deduction_*: the US$ fee rc.44 charges a flagged request on any model."""
-    tgt = ctx["target"]["options"]
+    tgt, version = ctx["target"]["options"], ctx["target"].get("running_version")
     alt = dict(tgt)
     if it["new"] is None:
         alt.pop(it["key"], None)
     else:
         alt[it["key"]] = it["new"]
-    (old, why_old), (new, why_new) = nc.violation_fee(tgt), nc.violation_fee(alt)
+    (old, why_old), (new, why_new) = nc.violation_fee(tgt, version), nc.violation_fee(alt, version)
     if old is None or new is None:
         it["class"], it["reason"] = "alert", f"the violation fee cannot be read ({why_old or why_new}): decide by hand"
         return
@@ -1329,7 +1428,7 @@ def simulate(tgt, chosen, profile, desired=None):
                                                               if m in adds and m not in cur]
         chans[cid]["models"] = ",".join(result)
     abilities = nc.expected_abilities(chans, {cid: ch.get("status", 1) for cid, ch in chans.items()})
-    return {"options": opts, "channels": chans, "abilities": abilities}
+    return {"options": opts, "channels": chans, "abilities": abilities, "running_version": tgt.get("running_version")}
 
 
 # -------------------------------------------------------------- holds
@@ -1503,7 +1602,8 @@ def absolute_price_rows(holds_items, base, final, profile):
             rows.append(row(label, "per 1,000 calls", nc.tool_price(idx_b, tool, prefix)[0],
                             nc.tool_price(idx_a, tool, prefix)[0], fb, fa))
     if any(it["kind"] == "opt" and it["key"] in PRICE_OPTIONS for it in holds_items):
-        (b, _), (a, _) = nc.violation_fee(base["options"]), nc.violation_fee(final["options"])
+        (b, _), (a, _) = (nc.violation_fee(base["options"], base.get("running_version")),
+                          nc.violation_fee(final["options"], final.get("running_version")))
         rows.append(row("content-safety violation fee", "per flagged request", b, a, fb, fa) if b is not None and
                     a is not None else "| content-safety violation fee | per flagged request | (by hand) | (by hand) | |")
     return rows
@@ -1882,8 +1982,11 @@ def tool_price_row(src, tgt, profile, allowed):
     div = profile["price_divisor"]
     name = f"every tool call price = WOOW's / {div:g} (each tool x key prefix and routed model)"
     try:
-        s_idx = nc.tool_price_index(nc.effective_tool_prices(src.get("version"), src["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
-        t_idx = nc.tool_price_index(nc.effective_tool_prices(tgt.get("version"), tgt["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
+        # each side's built-in seed is the one of the version it runs (running_version, not setups.version)
+        s_idx = nc.tool_price_index(nc.effective_tool_prices(src.get("running_version"),
+                                                             src["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
+        t_idx = nc.tool_price_index(nc.effective_tool_prices(tgt.get("running_version"),
+                                                             tgt["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
     except nc.ContentError as e:
         return ("prices", name, False, str(e))
     probes = nc.tool_probes(s_idx, t_idx) | set(routed_models(src)) | set(routed_models(tgt))
@@ -1921,7 +2024,11 @@ def verify_report(src, tgt, desired, profile, keys, expected_items=()):
         rows.append(tool_price_row(src, tgt, profile, nc.TOOL_PRICE_KEY in allowed_opts))
     if nc.VIOLATION_FEE_KEY in profile.get("divided_scalar_prices", ()):
         div = profile["price_divisor"]
-        (ws, _), (ap, _) = nc.violation_fee(src["options"]), nc.violation_fee(have)
+        try:
+            (ws, _), (ap, _) = (nc.violation_fee(src["options"], src.get("running_version")),
+                                nc.violation_fee(have, tgt.get("running_version")))
+        except nc.ContentError:
+            ws = ap = None
         ok = ws is not None and ap is not None and ap == ws / div
         allowed = bool(allowed_opts & set(PRICE_OPTIONS))
         rows.append(("prices", f"violation fee = WOOW's / {div:g}", ok or allowed, None if ok else
@@ -2013,18 +2120,21 @@ def yaml_images(path):
 PRICE_TABLE_DETAILS = [
     "rc.44 bills tool calls from a built-in price table (setting/operation_setting/tools.go) and the content-safety "
     "violation fee from a built-in default (setting/model_setting/grok.go); a new New API image may change them",
-    "before WOOW or Apporo runs it: check its source with tests/apporo_sync/rc44_price_tables.py, add its table to "
-    "newapi_content.TOOL_PRICE_SEEDS and SEED_IMAGES (and re-check the other rc.44 rules, NEWAPI_VERSION); the daily "
-    "sync then recomputes Apporo's tool prices (WOOW's effective prices / 30: decreases written, increases held for "
-    "a notice)",
-    "until then the sync stops at its version check; do not upgrade Apporo to the new image first: tools it adds "
-    "would be billed at WOOW's price, about 30x the rule",
+    "before WOOW or Apporo runs it: check its source with tests/apporo_sync/rc44_price_tables.py <source> <version> "
+    "and re-check the other rc.44 rules (docs/APPORO-SYNC.md 〈限制〉), then add the version to "
+    "apporo_newapi_content.SEED_IMAGES (its image digest), TOOL_PRICE_SEEDS and VIOLATION_FEE_DEFAULTS; the sync "
+    "then prices WOOW with the tables of the version WOOW runs and Apporo with those of the version Apporo runs "
+    "(WOOW's effective prices / 30: decreases written, increases held for a notice)",
+    "until then the sync stops before comparing or writing anything once a site runs the image (the version is read "
+    "from the image digest its Deployments pin, never from setups.version, which rc.44 writes once at /api/setup); "
+    "upgrade WOOW before Apporo: tools a new version adds would be billed on Apporo at their built-in US$ price "
+    "(about 30x the rule) until WOOW's table has them",
 ]
 
 
 def seed_image_alerts(repo):
     """The New API image pinned in this checkout (chart/values.yaml) vs the images whose built-in
-    price tables the tool knows (newapi_content.SEED_IMAGES)."""
+    price tables the tool knows (apporo_newapi_content.SEED_IMAGES)."""
     chart = os.path.join(repo, "chart", "values.yaml")
     if not os.path.exists(chart):
         return []
@@ -2050,22 +2160,8 @@ def image_alerts(repo, kube=None, live=False, profile=None):
                             "details": ["open a PR that moves deploy/apporo-k3s.yaml to WOOW's pin (after WOOW prod "
                                         "runs it); the owner merges it, then helm upgrade"]})
     if live and kube and profile:
-        def images(ns):
-            try:
-                r = subprocess.run(kube + ["-n", ns, "get", "deploy,statefulset,cronjob", "-o", "json"],
-                                   capture_output=True, timeout=60)
-                if r.returncode != 0:
-                    return None
-                got = {}
-                for obj in json.loads(r.stdout or b"{}").get("items", []):
-                    spec = obj["spec"].get("jobTemplate", {}).get("spec", obj["spec"])
-                    pod = spec.get("template", {}).get("spec", {})
-                    for c in pod.get("containers", []) + pod.get("initContainers", []):
-                        got[f"{obj['kind']}/{obj['metadata']['name']}/{c['name']}"] = c.get("image")
-                return got
-            except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
-                return None
-        w, p = images(profile["source"]["namespace"]), images(profile["target"]["namespace"])
+        w = workload_images(kube, profile["source"]["namespace"])
+        p = workload_images(kube, profile["target"]["namespace"])
         if w is None or p is None:
             out.append({"severity": "info", "title": "images: live comparison unavailable (kubectl get failed)",
                         "details": []})
@@ -2144,11 +2240,12 @@ def values_alerts(repo, run=subprocess.run):
 
 
 def price_table_alerts(state, version):
-    """The built-in price tables changed since the last run (a New API version the tool now knows):
-    this run recomputed Apporo's tool prices from them."""
+    """The built-in price tables of the version WOOW runs changed since the last run (WOOW upgraded to
+    another supported version, or the tool's table for it changed): this run recomputed Apporo's prices."""
     try:
+        enabled, amount = nc.violation_defaults(version)
         rec = {"version": version, "tool_seed_sha256": nc.sha256_text(nc.go_json(nc.tool_price_seed(version))),
-               "violation_fee": nc.RC44_VIOLATION_FEE}
+               "violation_fee": amount, "violation_fee_enabled": enabled}
     except nc.ContentError:
         return []
     old = state.data.get("price_tables")
@@ -2158,6 +2255,28 @@ def price_table_alerts(state, version):
                  "details": ["this run recomputed Apporo's tool prices (and the violation fee) from the new built-in "
                              "tables: see the price items of this run (decreases written, increases held for a notice)"]}]
     return []
+
+
+def version_alerts(src, tgt, profile):
+    """Apporo running a New API version whose built-in tool prices name keys that WOOW's effective
+    table (the one of the version WOOW runs) lacks: Apporo bills those at the built-in US$ price,
+    not WOOW's / 30, because the sync can only write the keys WOOW has (Apporo upgraded first)."""
+    if not profile.get("divide_tool_prices"):
+        return []
+    sv, tv = src.get("running_version"), tgt.get("running_version")
+    try:
+        woow, _ = nc.effective_tool_prices(sv, src["options"].get(nc.TOOL_PRICE_KEY))
+        extra = sorted(set(nc.tool_price_seed(tv)) - set(woow), key=str.encode)
+    except nc.ContentError:
+        return []
+    if not extra:
+        return []
+    return [{"severity": "action",
+             "title": f"prices: Apporo runs New API {tv} (WOOW {sv}): {len(extra)} built-in tool price(s) not divided "
+                      f"by {profile['price_divisor']:g}",
+             "details": [f"keys only Apporo's version has: {', '.join(extra[:10])}" + (" ..." if len(extra) > 10 else ""),
+                         "Apporo bills these tool calls at the built-in US$ price (about 30x the rule) until WOOW "
+                         "runs a version that has them: upgrade WOOW first, or take Apporo back to WOOW's image"]}]
 
 
 # ------------------------------------------------------------- commands
@@ -2219,7 +2338,9 @@ def cmd_export(a):
     snap = read_source(a, profile) if side == "source" else read_target(a, profile)
     n, fp = nc.options_fingerprint(snap["options"])
     ab = nc.abilities_fingerprint(snap["abilities"])
-    print(f"{side} {profile[side]['namespace']}: version {snap['version']}, {len(snap['options'])} options "
+    print(f"{side} {profile[side]['namespace']}: runs New API {snap['running_version']} "
+          f"({snap.get('running_image') or 'version given by --source-version or the snapshot'}; setups.version "
+          f"{snap.get('setup_version')}), {len(snap['options'])} options "
           f"(portable {n}, sha256 {fp}), {len(snap['channels'])} channels, abilities {ab[0]} sha256 {ab[1]}")
     for k in ("ModelRatio", "ModelPrice", "CompletionRatio", "CacheRatio"):
         if k in snap["options"]:
@@ -2361,7 +2482,7 @@ def run_apply(a, profile, bootstrap, out=None):
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
         state.save()
         return {"ok": run["ok"], "items": items, "run": run, "state": state, "tgt": tgt2, "alerts": alerts,
-                "version": src.get("version")}
+                "src": src}
     except BaseException as e:
         run.update(ok=False, error=e.__class__.__name__)
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
@@ -2455,7 +2576,8 @@ def _daily(a):
     if a.apply:
         res = run_apply(a, profile, bootstrap=False)
         items, run, state, ok = res["items"], res["run"], res["state"], res["ok"]
-        extra += res["alerts"] + price_table_alerts(state, res["version"])
+        extra += res["alerts"] + price_table_alerts(state, res["src"]["running_version"])
+        extra += version_alerts(res["src"], res["tgt"], profile)
         fail = apply_failure_alert(run)
         if fail:
             extra.append(fail)
@@ -2464,7 +2586,8 @@ def _daily(a):
         days, hdays = notice_days(profile), history_days(profile)
         history = offered_history(state, now, hdays)
         src, tgt, desired, items = plan_all(a, profile, False, None, history)
-        extra += history_alerts(state, tgt, desired) + price_table_alerts(state, src.get("version"))
+        extra += history_alerts(state, tgt, desired) + price_table_alerts(state, src["running_version"])
+        extra += version_alerts(src, tgt, profile)
         new = process_holds(items, state, now, days, persist=True)
         gate_chosen(items, tgt, profile, desired, history)
         base = simulate(tgt, chosen_items(items), profile, desired)
@@ -2634,6 +2757,8 @@ def build_parser():
     ap.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="holds, notices, alerts, journal (0700)")
     ap.add_argument("--kubectl", help="kubectl command line (default $APPORO_SYNC_KUBECTL or kubectl)")
     ap.add_argument("--source-snapshot", help="use an `export --out` file as the source instead of reading it")
+    ap.add_argument("--source-version", help="with --source-snapshot: the New API version its source ran, for an "
+                    "export taken before the tool recorded it (its setups.version is not that version)")
     ap.add_argument("--target-base", help="target origin if a port-forward is already running (127.0.0.1 only)")
     ap.add_argument("--auth", choices=("pat", "password"), default="pat",
                     help="target credential: Secret newapi-sync-pat (default) or newapi-root-credentials (before 2FA)")

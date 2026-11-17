@@ -5,7 +5,7 @@
 - 讀：兩邊都用唯讀 SQL（`kubectl exec ... psql`，第一句 `SET default_transaction_read_only = on`）。SQL 只能是工具自己的兩種固定查詢，逐字比對（見〈機密與輸出〉）。
 - 寫：只寫 Apporo，用 New API 的管理 API（`kubectl port-forward`），身分是 root。WOOW 那一側永遠不寫，工具也拒絕以 WOOW 的網址或 `new-api`／`new-api-stg` 當目標。
 - Python 3 標準函式庫，沒有其他相依。設定檔：[`deploy/apporo-sync/profile.json`](../deploy/apporo-sync/profile.json)。
-- 只支援 New API `v1.0.0-rc.44`：兩邊版本不是它就停（價目表的儲存格式、渠道 API 的行為都是照 rc.44 驗證的）。
+- 只支援工具驗證過的 New API 版本（目前只有 `v1.0.0-rc.44`：價目表的儲存格式、渠道 API 的行為、內建價格表都是照它驗證的）。版本看兩邊**實際跑的映像**：Deployment 釘的 image digest 對照 `apporo_newapi_content.SEED_IMAGES`。不看 `setups` 表：rc.44 只在 `/api/setup` 時寫一次 `setups.version`，之後升級也不會改。任何一邊跑的映像不是工具認得的 digest，同步就在讀那一邊的內容之前停下：不比對、不寫入，`daily` 寫一筆 `daily sync failed` 告警（見〈映像〉）。
 
 ## 內容對照
 
@@ -63,7 +63,7 @@
 | `mint-sync-pat` | 是（Secret） | 只在 root 還沒綁 2FA 時用：建同步用的 root PAT，直接寫進 Secret，不印出；Secret 寫不進去就立刻撤銷這把 PAT |
 | `failure-alert [--reason 文字]` | 只寫告警 | 給 systemd `OnFailure=` 用：工具自己來不及回報的失敗（被 kill、逾時）也變成一筆告警 |
 
-共用參數：`--profile`、`--state-dir`（預設 `~/.local/state/apporo-newapi-sync`，0700）、`--auth pat|password`、`--token-file`、`--source-snapshot`（用 `export --out` 的檔當來源）、`--target-base`（已經有 port-forward 時）、`--platform-pricing-module`（見〈平台定價檢查〉）。
+共用參數：`--profile`、`--state-dir`（預設 `~/.local/state/apporo-newapi-sync`，0700）、`--auth pat|password`、`--token-file`、`--source-snapshot`（用 `export --out` 的檔當來源；快照記著來源當時跑的版本與映像）、`--source-version`（只和 `--source-snapshot` 一起用：還沒記版本的舊快照，指定來源當時跑的版本）、`--target-base`（已經有 port-forward 時）、`--platform-pricing-module`（見〈平台定價檢查〉）。
 
 結束碼：0 正常（有告警也是 0，告警走告警管道）；1 寫入或比對失敗（另有告警）；2 用法、目標或連線錯誤（`daily` 另寫一筆 `daily sync failed` 告警）。
 
@@ -138,7 +138,8 @@
 |---|---|
 | `values: Apporo's Helm values fail the Apporo checks or are behind WOOW prod`（exit 1）／`values: the Apporo checks could not run …`（exit 2）／`… did not finish` | 見〈Helm values 落後〉 |
 | `images: chart/values.yaml pins New API …`／`images (live): … runs …, not an image whose built-in prices this tool knows` | 見〈映像〉：New API 映像不是工具知道內建價格表的那一版 |
-| `built-in prices changed: New API A -> B` | 工具改支援新版本、內建價格表換了：這一輪已依新表重算 Apporo 的工具價（降價寫入、漲價暫停） |
+| `built-in prices changed: New API A -> B` | WOOW 跑的版本換了（工具支援的另一版），或工具裡這一版的表改了：這一輪已依 WOOW 跑的版本的表重算 Apporo 的工具價與違規扣費（降價寫入、漲價暫停） |
+| `prices: Apporo runs New API B (WOOW A): N built-in tool price(s) not divided by 30` | Apporo 先升版：它的內建工具價表有 WOOW 的表沒有的 key，這些工具在 Apporo 以內建美元價計費（約規則的 30 倍），同步寫不到（只能寫 WOOW 有的 key）。先升 WOOW，或把 Apporo 退回 WOOW 的映像 |
 | `fixed-audio-price: model …` | 路由中有 rc.44 以固定美元價計音訊輸入的 Gemini 模型名 |
 
 另外：同步 PAT 到期前 14 天是 `action`；Secret 沒有 `woowtech.io/expires-at` 或讀不到是 `info`；狀態目錄沒有提供紀錄（見上）是 `info`。
@@ -156,7 +157,7 @@ Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試�
 
 - **渠道欄位**：除了 `key` 以外的欄位都會讀，但讀到時就檢查。`header_override`、`param_override`、`setting`、`settings`、`other`、`model_mapping`… 這類 JSON 欄位，只要成員名稱像憑證（`Authorization`、`Cookie`、`x-api-key`、`*_token`、`*_key`、`CF-Access-*`、`secret`、`password`…；`max_tokens` 這種不算），或值是 `Bearer …` 這類驗證值、32 字以上的十六進位、24 字以上大小寫數字混雜的隨機字串、網址帳密或像金鑰的查詢參數，整個欄位立刻換成 `[redacted]`：這個渠道不複製、不印、不匯出，只告警。
 - **印出的值**：渠道欄位只印 `name`、`models`、`group`、`test_model`、`type`、`status`、`priority`、`weight`、`auto_ban`、`tag`；其他欄位（含 `base_url`、`remark`）在 `plan`、`plan --json`、`verify`、告警裡都只顯示 sha256 前 12 碼與長度。值像金鑰的字串（`sk-` 加 16 字以上、`nap_…`、JWT、PEM）一律遮成 `[redacted]`。
-- **唯讀 SQL**：工具只送兩種查詢（option 名稱清單、內容），守衛**逐字**比對這兩個樣板，三個樣板文字（內容查詢分來源用與目標用兩種）以 sha256 釘在 `newapi_content.SQL_TEMPLATE_SHA256`。唯一能變的是內容查詢 `WHERE key IN (…)` 裡的 option 名稱常值，每個都必須是 `'[A-Za-z0-9_.:-]{1,128}'`（引號、反斜線、空白都不可能出現）。所以 `key` 只會在樣板讀它的位置出現：options 的 key 欄、以及只在目標端算的 `sha256(convert_to(channels.key))` 前 16 碼與長度。任何其他 SQL（包括把 options 用的 `key` 片段套在 channels 上、巢狀子查詢、`UNION`、多一個空白）一律拒絕。改了樣板（例如 `CHANNEL_COLUMNS`）時，所有讀取都會被拒，直到審過新文字並更新 pin。沙盒測試腳本的兩句固定 SQL 另以 sha256 釘住。
+- **唯讀 SQL**：工具只送兩種查詢（option 名稱清單、內容），守衛**逐字**比對這兩個樣板，三個樣板文字（內容查詢分來源用與目標用兩種）以 sha256 釘在 `apporo_newapi_content.SQL_TEMPLATE_SHA256`。唯一能變的是內容查詢 `WHERE key IN (…)` 裡的 option 名稱常值，每個都必須是 `'[A-Za-z0-9_.:-]{1,128}'`（引號、反斜線、空白都不可能出現）。所以 `key` 只會在樣板讀它的位置出現：options 的 key 欄、以及只在目標端算的 `sha256(convert_to(channels.key))` 前 16 碼與長度。任何其他 SQL（包括把 options 用的 `key` 片段套在 channels 上、巢狀子查詢、`UNION`、多一個空白）一律拒絕。改了樣板（例如 `CHANNEL_COLUMNS`）時，所有讀取都會被拒，直到審過新文字並更新 pin。沙盒測試腳本的兩句固定 SQL 另以 sha256 釘住。
 - `export --out` 用實際路徑比對，拒絕寫進本 repo（main 會鏡像到公開的 GitHub）。
 
 ## Secret（全部在 `new-api-apporo`，只列名稱）
@@ -199,7 +200,7 @@ $S apply                                                  # 用 PAT：0 auto，�
 
 **每日同步的身分**：無人值守的工作不要用叢集管理員的 context。`deploy/apporo-sync/rbac.yaml`（範本，未套用）建一個 ServiceAccount `apporo-newapi-sync`，權限只有：
 
-- `new-api`：`newapi-postgres-0` 的 `get` 與 `pods/exec`（唯讀 SQL）、列出 deployment／statefulset／cronjob（映像比對）；
+- `new-api`：`newapi-postgres-0` 的 `get` 與 `pods/exec`（唯讀 SQL）、列出 deployment／statefulset／cronjob（每次執行讀它跑的 New API 版本，以及映像比對）；
 - `new-api-apporo`：同上的 exec、`svc/newapi` 的 port-forward、`get` Secret `newapi-upstream-keys`、`newapi-sync-pat`；
 - 讀不到 `newapi-root-credentials`、不能寫 Secret、不能改任何部署；其他 namespace 一律沒有。
 
@@ -246,12 +247,30 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 
 `daily` 也比 `deploy/woow-k3s.yaml` 與 `deploy/apporo-k3s.yaml` 的映像 pin（`--live-images` 再比兩個 namespace 實際跑的映像）。不同就告警「開 PR 把 Apporo 跟上 WOOW 正式站的 pin」。自動開 PR 是之後的工作；PR 由負責人合併，合併後再 `helm upgrade`。
 
-**New API 映像與內建價格表**：工具價的內建表（`tools.go`）與違規扣費的預設（`grok.go`）跟著 New API 版本走。工具記錄它驗證過的映像（`newapi_content.SEED_IMAGES`：rc.44 的 digest）與該版的表（`TOOL_PRICE_SEEDS`）。`daily` 在這兩種情況告警（`action`），並說明要做的事：
+**New API 映像與內建價格表**：工具價的內建表（`tools.go`）與違規扣費的預設（`grok.go`）跟著 New API 版本走。工具記錄它支援的每一版：映像 digest（`apporo_newapi_content.SEED_IMAGES`）、工具價內建表（`TOOL_PRICE_SEEDS`）、違規扣費預設（`VIOLATION_FEE_DEFAULTS`）。目前只有 rc.44。
 
-- checkout 的 `chart/values.yaml` 釘的 `newapi.image` 不是工具認得的映像（tag 或 digest 不同）；
-- `--live-images`：WOOW 或 Apporo 實際跑的 New API 映像不是工具認得的。
+**每一邊跑哪一版**：每次讀內容（`export`、`plan`、`verify`、`apply`、`replay`、`daily`、`mint-sync-pat`）都先列出那一邊 namespace 的 Deployment（`kubectl get deploy,statefulset,cronjob -o json`，rbac.yaml 已有這個權限），取 New API 容器（master 與 slave）釘的 image digest 對照 `SEED_IMAGES`；`--source-snapshot` 時來源用快照記下的版本。不看 `setups.version`：rc.44 只在 `/api/setup` 時寫一次，之後升級也不會改（`export` 會把它和實際版本並列印出）。下面任何一種都讓這次執行在讀那一邊的內容（SQL）之前停下（結束碼 2，`daily` 另寫 `daily sync failed` 告警，不比對、不寫入）：
 
-新版本的步驟：用 `tests/apporo_sync/rc44_price_tables.py <新版原始碼>` 讀出新表（只讀文字，不建置），把表與映像 digest 加進 `TOOL_PRICE_SEEDS`／`SEED_IMAGES`（並重新確認其他 rc.44 規則、改 `NEWAPI_VERSION`）。之後每天都依「來源版本的表」重算 Apporo 的工具價：降價寫入、漲價暫停並起草通知；表換掉的那一輪另有一筆「built-in prices changed」告警（狀態檔記著上次用的版本與表的 sha256）。**順序**：工具還不認得新版本之前，同步會在版本檢查停下（每天 `daily sync failed`）；不要先把 Apporo 升到新映像，否則新版本新增的工具會以 WOOW 的價格（約 30 倍）計費。
+- 映像沒有 digest、digest 不在 `SEED_IMAGES`（還沒驗證的新版本）；
+- 同一個 namespace 的 New API Deployment 釘了兩種 digest（升級做到一半）；
+- 列不出 Deployment。
+
+寫入前另外確認目標的 `/api/status` 版本等於它 Deployment 跑的版本（不同表示正在換版，或 port-forward 與 kubectl 連到不同的實例），不同就不寫。WOOW 的有效工具價用 **WOOW 跑的版本**的表算，Apporo 現在收的價用 **Apporo 跑的版本**的表算；兩邊版本可以暫時不同。
+
+`daily` 另外在這兩種情況告警（`action`），並說明要做的事：
+
+- checkout 的 `chart/values.yaml` 釘的 `newapi.image` 不是工具認得的映像（tag 或 digest 不同）：在部署之前就先提醒；
+- `--live-images`：WOOW 或 Apporo 實際跑的 New API 映像不是工具認得的（這時同步本身也已停下）。
+
+新版本的步驟：
+
+1. 用 `tests/apporo_sync/rc44_price_tables.py <新版原始碼> <版本>` 讀出新版的工具價表與違規扣費預設（只讀文字，不建置；工具還沒有這一版時，它會印出讀到的表）。
+2. 重新確認其他 rc.44 規則（見〈限制〉第一點）。
+3. 把版本加進 `SEED_IMAGES`（映像 digest）、`TOOL_PRICE_SEEDS`、`VIOLATION_FEE_DEFAULTS`，開 PR、合併、更新 cluster1 的 checkout。
+4. 先升 WOOW。之後每天依 WOOW 跑的版本的表重算 Apporo 的工具價與違規扣費：降價寫入、漲價暫停並起草通知；換表的那一輪另有一筆 `built-in prices changed` 告警（狀態檔記著上次用的版本與表）。
+5. 再升 Apporo（APPORO-K3S.md 的映像 PR）。
+
+**順序**：工具還不認得新版本時，哪一邊先跑新映像，同步就從那天起停下（每天 `daily sync failed`），直到第 3 步完成。不要先升 Apporo：新版本新增的工具會在 Apporo 以內建美元價計費（約 30 倍），直到 WOOW 也跑那一版；這時每天有一筆 `prices: Apporo runs New API …` 告警，`verify` 的 `prices` 檢查也會失敗。
 
 ## 已驗證（2026-11-17，woow-k3s 的 dev-sandbox namespace，測完已刪）
 
@@ -284,7 +303,7 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 
 ## 限制
 
-- 只支援 rc.44。New API 升版時要重新驗證價目表的儲存格式、渠道 API、內建計費公式清單、內建工具價表與違規扣費預設（`tests/apporo_sync/rc44_price_tables.py`）與 `channelHasSensitiveChanges`，再改 `NEWAPI_VERSION`（見〈映像〉）。
+- 只支援 `SEED_IMAGES` 裡的版本（目前只有 rc.44）。加入新版本之前要重新驗證：價目表的儲存格式（Go JSON）、渠道 API（`PUT /api/channel/` 清欄位的規則、`channelHasSensitiveChanges`）、內建計費公式清單（`RC44_BUILTIN_EXPR_MODELS`）、Gemini 音訊固定價、內建工具價表與違規扣費預設（`tests/apporo_sync/rc44_price_tables.py <原始碼> <版本>`）、`/api/status` 的 `version` 欄位。任何一條改了，就要先改程式再加版本（見〈映像〉）。`NEWAPI_VERSION`（設定檔的 `newapi_version`）只標示設定檔格式依據的版本，不決定支援哪些版本。
 - rc.44 的 `PUT /api/channel/` 無法把欄位清成 null，也無法把一般字串欄位（名稱、模型清單……）清成空字串；這類變更只告警，要在管理介面手動改。
 - 設定列沒有刪除 API：WOOW 刪掉的設定列，Apporo 端只會告警。
 - 渠道 1、4 共用的那把金鑰若被 LiteLLM 停用（月預算用完），渠道會被 New API 自動停用；同步不改渠道狀態，只告警（它的模型仍算提供中，漲價照樣暫停）。

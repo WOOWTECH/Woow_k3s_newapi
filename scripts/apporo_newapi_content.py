@@ -23,6 +23,12 @@ What is read (and nothing else):
   Never: users, tokens, user_access_tokens, two_fas, passkeys, sessions,
   logs, quota_data, audit_logs or any other customer or identity table.
 
+setups.version is only shown (snapshot "setup_version"): rc.44 writes that row
+once, at /api/setup, and never updates it, so after an upgrade it still names
+the first version. The version a site runs, which selects its built-in prices
+(SEED_IMAGES, TOOL_PRICE_SEEDS, VIOLATION_FEE_DEFAULTS), is read by
+apporo_sync.running_version from the image digest its Deployments pin.
+
 The read-only SQL is one of the tool's own two queries, byte for byte
 (check_read_only_sql; the templates are pinned by sha256 in
 SQL_TEMPLATE_SHA256): the only variable part is the list of option key names,
@@ -43,6 +49,9 @@ import re
 import subprocess
 import urllib.parse
 
+# The New API version the storage and API rules of this module were verified on
+# (profile.newapi_version names it). The versions a site may RUN are the keys of
+# SEED_IMAGES: each one was re-checked against those rules (see SEED_IMAGES).
 NEWAPI_VERSION = "v1.0.0-rc.44"
 
 # rc.44 model/model_pricing_config.go modelPricingOptionKeys: written in one
@@ -367,7 +376,7 @@ def check_read_only_sql(sql):
     for name, (head, tail) in templates.items():
         if template_sha256(head, tail) != SQL_TEMPLATE_SHA256[name]:
             raise ContentError(f"the {name} SQL template changed: review it (read-only, no channel key, no "
-                               "customer table), then update newapi_content.SQL_TEMPLATE_SHA256")
+                               "customer table), then update apporo_newapi_content.SQL_TEMPLATE_SHA256")
     for name, (head, tail) in templates.items():
         if tail is None:
             if sql == head:
@@ -473,7 +482,8 @@ def read_snapshot(psql, profile=None, key_hashes=False):
     for a in abilities:
         if not isinstance(a, dict) or set(a) != set(ABILITY_COLUMNS):
             raise ContentError("invalid ability row")
-    return {"version": body.get("version") or head.get("version"), "options": options, "option_sha256": hashes,
+    # setups.version: shown only (rc.44 never updates it after /api/setup); apporo_sync adds running_version.
+    return {"setup_version": body.get("version") or head.get("version"), "options": options, "option_sha256": hashes,
             "skipped_keys": skipped, "channels": channels, "unsafe_channels": unsafe, "abilities": abilities,
             "seq": body.get("seq") or {}}
 
@@ -596,13 +606,30 @@ RC44_TOOL_PRICE_SEED = {
     "search_strategy_agent_max": 4.0, "bing_web_search": 14.0, "web_search:grok*": 5.0,
     "x_search_posts": 5.0, "x_search_profiles": 10.0,
 }
-# The built-in seed of each New API version the tool knows, and the image it was
-# read from (chart/values.yaml newapi.image). A new version may change the seed:
-# read its tools.go, add it here, and the sync recomputes Apporo's prices.
-TOOL_PRICE_SEEDS = {"v1.0.0-rc.44": RC44_TOOL_PRICE_SEED}
+# The New API versions this tool supports: the image each one runs as (the digest
+# chart/values.yaml newapi.image pins) and its built-in prices (the tool price seed
+# here, the violation fee default in VIOLATION_FEE_DEFAULTS). A site's version is
+# the one it RUNS, read from the image digest its Deployments pin
+# (apporo_sync.running_version); setups.version is not it (rc.44 writes that row
+# once, at /api/setup). A new version may change these prices or any rc.44 rule
+# this module relies on: re-check them (docs/APPORO-SYNC.md 〈映像〉 and 〈限制〉;
+# tests/apporo_sync/rc44_price_tables.py <source> <version>), then add the version
+# to all three tables. A site running an image that is not here stops the sync.
 SEED_IMAGES = {"v1.0.0-rc.44": "sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84"}
+TOOL_PRICE_SEEDS = {"v1.0.0-rc.44": RC44_TOOL_PRICE_SEED}
 # sha256 of go_json(RC44_TOOL_PRICE_SEED): an edit of the table must be a deliberate one.
 RC44_TOOL_PRICE_SEED_SHA256 = "69dc49fddbea1f79c82a85b62043a46191ff9028f26e187b6956d378579a8493"
+
+
+def version_of_digest(digest):
+    """The supported New API version whose image has this digest, or None."""
+    found = [version for version, d in SEED_IMAGES.items() if d == digest]
+    return found[0] if len(found) == 1 else None
+
+
+def supported_version(version):
+    """True when every built-in table of this version is known (SEED_IMAGES and the price tables)."""
+    return version in SEED_IMAGES and version in TOOL_PRICE_SEEDS and version in VIOLATION_FEE_DEFAULTS
 
 
 class _Pairs(list):
@@ -736,6 +763,9 @@ def divided_tool_prices(version, text, divisor):
 VIOLATION_FEE_KEY = "grok.violation_deduction_amount"
 VIOLATION_SWITCH_KEY = "grok.violation_deduction_enabled"
 RC44_VIOLATION_FEE = 0.05
+# The built-in default of each supported version (see SEED_IMAGES): (enabled, US$ per flagged request).
+VIOLATION_FEE_DEFAULTS = {"v1.0.0-rc.44": (True, RC44_VIOLATION_FEE)}
+# The absolute-price options the profile may divide (divided_scalar_prices) and their switches.
 SCALAR_PRICE_DEFAULTS = {VIOLATION_FEE_KEY: RC44_VIOLATION_FEE}
 PRICE_SWITCHES = {VIOLATION_SWITCH_KEY: True}
 _GO_DECIMAL_RE = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
@@ -765,24 +795,37 @@ def go_parse_bool(text):
     return None
 
 
-def scalar_price(options, key):
-    """(the US$ amount rc.44 uses for this option, or None, and why not)."""
+def violation_defaults(version):
+    """(enabled, US$) that the New API version a site runs uses when its option rows are absent."""
+    found = VIOLATION_FEE_DEFAULTS.get(version)
+    if found is None:
+        raise ContentError(f"no built-in violation fee default for New API {version!r}: read its "
+                           "setting/model_setting/grok.go and add it to VIOLATION_FEE_DEFAULTS")
+    return found
+
+
+def scalar_price(options, key, version):
+    """(the US$ amount this New API version uses for this option, or None, and why not)."""
+    if key != VIOLATION_FEE_KEY:
+        raise ContentError(f"{key}: not an absolute price this tool knows")
+    default = violation_defaults(version)[1]
     text = options.get(key)
     if text is None:
-        return SCALAR_PRICE_DEFAULTS[key], None
+        return default, None
     v, why = go_parse_float(text)
     if why:
         return None, why
-    return (SCALAR_PRICE_DEFAULTS[key] if v is None else v), None
+    return (default if v is None else v), None
 
 
-def violation_fee(options):
-    """(US$ rc.44 charges per flagged request, 0 when switched off, or None, and why not)."""
+def violation_fee(options, version):
+    """(US$ the New API version charges per flagged request, 0 when switched off, or None, and why not)."""
+    on_default = violation_defaults(version)[0]
     text = options.get(VIOLATION_SWITCH_KEY)
-    enabled = PRICE_SWITCHES[VIOLATION_SWITCH_KEY] if text is None else go_parse_bool(text)
+    enabled = on_default if text is None else go_parse_bool(text)
     if enabled is None:
-        enabled = PRICE_SWITCHES[VIOLATION_SWITCH_KEY]     # rc.44 skips an unreadable switch
-    amount, why = scalar_price(options, VIOLATION_FEE_KEY)
+        enabled = on_default                               # rc.44 skips an unreadable switch
+    amount, why = scalar_price(options, VIOLATION_FEE_KEY, version)
     if amount is None:
         return None, why
     return (amount if enabled and amount > 0 else 0.0), None
@@ -851,7 +894,9 @@ def transform(src, profile):
         opts[key] = value
     if profile.get("divide_tool_prices"):
         # Absolute prices per 1,000 tool calls: WOOW's effective price of every key / divisor.
-        text, ignored, clashes = divided_tool_prices(src.get("version"), src["options"].get(TOOL_PRICE_KEY), divisor)
+        # The seed is the one of the version WOOW RUNS (src["running_version"]), never setups.version.
+        text, ignored, clashes = divided_tool_prices(src.get("running_version"), src["options"].get(TOOL_PRICE_KEY),
+                                                     divisor)
         opts[TOOL_PRICE_KEY] = text
         if ignored:
             notes.append(("tool-price-ignored", TOOL_PRICE_KEY,
@@ -862,7 +907,7 @@ def transform(src, profile):
                           f"keys {pair} name the same model prefix at different prices: rc.44's choice between "
                           "them is not defined, so Apporo may not charge exactly WOOW's / 30; fix it at WOOW"))
     for key in profile.get("divided_scalar_prices", ()):
-        amount, why = scalar_price(src["options"], key)
+        amount, why = scalar_price(src["options"], key, src.get("running_version"))
         if amount is None:
             opts.pop(key, None)
             notes.append(("scalar-price-unreadable", key, f"WOOW's value cannot be read ({why}): not copied"))

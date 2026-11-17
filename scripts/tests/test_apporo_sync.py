@@ -1,4 +1,4 @@
-"""Unit tests for scripts/apporo_sync.py and scripts/newapi_content.py.
+"""Unit tests for scripts/apporo_sync.py and scripts/apporo_newapi_content.py.
 
 Run: python3 -m unittest discover -s scripts/tests -v
 No cluster: an in-process fake rc.44 (FakeNewAPI) answers the admin API the
@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import apporo_sync as aps  # noqa: E402
-import newapi_content as nc  # noqa: E402
+import apporo_newapi_content as nc  # noqa: E402
 
 # Owner decision 2026-11-17: Apporo never fails a WOOW pull request. Once the Apporo
 # values PR (#44) is in, CI runs every scripts/tests/test_apporo_*.py in its own
@@ -53,6 +53,11 @@ ROOT_PW = "root-password-" + "y" * 18
 KEY_API = "sk-" + "A" * 30
 KEY_PAID = "sk-" + "P" * 30
 SMTP_SECRET = "sk-" + "Z" * 30
+RC44 = "v1.0.0-rc.44"
+RC44_IMAGE = "docker.io/calciumion/new-api:v1.0.0-rc.44@" + nc.SEED_IMAGES[RC44]
+PG_IMAGE = "docker.io/library/postgres:16.15-alpine3.24@sha256:" + "7" * 64
+
+
 def load_json(path):
     with open(path) as f:
         return json.load(f)
@@ -125,7 +130,9 @@ class FakeDB:
     """One rc.44 instance's tables, as the sync sees them."""
 
     def __init__(self, server_address=None):
-        self.version = "v1.0.0-rc.44"
+        self.version = RC44            # setups.version: written once by /api/setup, never updated
+        self.running = RC44            # what /api/status answers (the binary that runs)
+        self.image = RC44_IMAGE        # what the Deployments pin (running_version reads it)
         self.options = {"theme.frontend": "default", "LegacyAccessTokenRetireAt": "1797000000",
                         "SelfUseModeEnabled": "false", "DemoSiteEnabled": "false"}
         if server_address:
@@ -209,7 +216,7 @@ class FakeDB:
 
 
 class FakePsql:
-    """Answers the two read-only queries of newapi_content from a FakeDB."""
+    """Answers the two read-only queries of apporo_newapi_content from a FakeDB."""
 
     def __init__(self, db):
         self.db, self.queries = db, []
@@ -272,7 +279,7 @@ class FakeNewAPI:
             def do_GET(self):
                 if self.path == "/api/status":
                     sa = fake.db.options.get("ServerAddress", "http://localhost:3000")
-                    return self._send({"success": True, "data": {"version": fake.db.version, "server_address": sa}})
+                    return self._send({"success": True, "data": {"version": fake.db.running, "server_address": sa}})
                 self._send({"success": False}, 404)
 
             def do_POST(self):
@@ -416,15 +423,26 @@ class Harness(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp)
         self.state = os.path.join(self.tmp, "state")
-        aps.PSQL_FACTORY = lambda side, profile: FakePsql(self.src if side == "source" else self.tgt)
+        self.sql_reads = []
+        aps.PSQL_FACTORY = lambda side, profile: (self.sql_reads.append(side),
+                                                  FakePsql(self.src if side == "source" else self.tgt))[1]
+        aps.WORKLOAD_READER = self.workloads
         aps.SECRET_READER = lambda ns, name, key: SECRETS.get((ns, name, key))
         aps.ANNOTATION_READER = lambda ns, name, annotation: None
         # the Helm values check (scripts/apporo_parity.py + helm) has its own tests: keep daily runs hermetic
         aps.values_alerts = lambda repo, run=None: []
         self.addCleanup(setattr, aps, "values_alerts", REAL_VALUES_ALERTS)
         self.addCleanup(setattr, aps, "PSQL_FACTORY", None)
+        self.addCleanup(setattr, aps, "WORKLOAD_READER", None)
         self.addCleanup(setattr, aps, "SECRET_READER", None)
         self.addCleanup(setattr, aps, "ANNOTATION_READER", None)
+
+    def workloads(self, namespace):
+        """`kubectl get deploy,statefulset,cronjob` of a side: its New API image and Postgres."""
+        db = {"new-api": self.src, "new-api-apporo": self.tgt}.get(namespace)
+        if db is None:
+            return None
+        return {"Deployment/newapi-master/new-api": db.image, "StatefulSet/newapi-postgres/postgres": PG_IMAGE}
 
     def run_cli(self, *args, auth="pat"):
         out, err = io.StringIO(), io.StringIO()
@@ -572,6 +590,7 @@ class ExportTest(unittest.TestCase):
         snap = nc.read_snapshot(FakePsql(db), load_json(PROFILE))
         self.assertEqual(snap["skipped_keys"]["Footer"], "secret-value")
         self.assertEqual(snap["unsafe_channels"], {3: ["header_override"]})
+        snap["running_version"] = RC44
         desired, notes = nc.transform(snap, nc.load_profile(PROFILE))
         self.assertNotIn(3, desired["channels"])
         self.assertIn("source-channel-unsafe", [n[0] for n in notes])
@@ -581,6 +600,7 @@ class TransformTest(unittest.TestCase):
     def setUp(self):
         self.profile = nc.load_profile(PROFILE)
         self.src = nc.read_snapshot(FakePsql(FakeDB().load_woow()), self.profile)
+        self.src["running_version"] = RC44            # apporo_sync.read_side adds it (from the Deployment)
         self.desired, self.notes = nc.transform(self.src, self.profile)
 
     def test_prices_divided_by_30_exactly(self):
@@ -608,6 +628,14 @@ class TransformTest(unittest.TestCase):
         self.assertEqual(self.desired["channels"][3]["param_override"], "")
         self.assertIsNone(self.desired["channels"][1]["param_override"])
         self.assertNotIn("source-channel-new", [n[0] for n in self.notes])
+
+    def test_no_running_version_no_transform(self):
+        src = dict(self.src)
+        del src["running_version"]               # never priced with a guessed (or setups) version
+        with self.assertRaises(nc.ContentError):
+            nc.transform(src, self.profile)
+        self.assertEqual(self.src["setup_version"], RC44)
+        self.assertNotIn("version", self.src)
 
     def test_profile_refuses_woow_targets(self):
         p = load_json(PROFILE)
@@ -657,11 +685,23 @@ class ReplayTest(Harness):
         self.assertEqual(rc, 2)
         self.assertIn("WOOW site", out)
 
-    def test_refuses_another_rc_version(self):
-        self.tgt.version = "v1.0.0-rc.45"
+    def test_refuses_a_target_running_an_unknown_image(self):
+        self.tgt.image = "docker.io/calciumion/new-api:v1.0.0-rc.45@sha256:" + "4" * 64
         rc, out = self.run_cli("replay", "--yes-bootstrap", auth="password")
         self.assertEqual(rc, 2)
-        self.assertIn("rc.44", out)
+        self.assertIn("new-api-apporo runs New API docker.io/calciumion/new-api:v1.0.0-rc.45@sha256:4444", out)
+        self.assertIn("not an image whose rules and built-in prices this tool knows", out)
+        self.assertEqual([r for r in self.api.requests if r[0] != "GET"], [])
+
+    def test_setups_version_is_not_the_version_that_runs(self):
+        # rc.44 writes setups.version once, at /api/setup: an instance installed with another
+        # version and upgraded to rc.44 still says so. It is shown, never used.
+        self.tgt.version = self.src.version = "v1.0.0-rc.40"
+        self.replay()
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("export", "--side", "target")
+        self.assertIn(f"runs New API {RC44} ({RC44_IMAGE}; setups.version v1.0.0-rc.40)", out)
 
 
 class DailyTest(Harness):
@@ -1437,6 +1477,10 @@ class ToolPriceTableTest(unittest.TestCase):
         self.assertEqual(nc.TOOL_PRICE_SEEDS[nc.NEWAPI_VERSION], nc.RC44_TOOL_PRICE_SEED)
         self.assertRegex(nc.SEED_IMAGES[nc.NEWAPI_VERSION], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(set(nc.SEED_IMAGES), set(nc.TOOL_PRICE_SEEDS))
+        self.assertEqual(set(nc.SEED_IMAGES), set(nc.VIOLATION_FEE_DEFAULTS))
+        self.assertEqual(nc.VIOLATION_FEE_DEFAULTS[nc.NEWAPI_VERSION], (True, 0.05))
+        self.assertEqual(nc.version_of_digest(nc.SEED_IMAGES[RC44]), RC44)
+        self.assertIsNone(nc.version_of_digest("sha256:" + "0" * 64))
 
     @unittest.skipUnless(os.environ.get("NEWAPI_RC44_SRC"), "set NEWAPI_RC44_SRC to a v1.0.0-rc.44 checkout")
     def test_the_tables_match_the_rc44_source(self):
@@ -1517,10 +1561,13 @@ class ToolPriceTableTest(unittest.TestCase):
         self.assertEqual(nc.go_parse_float("NaN")[0], None)
         self.assertTrue(nc.go_parse_float("Inf")[1])
         self.assertEqual([nc.go_parse_bool(x) for x in ("true", "T", "0", "no")], [True, True, False, None])
-        self.assertEqual(nc.violation_fee({}), (0.05, None))
-        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "false"}), (0.0, None))
-        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "maybe", nc.VIOLATION_FEE_KEY: "0.1"}), (0.1, None))
-        self.assertIsNone(nc.violation_fee({nc.VIOLATION_FEE_KEY: "Inf"})[0])
+        self.assertEqual(nc.violation_fee({}, RC44), (0.05, None))
+        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "false"}, RC44), (0.0, None))
+        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "maybe", nc.VIOLATION_FEE_KEY: "0.1"}, RC44),
+                         (0.1, None))
+        self.assertIsNone(nc.violation_fee({nc.VIOLATION_FEE_KEY: "Inf"}, RC44)[0])
+        with self.assertRaises(nc.ContentError):
+            nc.violation_fee({}, None)                                     # no version: never a guessed default
 
 
 class ProfileBoundsTest(unittest.TestCase):
@@ -1734,10 +1781,169 @@ class PriceTableImageTest(unittest.TestCase):
         self.assertEqual(aps.price_table_alerts(state, nc.NEWAPI_VERSION), [])
         self.assertEqual(aps.price_table_alerts(state, nc.NEWAPI_VERSION), [])
         self.addCleanup(nc.TOOL_PRICE_SEEDS.pop, "v1.0.0-rc.99", None)
+        self.addCleanup(nc.VIOLATION_FEE_DEFAULTS.pop, "v1.0.0-rc.99", None)
         nc.TOOL_PRICE_SEEDS["v1.0.0-rc.99"] = dict(nc.RC44_TOOL_PRICE_SEED, web_search=12.0)
+        nc.VIOLATION_FEE_DEFAULTS["v1.0.0-rc.99"] = (True, 0.05)
         (al,) = aps.price_table_alerts(state, "v1.0.0-rc.99")
         self.assertIn("v1.0.0-rc.44 -> v1.0.0-rc.99", al["title"])
         self.assertEqual(aps.price_table_alerts(state, "v1.0.0-rc.99"), [])
+
+
+RC45 = "v1.0.0-rc.45"
+RC45_IMAGE = "docker.io/calciumion/new-api:v1.0.0-rc.45@sha256:" + "5" * 64
+
+
+class RunningVersionTest(Harness):
+    """The version a site runs is the image digest its Deployments pin, never setups.version (rc.44
+    writes that row once, at /api/setup): the built-in prices follow it; an unknown image stops the sync."""
+
+    def setUp(self):
+        super().setUp()
+        self.replay()
+
+    def support_rc45(self, seed_changes):
+        """The tool learns rc.45 as docs/APPORO-SYNC.md 〈映像〉 says: its digest and its built-in tables."""
+        for table, value in ((nc.SEED_IMAGES, RC45_IMAGE.rpartition("@")[2]),
+                             (nc.TOOL_PRICE_SEEDS, dict(nc.RC44_TOOL_PRICE_SEED, **seed_changes)),
+                             (nc.VIOLATION_FEE_DEFAULTS, (True, 0.05))):
+            table[RC45] = value
+            self.addCleanup(table.pop, RC45, None)
+
+    @staticmethod
+    def upgrade(db):
+        db.image, db.running = RC45_IMAGE, RC45           # setups.version keeps saying rc.44
+
+    def tool_map(self):
+        return json.loads(self.tgt.options[nc.TOOL_PRICE_KEY])
+
+    def writes(self, since):
+        return [r for r in self.api.requests[since:] if r[0] in ("PUT", "POST") and "sessions" not in r[1]]
+
+    def test_woow_running_an_image_the_tool_does_not_know_stops_the_sync(self):
+        self.src.image = RC45_IMAGE                       # WOOW upgraded first; the tool does not know rc.45
+        self.src.set_map_entry("ModelRatio", "gpt-4", 1)  # a change the sync would otherwise write
+        before, reads = len(self.api.requests), len(self.sql_reads)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 2, out)
+        self.assertIn(f"new-api runs New API {RC45_IMAGE}: not an image whose rules and built-in prices this tool "
+                      "knows", out)
+        (al,) = [al for al in self.alerts() if al["title"] == "daily sync failed"]
+        self.assertTrue(al["new"])
+        self.assertEqual(self.writes(before), [])
+        self.assertEqual(self.sql_reads[reads:], [], "no SQL is sent before the versions are known")
+        for cmd in (["plan"], ["verify"], ["apply"], ["daily"]):
+            rc, out = self.run_cli(*cmd)
+            self.assertEqual(rc, 2, (cmd, out))
+        self.assertEqual(self.writes(before), [])
+
+    def test_a_supported_upgrade_prices_woow_with_the_version_it_runs(self):
+        self.run_cli("daily", "--apply")                  # the record of the built-in tables starts here
+        self.support_rc45({"web_search": 8.0})            # rc.45 lowers web_search 10 -> 8
+        self.upgrade(self.src)
+        self.assertEqual(self.src.version, RC44)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search"], 8 / 30)                       # a decrease: at once
+        self.assertIn("AUTO  tool_price_setting.prices[web_search]: tool price (web_search, per 1,000 calls) "
+                      "decrease", out)
+        self.assertIn(f"ALERT [action] built-in prices changed: New API {RC44} -> {RC45}", out)
+        rc, out = self.run_cli("verify", "--strict", "-v")
+        self.assertEqual(rc, 0, out)                      # WOOW on rc.45, Apporo still on rc.44: WOOW / 30
+        self.assertIn("ok   prices every tool call price = WOOW's / 30", out)
+        self.upgrade(self.tgt)                            # Apporo follows: nothing left to write
+        before = len(self.api.requests)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.writes(before), [])
+        self.assertNotIn("built-in prices changed", out)
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+
+    def test_a_higher_builtin_price_is_held_for_a_notice(self):
+        self.run_cli("daily", "--apply")
+        self.support_rc45({"web_search": 12.0})
+        self.upgrade(self.src)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search"], 10 / 30)                      # held
+        self.assertIn("HOLD  tool_price_setting.prices[web_search]", out)
+        (h,) = self.state_data()["holds"].values()
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| tool `web_search` | per 1,000 calls | 10.666667 | 12.8 | +20.0% |", notice)
+
+    def test_apporo_upgraded_before_woow_is_an_alert(self):
+        self.support_rc45({"new_tool": 20.0})             # rc.45 bills a tool WOOW's rc.44 does not have
+        self.upgrade(self.tgt)
+        rc, out = self.run_cli("daily")
+        self.assertEqual(rc, 0, out)
+        (al,) = [al for al in self.alerts() if al["title"].startswith("prices: Apporo runs New API")]
+        self.assertEqual(al["severity"], "action")
+        self.assertIn(f"Apporo runs New API {RC45} (WOOW {RC44}): 1 built-in tool price(s) not divided by 30",
+                      al["title"])
+        self.assertIn("new_tool", al["details"][0])
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL prices every tool call price = WOOW's / 30", out)
+
+    def test_writes_need_the_api_and_the_deployments_to_agree(self):
+        self.support_rc45({})
+        self.src.set_map_entry("ModelRatio", "gpt-4", 1)  # something to write
+        self.tgt.running = RC45                           # the API answers rc.45, the Deployments pin rc.44
+        before = len(self.api.requests)
+        rc, out = self.run_cli("apply")
+        self.assertEqual(rc, 2, out)
+        self.assertIn(f"the target's /api/status says New API '{RC45}', its Deployments run '{RC44}'", out)
+        self.assertEqual(self.writes(before), [])
+
+    def test_mixed_undigested_missing_or_unlistable_images_stop_the_sync(self):
+        cases = (
+            ({"Deployment/newapi-master/new-api": RC44_IMAGE, "Deployment/newapi-slave/new-api": RC45_IMAGE},
+             "pin 2 different New API images"),
+            ({"Deployment/newapi-master/new-api": "docker.io/calciumion/new-api:v1.0.0-rc.44"},
+             "without an image digest"),
+            ({"StatefulSet/newapi-postgres/postgres": PG_IMAGE}, "no Deployment runs a New API image"),
+            (None, "kubectl cannot list its Deployments"),
+        )
+        for images, why in cases:
+            aps.WORKLOAD_READER = lambda ns, images=images: images if ns == "new-api" else self.workloads(ns)
+            rc, out = self.run_cli("plan")
+            self.assertEqual(rc, 2, (why, out))
+            self.assertIn(why, out)
+        aps.WORKLOAD_READER = lambda ns: {"Deployment/newapi-master/new-api": RC44_IMAGE,
+                                          "Deployment/newapi-slave/new-api": "calciumion/new-api@" +
+                                          nc.SEED_IMAGES[RC44]}
+        rc, out = self.run_cli("plan")                    # the same digest written differently is one image
+        self.assertEqual(rc, 0, out)
+
+    def test_snapshots_record_the_version_their_source_ran(self):
+        path = os.path.join(self.tmp, "woow.json")
+        rc, out = self.run_cli("export", "--side", "source", "--out", path)
+        self.assertEqual(rc, 0, out)
+        snap = load_json(path)
+        self.assertEqual((snap["running_version"], snap["running_image"], snap["setup_version"]),
+                         (RC44, RC44_IMAGE, RC44))
+        rc, out = self.run_cli("--source-snapshot", path, "verify", "--strict")
+        self.assertEqual(rc, 0, out)
+        # an export taken before the tool recorded the running version (setups.version as "version")
+        legacy = {k: v for k, v in snap.items() if k not in ("running_version", "running_image", "setup_version")}
+        legacy["version"] = RC44
+        old = os.path.join(self.tmp, "old.json")
+        with open(old, "w") as f:
+            json.dump(legacy, f)
+        rc, out = self.run_cli("--source-snapshot", old, "verify", "--strict")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("does not record the New API version its source ran", out)
+        rc, out = self.run_cli("--source-snapshot", old, "--source-version", RC44, "verify", "--strict")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("--source-snapshot", old, "--source-version", RC45, "verify")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not a version this tool supports", out)
+        rc, out = self.run_cli("--source-snapshot", path, "--source-version", "v1.0.0-rc.43", "verify")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("contradicts", out)
+        rc, out = self.run_cli("--source-version", RC44, "verify")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("only goes with --source-snapshot", out)
 
 
 def types_ns(**kw):

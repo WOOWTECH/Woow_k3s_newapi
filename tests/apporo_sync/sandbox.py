@@ -24,8 +24,12 @@ Output (export, state, journal; no secret) goes to $APPORO_SYNC_SANDBOX_OUT
 (default ~/.local/state/apporo-newapi-sync-sandbox/<suffix>), never into the repo.
 To test without reading WOOW production again, copy an earlier export-woow result
 (woow-prod-export.json and woow-prod-fingerprints.json) into that directory and
-skip export-woow. The throwaway sandbox credentials (0600 sandbox-secrets.json)
+skip export-woow; an export taken before the tool recorded the New API version its
+source ran needs APPORO_SYNC_SANDBOX_SOURCE_VERSION=<that version> (passed as
+--source-version). The throwaway sandbox credentials (0600 sandbox-secrets.json)
 are deleted by `down`.
+
+  python3 tests/apporo_sync/sandbox.py versions      # running versions from the real Deployments; fail closed
 """
 import base64
 import datetime
@@ -43,7 +47,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import apporo_sync as aps  # noqa: E402
 import newapi_admin as na  # noqa: E402
-import newapi_content as nc  # noqa: E402
+import apporo_newapi_content as nc  # noqa: E402
 sys.path.insert(0, HERE)
 import manifests  # noqa: E402
 
@@ -62,7 +66,7 @@ FP_SQL = nc.READ_ONLY_PREAMBLE + """SELECT json_build_object(
 'abilities', (SELECT json_build_array(count(*), encode(sha256(convert_to(string_agg(concat_ws('|',"group",model,channel_id,enabled,priority,weight,coalesce(tag,'')), E'\\n' ORDER BY "group",model,channel_id),'UTF8')),'hex')) FROM abilities),
 'channels', (SELECT json_build_array(count(*), encode(sha256(convert_to(string_agg(concat_ws('|', id, type, name, status, coalesce(base_url,''), "group", coalesce(models,''), coalesce(model_mapping,''), coalesce(status_code_mapping,''), coalesce(priority,0), coalesce(weight,0), coalesce(auto_ban,0), coalesce(tag,''), coalesce(test_model,''), coalesce(open_ai_organization,''), coalesce(other,''), coalesce(other_info,''), coalesce(setting,''), coalesce(param_override,''), coalesce(header_override,''), coalesce(remark,''), coalesce(channel_info::text,''), coalesce(settings,'')), E'\\n' ORDER BY id),'UTF8')),'hex')) FROM channels)
 )::text;"""
-# The two fixed SQL texts of this harness are pinned (newapi_content.check_pinned_sql):
+# The two fixed SQL texts of this harness are pinned (apporo_newapi_content.check_pinned_sql):
 # reviewed once; any edit must update the pin. FP_SQL returns counts and sha256 only.
 FP_SQL_SHA256 = "bd2d2298662f5df1d9fe2844f603f27272b183d73b7ce8da787d2729891411e6"
 
@@ -203,11 +207,19 @@ def phase_export_woow():
     print("WOOW prod research fingerprints (read-only):", json.dumps(fp))
 
 
+def snapshot_args():
+    """--source-snapshot WOOW_EXPORT, plus --source-version for an export that does not record it."""
+    args = ["--source-snapshot", WOOW_EXPORT]
+    if os.environ.get("APPORO_SYNC_SANDBOX_SOURCE_VERSION"):
+        args += ["--source-version", os.environ["APPORO_SYNC_SANDBOX_SOURCE_VERSION"]]
+    return args
+
+
 def phase_seed_source():
     p = profiles()
-    tool("--profile", p["mirror"], "--source-snapshot", WOOW_EXPORT, "--auth", "password", "--state-dir",
+    tool("--profile", p["mirror"], *snapshot_args(), "--auth", "password", "--state-dir",
          os.path.join(OUT, "state-mirror"), "replay", "--yes-bootstrap")
-    tool("--profile", p["mirror"], "--source-snapshot", WOOW_EXPORT, "verify", "--strict", "--check-keys")
+    tool("--profile", p["mirror"], *snapshot_args(), "verify", "--strict", "--check-keys")
     with open(os.path.join(OUT, "woow-prod-fingerprints.json")) as f:
         woow = json.load(f)
     sbx = fingerprints(SRC)
@@ -515,6 +527,70 @@ def phase_daily():
     tool("--profile", p["apporo"], "verify")
     tool("--profile", p["apporo"], "verify", "--strict", check=False)
     tool("holds")
+
+
+def phase_versions():
+    """Each sandbox's New API version comes from its real Deployment (image digest), not setups.version;
+    an image the tool does not know stops the sync before any SQL or write; a target whose /api/status
+    disagrees with its Deployments is never written. The tool runs in-process with its version tables
+    patched for the test (the cluster is not changed)."""
+    import contextlib
+    import io
+    p = profiles()
+    ok = True
+    for ns in (SRC, TGT):
+        version, image = aps.running_version(KUBECTL, ns)
+        good = version == nc.NEWAPI_VERSION and image == manifests.NEWAPI
+        ok &= good
+        print(f"{'PASS' if good else 'FAIL'} {ns} runs {version} ({image})")
+
+    def run(*args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = aps.main(["--profile", p["apporo"], "--kubectl", " ".join(KUBECTL), "--state-dir", STATE, *args])
+        return rc, out.getvalue()
+
+    tables = (nc.SEED_IMAGES, nc.TOOL_PRICE_SEEDS, nc.VIOLATION_FEE_DEFAULTS)
+    saved = [dict(t) for t in tables]
+
+    def restore():
+        for t, old in zip(tables, saved):
+            t.clear()
+            t.update(old)
+    before = fingerprints(TGT)
+    # 1. the sandboxes run a digest the tool does not know (as if WOOW had upgraded first)
+    nc.SEED_IMAGES[nc.NEWAPI_VERSION] = "sha256:" + "0" * 64
+    try:
+        rc, text = run("--auth", "password", "daily", "--apply")
+    finally:
+        restore()
+    good = rc == 2 and "not an image whose rules and built-in prices this tool knows" in text and \
+        "daily sync failed" in text and fingerprints(TGT) == before
+    ok &= good
+    print(f"{'PASS' if good else 'FAIL'} unknown image: daily --apply exits {rc}, a 'daily sync failed' alert, "
+          "nothing written")
+    # 2. the same digest supported as a newer version with another table: the plan prices WOOW with it,
+    #    and the write is refused because the target's /api/status still says rc.44
+    newer = "v1.0.0-rc.45-sandbox"
+    nc.SEED_IMAGES.clear()
+    nc.SEED_IMAGES[newer] = saved[0][nc.NEWAPI_VERSION]
+    nc.TOOL_PRICE_SEEDS[newer] = dict(nc.RC44_TOOL_PRICE_SEED, web_search=8.0)
+    nc.VIOLATION_FEE_DEFAULTS[newer] = saved[2][nc.NEWAPI_VERSION]
+    try:
+        rc1, plan = run("plan")
+        rc2, text = run("--auth", "password", "apply")
+    finally:
+        restore()
+    good = rc1 == 0 and "AUTO  tool_price_setting.prices[web_search]: tool price (web_search, per 1,000 calls) " \
+        "decrease" in plan and rc2 == 2 and f"/api/status says New API '{nc.NEWAPI_VERSION}'" in text and \
+        fingerprints(TGT) == before
+    ok &= good
+    print(f"{'PASS' if good else 'FAIL'} supported newer version by digest: plan writes web_search at the new "
+          f"table / 30; apply exits {rc2} without writing (the API still says {nc.NEWAPI_VERSION})")
+    rc, text = run("verify", "--strict")
+    print(f"{'PASS' if rc == 0 else 'FAIL'} verify --strict with the real tables: rc {rc}")
+    ok &= rc == 0
+    print("versions:", "ALL PASS" if ok else "FAILED")
 
 
 def as_sync_identity():

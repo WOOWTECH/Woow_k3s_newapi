@@ -5,7 +5,9 @@
 #
 # What the daily job runs (scripts/apporo_sync.py daily --live-images [--apply]):
 #   new-api         exec -i newapi-postgres-0 -c postgres -- psql   whitelisted read-only SELECTs
-#                   get deploy,statefulset,cronjob -o json          live image comparison
+#                   get deploy,statefulset,cronjob -o json          the New API version it runs (every run:
+#                                                                   the image digest, not setups.version)
+#                                                                   and the live image comparison
 #   new-api-apporo  exec -i newapi-postgres-0 -c postgres -- psql   whitelisted read-only SELECTs
 #                   port-forward svc/newapi                         admin API writes (PAT)
 #                   get secret newapi-upstream-keys, newapi-sync-pat

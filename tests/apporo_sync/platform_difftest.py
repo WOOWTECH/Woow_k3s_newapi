@@ -1,7 +1,8 @@
 """Differential test: the built-in pricing gate vs the platform's own llm_pricing.py.
 
-  python3 tests/apporo_sync/platform_difftest.py <llm_pricing.py> <export --out snapshot of WOOW>
-Random catalogue mutations (pilot and GA profiles); every verdict must agree.
+  python3 tests/apporo_sync/platform_difftest.py <llm_pricing.py> <export --out snapshot of WOOW> [<version>]
+Random catalogue mutations (pilot and GA profiles); every verdict must agree. <version>: the New API
+version WOOW ran, for an export taken before the tool recorded it (as --source-version).
 """
 import copy
 import json
@@ -13,12 +14,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import apporo_sync as aps  # noqa: E402
-import newapi_content as nc  # noqa: E402
+import apporo_newapi_content as nc  # noqa: E402
 mod = aps.load_platform_module(sys.argv[1])
 prof = nc.load_profile(os.path.join(REPO, "deploy", "apporo-sync", "profile.json"))
-with open(sys.argv[2]) as f:
-    snap = json.load(f)
-snap["channels"] = {int(k): v for k, v in snap["channels"].items()}
+snap = aps.load_snapshot(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
 desired, _ = nc.transform(snap, prof)
 base = {"options": desired["options"], "channels": desired["channels"]}
 pilot = prof["platform"]["paid_pilot_models"]

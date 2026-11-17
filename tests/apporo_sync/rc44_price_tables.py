@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Check the tool's rc.44 price tables against a New API source checkout (manual, not CI).
+"""Check the tool's built-in price tables against a New API source checkout (manual, not CI).
 
   git clone --depth 1 --branch v1.0.0-rc.44 https://github.com/QuantumNous/new-api /path/rc44
-  python3 tests/apporo_sync/rc44_price_tables.py /path/rc44
+  python3 tests/apporo_sync/rc44_price_tables.py /path/rc44 [v1.0.0-rc.44]
 
 Reads (as text; nothing is built or run) setting/operation_setting/tools.go
 (seedHardcodedToolPrices and its constants, GetGeminiInputAudioPricePerMillionTokens)
-and setting/model_setting/grok.go (defaultGrokSettings), and compares them with
-newapi_content.RC44_TOOL_PRICE_SEED, GEMINI_AUDIO_PREFIXES and RC44_VIOLATION_FEE.
+and setting/model_setting/grok.go (defaultGrokSettings), and compares them with the
+tables the tool holds for that version (default v1.0.0-rc.44):
+apporo_newapi_content.TOOL_PRICE_SEEDS, VIOLATION_FEE_DEFAULTS and GEMINI_AUDIO_PREFIXES.
+For a version the tool does not support yet it prints what it read: add that to the
+tables (and the image digest to SEED_IMAGES) once the other rc.44 rules are re-checked.
 Exit 0 when they match. scripts/tests/test_apporo_sync.py runs the same check
-when NEWAPI_RC44_SRC points at such a checkout.
+when NEWAPI_RC44_SRC points at a v1.0.0-rc.44 checkout.
 """
 import os
 import re
@@ -17,7 +20,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "scripts"))
-import newapi_content as nc  # noqa: E402
+import apporo_newapi_content as nc  # noqa: E402
 
 
 def _body(text, signature):
@@ -53,31 +56,41 @@ def violation_fee(grok_go):
     return enabled, amount
 
 
-def check(src):
+def check(src, version=nc.NEWAPI_VERSION):
     with open(os.path.join(src, "setting", "operation_setting", "tools.go")) as f:
         tools_go = f.read()
     with open(os.path.join(src, "setting", "model_setting", "grok.go")) as f:
         grok_go = f.read()
     problems = []
     seed = tool_seed(tools_go)
-    if seed != nc.RC44_TOOL_PRICE_SEED:
-        problems.append(f"tool price seed differs: source-only {sorted(set(seed.items()) - set(nc.RC44_TOOL_PRICE_SEED.items()))}"
-                        f", tool-only {sorted(set(nc.RC44_TOOL_PRICE_SEED.items()) - set(seed.items()))}")
+    known = nc.TOOL_PRICE_SEEDS.get(version)
+    if known is None:
+        problems.append(f"the tool has no tool price table for {version}: add the one above to TOOL_PRICE_SEEDS")
+    elif seed != known:
+        problems.append(f"tool price seed differs: source-only {sorted(set(seed.items()) - set(known.items()))}"
+                        f", tool-only {sorted(set(known.items()) - set(seed.items()))}")
     prefixes = audio_prefixes(tools_go)
     covered = all(any(p.startswith(q) for q in nc.GEMINI_AUDIO_PREFIXES) for p in prefixes)
     if not prefixes or not covered:
         problems.append(f"Gemini audio prefixes {prefixes} not covered by {nc.GEMINI_AUDIO_PREFIXES}")
     enabled, amount = violation_fee(grok_go)
-    if (enabled, amount) != (nc.PRICE_SWITCHES[nc.VIOLATION_SWITCH_KEY], nc.RC44_VIOLATION_FEE):
-        problems.append(f"violation fee default ({enabled}, {amount}) differs from the tool's")
+    fee = nc.VIOLATION_FEE_DEFAULTS.get(version)
+    if fee is None:
+        problems.append(f"the tool has no violation fee default for {version}: add ({enabled}, {amount}) to "
+                        "VIOLATION_FEE_DEFAULTS")
+    elif (enabled, amount) != tuple(fee):
+        problems.append(f"violation fee default ({enabled}, {amount}) differs from the tool's {tuple(fee)}")
+    if version not in nc.SEED_IMAGES:
+        problems.append(f"SEED_IMAGES has no image digest for {version} (chart/values.yaml newapi.image.digest)")
     return seed, prefixes, (enabled, amount), problems
 
 
 def main(argv):
-    if len(argv) != 2:
+    if len(argv) not in (2, 3):
         print(__doc__)
         return 2
-    seed, prefixes, fee, problems = check(argv[1])
+    seed, prefixes, fee, problems = check(argv[1], *argv[2:])
+    print(f"tools.go seed as Python: {seed!r}")
     print(f"tools.go seed: {len(seed)} keys, sha256(go_json) {nc.sha256_text(nc.go_json(seed))}")
     print(f"Gemini audio prefixes: {prefixes}")
     print(f"violation fee default: enabled {fee[0]}, US$ {fee[1]}")
