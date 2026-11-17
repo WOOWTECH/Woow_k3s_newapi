@@ -39,7 +39,9 @@
   "free_groups": ["free"],
   "key_secret": {"name": "newapi-upstream-keys", "slots": {"api": "api", "paid": "paid"}},
   "auth": {"pat_secret": "newapi-sync-pat", "password_secret": "newapi-root-credentials"},
+  "_comment_notice": "price_increase_notice_days: the AI Models Terms promise at least 7 days (the tool refuses less). served_history_days: a model offered on the target within this many days keeps price-increase protection while it is taken off, so a re-listing at a higher price still needs a notice.",
   "price_increase_notice_days": 7,
+  "served_history_days": 30,
   "points_per_usd": 32,
   "_comment_platform": "The Apporo platform's pricing check (woow_paas_platform services/llm_pricing.py): a change that would make it fail is alert-only.",
   "platform": {

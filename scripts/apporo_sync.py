@@ -6,7 +6,9 @@ the same content as WOOW production (namespace new-api), with these
 differences (deploy/apporo-sync/profile.json, docs/APPORO-SYNC.md):
 
   - ModelRatio and ModelPrice divided by 30 (float64, stored exactly as rc.44
-    stores them); every other price map is copied unchanged;
+    stores them); the other ratio maps are copied unchanged. Billing
+    expressions (billing_setting.*) are real US$ prices that the 30:1 rule
+    cannot reach: replay refuses them and the daily sync only alerts;
   - channel 2 (WOOW's internal ChatGPT subscription test route) is not copied;
     channels 1, 3, 4 keep their ids; their keys are Apporo's own LiteLLM keys
     from the Secret new-api-apporo/newapi-upstream-keys (never printed);
@@ -15,8 +17,8 @@ differences (deploy/apporo-sync/profile.json, docs/APPORO-SYNC.md):
     LegacyAccessTokenRetireAt) are never copied.
 
 Reads are read-only SQL through `kubectl exec ... psql` (scripts/newapi_content.py:
-explicit column lists, no channel key, no user/token/log table). Writes go only
-to the target, through the New API admin API over a `kubectl port-forward`,
+whitelisted statement shape, no channel key, no user/token/log table). Writes go
+only to the target, through the New API admin API over a `kubectl port-forward`,
 as root: a PAT from the Secret newapi-sync-pat (key token), or before root has
 2FA the password in newapi-root-credentials.
 
@@ -27,20 +29,34 @@ Commands:
   replay   --yes-bootstrap                       fresh target after /api/setup: copy everything
   verify   [--strict] [--json]                   read-only SQL fingerprints of the target
   daily    [--apply]                             images + apply + alerts (the timer runs this)
-  notice-sent NOTICE_ID [--at ISO-8601]          the owner sent a price-increase notice
+  notice-sent NOTICE_ID --effective YYYY-MM-DD [--at ISO-8601]
+                                                 the owner sent a price-increase notice
   holds                                          list holds and notices
   check-images [--live]                          deploy/woow-k3s.yaml vs deploy/apporo-k3s.yaml
   mint-sync-pat                                  bootstrap only: root PAT into newapi-sync-pat
+  failure-alert [--reason TEXT]                  record a failed unit run as an alert (systemd OnFailure)
 
-Daily classification (docs/APPORO-SYNC.md):
+Daily classification (docs/APPORO-SYNC.md). A model is "offered" when any
+channel of the target routes it, enabled or not (rc.44 disables and re-enables
+channels by itself); the state directory remembers the models offered in the
+last served_history_days days.
   auto   new models, price decreases, non-price option changes, model-list
          changes of the paid channels, removed models (plus an alert),
-         Apporo-owned settings, channel creation and key rotation;
-  hold   anything that raises the effective price of a model the target
-         serves: drafted English notice; applied only when the owner has
-         marked the notice sent (notice-sent) and 7 days have passed;
-  alert  changes that need a platform or values change, or would make the
-         platform's pricing validation fail: never applied automatically.
+         Apporo-owned settings, channel creation and key rotation, any price
+         change of a model not offered now, after this run or recently, and
+         the first price of a model offered for the first time;
+  hold   anything that raises the effective price of a model offered now or
+         recently that is still offered after this run: drafted English
+         notice; applied only from the effective date the owner records with
+         notice-sent (at least 7 days after sending);
+  alert  changes that need a platform or values change, billing expressions,
+         changes that would make the platform's pricing validation fail, and
+         (severity info, "kept") increases or price removals of a model that
+         is taken off now or was recently: kept until the window ends, so a
+         re-listing cannot skip the notice.
+
+Writes run in an order that never leaves an offered model without its price:
+options and new or changed prices, then channels, then removed price entries.
 
 Exit status: 0 ok, 1 a write or check failed, 2 usage, target or connection error.
 """
@@ -51,13 +67,16 @@ import datetime
 import decimal
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -76,6 +95,10 @@ PAT_SCOPES = ("channel:sensitive_write", "channel:write", "option:write")
 PAT_DAYS = 180
 PAT_WARN_DAYS = 14
 TPE = datetime.timezone(datetime.timedelta(hours=8))
+# "Anywhere on Earth": a notice's effective date has begun for every customer
+# once it is 00:00 at UTC-12. Increases apply from then, never earlier.
+AOE = datetime.timezone(datetime.timedelta(hours=-12))
+BACKDATE_LIMIT = datetime.timedelta(hours=24)
 
 # Options a change of which needs the Apporo platform (or its values) to change
 # in step: docs/OPERATIONS.md 〈PaaS 依賴的設定不變量〉, the /api/status
@@ -99,7 +122,8 @@ CUSTOMER_TEXT_RE = re.compile(r"^(SystemName|Logo|Footer|About|HomePageContent|N
 NEEDS_CONFIG_RE = re.compile(r"(OAuth|^oidc\.|^discord\.|^telegram\.|WeChat|Telegram|LinuxDO|GitHub|SMTP|Turnstile|"
                              r"EmailVerification|EmailDomain|EmailAlias|PasswordRegister|^passkey\.|Stripe|Epay|Waffo|"
                              r"Creem|^Pay|TopUp|Worker|CustomCallbackAddress|TaskPublicAddress|^payment_setting\.)")
-# Prices whose direction cannot be read from the value: a person decides.
+# Prices whose direction cannot be read from the value (or that are absolute
+# vendor prices the 30:1 rule never reaches): a person decides.
 OPAQUE_PRICE_RE = re.compile(r"^(tool_price_setting\..*|task_pricing_setting\..*|Price|USDExchangeRate|PreConsumedQuota|"
                              r"QuotaRemindThreshold)$")
 # Security-relevant switches (docs/OPERATIONS.md: JS task plugins can read channel keys).
@@ -117,10 +141,15 @@ CHANNEL_POINTER_FIELDS = frozenset(("openai_organization", "test_model", "base_u
 PSQL_FACTORY = None        # (side, profile) -> object with query_json(sql)
 SECRET_READER = None       # (namespace, name, key) -> str
 ANNOTATION_READER = None   # (namespace, name, annotation) -> str | None
+SECRET_WRITER = None       # (namespace, name, manifest) -> (ok, message)
 
 
 class SyncError(Exception):
     """Usage, target, connection or safety error (exit 2)."""
+
+
+class Terminated(SyncError):
+    """SIGTERM (systemd stop or TimeoutStartSec): finally blocks and the failure alert still run."""
 
 
 def now_utc():
@@ -139,6 +168,35 @@ def parse_iso(text):
     if dt.tzinfo is None:
         raise SyncError(f"{text!r}: give a time zone, e.g. 2026-11-18T09:00:00+08:00")
     return dt.astimezone(datetime.timezone.utc)
+
+
+def parse_date(text):
+    try:
+        return datetime.date.fromisoformat(text)
+    except (TypeError, ValueError):
+        raise SyncError(f"not a date (YYYY-MM-DD): {text!r}") from None
+
+
+def effective_start(day):
+    """The moment a notice's effective date has begun everywhere (00:00 at UTC-12)."""
+    return datetime.datetime.combine(day, datetime.time(0), AOE).astimezone(datetime.timezone.utc)
+
+
+def earliest_effective(sent, days):
+    """The first effective date allowed for a notice sent at `sent` (at least `days` days later, everywhere)."""
+    target = sent + datetime.timedelta(days=days)
+    day = target.astimezone(AOE).date()
+    if effective_start(day) < target:
+        day += datetime.timedelta(days=1)
+    return day
+
+
+def notice_days(profile):
+    return max(nc.MIN_NOTICE_DAYS, profile.get("price_increase_notice_days", nc.MIN_NOTICE_DAYS))
+
+
+def history_days(profile):
+    return profile.get("served_history_days", nc.DEFAULT_HISTORY_DAYS)
 
 
 class Secret:
@@ -189,11 +247,33 @@ def read_secret(kube, namespace, name, key, run=subprocess.run):
 
 
 def read_annotation(kube, namespace, name, annotation, run=subprocess.run):
+    """The annotation's value ('' when unset), or None when the Secret could not be read."""
     if ANNOTATION_READER is not None:
         return ANNOTATION_READER(namespace, name, annotation)
     path = "{.metadata.annotations." + annotation.replace(".", "\\.") + "}"
-    r = run(kube + ["-n", namespace, "get", "secret", name, "-o", "jsonpath=" + path], capture_output=True, timeout=60)
-    return (r.stdout or b"").decode("utf-8").strip() if r.returncode == 0 else None
+    try:
+        r = run(kube + ["-n", namespace, "get", "secret", name, "-o", "jsonpath=" + path], capture_output=True,
+                timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (r.stdout or b"").decode("utf-8", "replace").strip() if r.returncode == 0 else None
+
+
+def write_secret(kube, namespace, name, manifest):
+    """Create or replace a Secret from a manifest on stdin: (ok, message). Never prints the manifest."""
+    if SECRET_WRITER is not None:
+        return SECRET_WRITER(namespace, name, manifest)
+    try:
+        exists = subprocess.run(kube + ["-n", namespace, "get", "secret", name], capture_output=True,
+                                timeout=60).returncode == 0
+        verb = "replace" if exists else "create"
+        r = subprocess.run(kube + [verb, "-f", "-"], input=json.dumps(manifest).encode(), capture_output=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"kubectl did not finish ({e.__class__.__name__})"
+    if r.returncode != 0:
+        return False, f"kubectl {verb} exit {r.returncode}"
+    return True, verb + "d"
 
 
 def free_port():
@@ -226,7 +306,7 @@ class PortForward:
                 with na._OPENER.open(req, timeout=5) as resp:
                     if json.loads(resp.read() or b"{}").get("success") is not None:
                         return base
-            except (OSError, ValueError, urllib.error.URLError, na.Fatal):
+            except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException, na.Fatal):
                 pass
             time.sleep(0.5)
         self.__exit__(None, None, None)
@@ -259,6 +339,11 @@ def read_source(a, profile):
         snap.pop("_meta", None)
         snap["channels"] = {int(k): v for k, v in snap["channels"].items()}
         snap["unsafe_channels"] = {int(k): v for k, v in (snap.get("unsafe_channels") or {}).items()}
+        for cid, ch in snap["channels"].items():   # snapshots older than the current checks
+            bad = nc.channel_unsafe_fields(ch)
+            if bad and cid not in snap["unsafe_channels"]:
+                snap["unsafe_channels"][cid] = bad
+                snap["channels"][cid] = {f: ("[redacted]" if f in bad else v) for f, v in ch.items()}
         return snap
     return nc.read_snapshot(psql_for(a, profile, "source"), profile)
 
@@ -324,6 +409,19 @@ def guard_target(client, profile, tgt, bootstrap):
     return sa
 
 
+def refuse_woow_database(tgt, profile):
+    """Defence in depth before any write: the target database must not carry a WOOW ServerAddress."""
+    sa = (tgt["options"].get("ServerAddress") or "").rstrip("/")
+    if sa in WOOW_ORIGINS or profile["target"]["server_address"].rstrip("/") in WOOW_ORIGINS:
+        raise SyncError(f"refusing to write to a WOOW site ({sa or profile['target']['server_address']})")
+
+
+def target_is_fresh(tgt, desired):
+    """A target nobody has synced yet: no ServerAddress of its own and none of the managed channels."""
+    sa = (tgt["options"].get("ServerAddress") or "").rstrip("/")
+    return sa in FRESH_ORIGINS and not (set(desired["channels"]) & set(tgt["channels"]))
+
+
 def api(client, method, path, body=None, headers=None):
     """One admin API call; True on success. Upstream messages are redacted, keys never echoed."""
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -339,10 +437,13 @@ def api(client, method, path, body=None, headers=None):
     except urllib.error.HTTPError as e:
         try:
             answer = json.loads(e.read()[:2000] or b"{}")
-        except ValueError:
+        except (ValueError, OSError, http.client.HTTPException):
+            answer = {"message": f"HTTP {e.code}"}
+        if not isinstance(answer, dict):
             answer = {"message": f"HTTP {e.code}"}
         answer.setdefault("success", False)
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        # IncompleteRead, BadStatusLine, RemoteDisconnected: a port-forward that broke mid-answer.
         return False, f"{method} {path}: {e.__class__.__name__} (outcome unknown)", {}
     ok = isinstance(answer, dict) and answer.get("success") is True
     msg = "" if ok else nc.redact(str(answer.get("message") or answer.get("code") or "rejected"))[:200]
@@ -434,7 +535,8 @@ def build_items(src, tgt, desired, notes, profile, keys=None, bootstrap=False):
             items.append(item("chan-rekey", channel=cid, slot=slot))
         if t.get("status") != 1:
             items.append(item("alert", "alert", f"status {t.get('status')}: disabled on the target "
-                              "(auto-disabled by upstream errors, or by hand); the sync does not change status",
+                              "(auto-disabled by upstream errors, or by hand); the sync does not change status. "
+                              "Its models still count as offered (price increases stay held)",
                               subject_text=f"channel-disabled: channel {cid}"))
     for cid in sorted(set(tgt["channels"]) - managed):
         items.append(item("alert", "alert", "a channel the profile does not manage; left alone",
@@ -486,19 +588,69 @@ def model_items(cid, old_text, new_text, group):
 
 # --------------------------------------------------------- classification
 
-def served_models(tgt):
+def routed_models(state):
+    """{model: groups} of every ability row, enabled or not: a channel disabled by
+    upstream errors (or by hand) still offers its models, and rc.44 re-enables it."""
     out = {}
-    for a in tgt["abilities"]:
-        if a["enabled"]:
-            out.setdefault(a["model"], set()).add(a["group"])
+    for a in state["abilities"]:
+        out.setdefault(a["model"], set()).add(a["group"])
     return out
+
+
+def merge_offered(*maps):
+    out = {}
+    for m in maps:
+        for model, groups in (m or {}).items():
+            out.setdefault(model, set()).update(groups)
+    return out
+
+
+def offered_history(state, now, days):
+    """{model: groups} the target offered in the last `days` days (the state directory's record)."""
+    if state is None:
+        return {}
+    cutoff = now - datetime.timedelta(days=days)
+    out = {}
+    for model, rec in (state.data.get("served") or {}).items():
+        try:
+            if parse_iso(rec["last_seen"]) >= cutoff:
+                out[model] = set(rec.get("groups") or ())
+        except (KeyError, TypeError, AttributeError, SyncError):
+            continue
+    return out
+
+
+def record_offered(state, snap, now, days):
+    """Remember the models `snap` offers (any channel status); forget those not seen for `days` days."""
+    served = state.data.setdefault("served", {})
+    for model, groups in routed_models(snap).items():
+        rec = served.get(model) if isinstance(served.get(model), dict) else {"first_seen": iso(now), "groups": []}
+        rec["groups"] = sorted(set(rec.get("groups") or ()) | groups)
+        rec["last_seen"] = iso(now)
+        served[model] = rec
+    cutoff = now - datetime.timedelta(days=days)
+    for model in list(served):
+        try:
+            keep = parse_iso(served[model]["last_seen"]) >= cutoff
+        except (KeyError, TypeError, AttributeError, SyncError):
+            keep = False
+        if not keep:
+            del served[model]
+
+
+def history_alerts(state, tgt, desired):
+    if (state.data.get("served") or state.data.get("runs")) or target_is_fresh(tgt, desired):
+        return []
+    return [{"severity": "info", "title": "no record of offered models in this state directory",
+             "details": [f"{state.dir}: models taken off the target before today are not remembered, so re-listing "
+                         "one of them at a higher price would not be held; the record starts with this run"]}]
 
 
 def _num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
-def classify(items, tgt, profile, bootstrap=False, desired=None):
+def classify(items, tgt, profile, bootstrap=False, desired=None, history=None):
     """Set class auto/hold/alert and reason on every item (bootstrap: everything auto)."""
     for it in items:
         if it["kind"] == "alert":
@@ -511,11 +663,14 @@ def classify(items, tgt, profile, bootstrap=False, desired=None):
         if k == "opt":
             classify_option(it, profile)
         elif k == "map":
-            continue  # second pass: needs what the channel changes leave served
+            continue  # second pass: needs what the channel changes leave offered
         elif k == "chan-create":
             it["class"], it["reason"] = "auto", "mapped channel missing on the target"
         elif k == "chan-field":
-            if it["field"] in _owned_fields(it["channel"], profile):
+            if it["new"] is None or (it["new"] == "" and it["field"] not in CHANNEL_POINTER_FIELDS):
+                it["class"], it["reason"] = "alert", "rc.44's PUT /api/channel/ cannot clear this field (null, or an " \
+                                                     "empty plain string): change it by hand in the admin UI"
+            elif it["field"] in _owned_fields(it["channel"], profile):
                 it["class"], it["reason"] = "auto", "Apporo's own channel setting (profile)"
             elif it["field"] in CHANNEL_AUTO_FIELDS:
                 it["class"], it["reason"] = "auto", "channel metadata"
@@ -526,26 +681,35 @@ def classify(items, tgt, profile, bootstrap=False, desired=None):
                                                       "values may need a change (never automatic)"
         elif k in ("chan-model-add", "chan-model-remove"):
             groups = set((it.get("group") or "").split(","))
+            left = ((desired or {}).get("channels", {}).get(it["channel"]) or {}).get("models")
             if groups & set(profile.get("free_groups", ("free",))):
                 it["class"], it["reason"] = "alert", "free-trial channel: proxy.freeModels and the platform's " \
                                                      "FREE_MODELS must change with it"
             elif k == "chan-model-add":
                 it["class"], it["reason"] = "auto", "new model route"
+            elif not left:
+                it["class"], it["reason"] = "alert", "the source channel has no models left: rc.44 cannot store an " \
+                                                     "empty model list; disable or delete the channel by hand"
             else:
                 it["class"], it["reason"], it["alert"] = "auto", "model removed at the source", True
         elif k == "chan-rekey":
             it["class"], it["reason"] = "auto", "channel key differs from the Apporo key Secret"
     if bootstrap:
         return items
-    # A price matters to customers only for a model served before and after this run.
-    before = served_models(tgt)
+    # Who can be charged a price: models routed now (any channel status), routed
+    # after this run's route changes, or offered in the last served_history_days days.
+    before = routed_models(tgt)
     routes = [it for it in items if it["class"] == "auto" and it["kind"] in ("chan-create", "chan-model-add",
                                                                              "chan-model-remove", "chan-field")]
-    after = served_models(simulate(tgt, routes, profile, desired))
-    in_use = {m: before[m] & after[m] for m in before if m in after}
+    after = routed_models(simulate(tgt, routes, profile, desired))
+    hist = history or {}
+    ctx = {"before": before, "after": after, "hist": hist, "days": history_days(profile)}
+    for name in ("before", "after", "hist"):
+        ctx["groups_" + name] = {g for gs in ctx[name].values() for g in gs}
     for it in items:
         if it["kind"] == "map":
-            classify_map(it, in_use, {g for gs in in_use.values() for g in gs})
+            classify_map(it, ctx)
+    expression_gate(items, tgt, profile, desired)
     platform_gate(items, tgt, profile, desired)
     return items
 
@@ -568,7 +732,11 @@ def classify_option(it, profile):
     elif cat == "config":
         it["class"], it["reason"] = "alert", "needs Apporo's own configuration (accounts, secrets or payments)"
     elif cat == "opaque-price":
-        it["class"], it["reason"] = "alert", "a price whose direction cannot be read: decide by hand"
+        it["class"], it["reason"] = "alert", "a price whose direction cannot be read, or an absolute vendor price " \
+                                             "the 30:1 rule never reaches: decide by hand"
+    elif key in nc.BILLING_MAPS:
+        it["class"], it["reason"] = "alert", "billing expressions are real US$ prices (never divided by 30): " \
+                                             "decide by hand"
     elif key in nc.PRICING_KEYS or key in nc.GROUP_PRICE_MAPS:
         it["class"], it["reason"] = "alert", "price option that cannot be compared entry by entry: decide by hand"
     else:
@@ -590,9 +758,26 @@ def _owned_fields(cid, profile):
     return set()
 
 
-def classify_map(it, served, served_groups):
+def _direction(key, o, n):
+    """'decrease', 'same', 'increase' or 'unknown' for one price-map entry."""
+    if key == "ModelPrice" and (o is None) != (n is None):
+        return "unknown"        # per-call <-> per-token billing
+    if key == "CompletionRatio" and (o is None) != (n is None):
+        return "unknown"        # rc.44's built-in completion rule
+    old_v = nc.ABSENT_DEFAULTS.get(key) if o is None else o
+    new_v = nc.ABSENT_DEFAULTS.get(key) if n is None else n
+    if not (_num(old_v) and _num(new_v)):
+        return "unknown"
+    return "increase" if new_v > old_v else "decrease" if new_v < old_v else "same"
+
+
+def classify_map(it, ctx):
     key, entry, o, n = it["key"], it["entry"], it["old"], it["new"]
-    if key in ("GroupRatio",) and entry in PLATFORM_COUPLED_GROUPS:
+    if key in nc.BILLING_MAPS:
+        it["class"], it["reason"] = "alert", "billing expressions are real US$ prices (rc.44: no ratio conversion), " \
+                                             "so the 30:1 rule cannot be applied to them: decide by hand"
+        return
+    if key == "GroupRatio" and entry in PLATFORM_COUPLED_GROUPS:
         it["class"], it["reason"] = "alert", "GroupRatio default/free: the platform's pricing profile pins them"
         return
     if key == "GroupGroupRatio":
@@ -601,42 +786,81 @@ def classify_map(it, served, served_groups):
     if key == "TopupGroupRatio":
         it["class"], it["reason"] = "auto", "top-up ratio (New API payments are off)"
         return
-    if key == "GroupRatio":
-        in_use = entry in served_groups
-    elif key == "billing_setting.plugin_billing_expr":
-        in_use = any(m in entry for m in served)       # entries are <plugin><separator><model>
-    else:
-        in_use = entry in served
-    if not in_use:
-        it["class"], it["reason"] = "auto", "not served on the target before and after this run: " \
-                                            "no customer price changes"
+    pre = "groups_" if key == "GroupRatio" else ""
+    now_, after, hist = (entry in ctx[pre + "before"], entry in ctx[pre + "after"], entry in ctx[pre + "hist"])
+    days = ctx["days"]
+    if not (now_ or after or hist):
+        it["class"], it["reason"] = "auto", f"not offered on the target (now, after this run or in the last {days} " \
+                                            "days): no customer price changes"
         return
-    if key in nc.BILLING_MAPS:
-        it["class"], it["reason"] = "hold", "billing expression or mode of a served model: direction unknown"
-        return
-    if key in ("ModelRatio", "ModelPrice") and n is not None and _num(n) and n == 0 and (o is None or o != 0):
+    if after and key in ("ModelRatio", "ModelPrice") and _num(n) and n == 0 and not (_num(o) and o == 0):
         it["class"], it["reason"] = "alert", "the price drops to 0: free for every key at any balance; confirm by hand"
         return
-    if key == "ModelRatio" and n is None:
-        it["class"], it["reason"] = "alert", "the served model loses its price: rc.44 would refuse it"
+    if after and key == "ModelRatio" and n is None:
+        it["class"], it["reason"] = "alert", "an offered model loses its price (ModelRatio): rc.44 refuses it (or " \
+                                             "bills a built-in US$ expression): decide by hand"
         return
-    if key == "ModelRatio" and o is None:
-        it["class"], it["reason"] = "auto", "a served model gets its first ratio (it was unpriced)"
+    direction = "first" if key == "ModelRatio" and o is None else _direction(key, o, n)
+    if direction in ("decrease", "same"):
+        it["class"], it["reason"] = "auto", "price decrease" if direction == "decrease" else "same effective value"
         return
-    if key == "ModelPrice" and (o is None) != (n is None):
-        it["class"], it["reason"] = "hold", "switches between per-call and per-token billing: direction unknown"
+    if direction == "first":
+        it["class"], it["reason"] = "auto", "a model gets its first ratio (rc.44 refused it before)"
         return
-    if key == "CompletionRatio" and (o is None) != (n is None):
-        it["class"], it["reason"] = "hold", "completion ratio falls back to rc.44's built-in rule: direction unknown"
+    if not after:
+        # Taken off now, or recently: keep the old value so that a re-listing within
+        # the window compares against it (and needs a notice to go up).
+        it["class"], it["severity"], it["deferred"] = "alert", "info", True
+        it["reason"] = f"kept: the model is not offered after this run but was offered in the last {days} days; a " \
+                       "re-listing must not skip the price notice (applied once the window has passed)"
         return
-    old_v = nc.ABSENT_DEFAULTS.get(key) if o is None else o
-    new_v = nc.ABSENT_DEFAULTS.get(key) if n is None else n
-    if not (_num(old_v) and _num(new_v)):
-        it["class"], it["reason"] = "hold", "not comparable: direction unknown"
-    elif new_v > old_v:
-        it["class"], it["reason"] = "hold", "price increase"
-    else:
-        it["class"], it["reason"] = "auto", "price decrease" if new_v < old_v else "same effective value"
+    if not (now_ or hist):
+        it["class"], it["reason"] = "auto", "first listing on the target: no customer paid the old price"
+        return
+    it["class"] = "hold"
+    it["reason"] = "price increase" if direction == "increase" else {
+        "ModelPrice": "switches between per-call and per-token billing: direction unknown",
+        "CompletionRatio": "completion ratio falls back to rc.44's built-in rule: direction unknown",
+    }.get(key, "not comparable: direction unknown")
+
+
+def expression_gate(items, tgt, profile, desired):
+    """A model rc.44 bills with a billing expression (real US$ per 1M tokens; never
+    divided by 30) must not be offered by the sync: alert, and do not route it."""
+    chosen = [it for it in items if it["class"] == "auto"]
+    final = simulate(tgt, chosen, profile, desired)
+    new_routes = {}
+    for it in chosen:
+        if it["kind"] == "chan-model-add":
+            new_routes.setdefault(it["model"], []).append(it)
+        elif it["kind"] == "chan-create" and desired:
+            for m in _models(desired["channels"][it["channel"]].get("models")):
+                new_routes.setdefault(m, []).append(it)
+    for m in sorted(routed_models(final), key=str.encode):
+        here = nc.billed_by_expression(final["options"], m)
+        # a new route also follows the source's billing: WOOW bills it by expression, Apporo cannot price it
+        there = desired is not None and nc.billed_by_expression(desired["options"], m)
+        reason = (f"{m} is billed by a billing expression (real US$ prices: an rc.44 built-in, or billing_mode "
+                  "tiered_expr); the 30:1 rule cannot be applied: give it a ModelRatio/ModelPrice or route it by hand")
+        if m in new_routes and (here or there):
+            for it in new_routes[m]:
+                it["class"], it["reason"] = "alert", reason
+        elif here:
+            items.append(item("alert", "alert", reason, subject_text=f"billing-expression: model {m}"))
+
+
+def bootstrap_blockers(desired):
+    """What replay must never copy: billing expressions and models billed by one (real US$ prices)."""
+    out = []
+    for key, n in nc.billing_entries(desired["options"]).items():
+        out.append(item("alert", "alert", f"{n} billing expression entr{'y' if n == 1 else 'ies'} (real US$ prices, "
+                        "never divided by 30): replay refuses to copy them", subject_text=f"billing-expression: {key}",
+                        blocker=True))
+    for m in sorted(routed_models({"abilities": nc.expected_abilities(desired["channels"])}), key=str.encode):
+        if nc.billed_by_expression(desired["options"], m):
+            out.append(item("alert", "alert", "billed by a billing expression (real US$ prices): replay refuses to "
+                            "route it", subject_text=f"billing-expression: model {m}", blocker=True))
+    return out
 
 
 # --------------------------------------------- the platform's pricing gate
@@ -650,8 +874,9 @@ def _dec(value):
     return d
 
 
-def pricing_payload(state, profile):
-    """What GET /api/pricing answers the platform's service account (group default), from DB state."""
+def pricing_payload(state, profile, include_disabled=False):
+    """What GET /api/pricing answers the platform's service account (group default), from DB state.
+    include_disabled: as if every channel were enabled (rc.44 re-enables channels by itself)."""
     opts = state["options"]
 
     def obj(k):
@@ -667,7 +892,7 @@ def pricing_payload(state, profile):
     mode, expr = obj("billing_setting.billing_mode"), obj("billing_setting.billing_expr")
     groups = {}
     for a in state["abilities"]:
-        if a["enabled"]:
+        if a["enabled"] or include_disabled:
             groups.setdefault(a["model"], []).append(a["group"])
     rows = []
     for model, gs in groups.items():
@@ -837,12 +1062,17 @@ def platform_verdict(payload, profile):
         return str(e)
 
 
+def gate_verdict(state, profile):
+    """The platform's verdict as if every channel were enabled (a disabled channel can come back any time)."""
+    return platform_verdict(pricing_payload(state, profile, include_disabled=True), profile)
+
+
 def platform_gate(items, tgt, profile, desired=None):
     """Turn an auto/hold item into an alert when it alone (or all autos together) would make
     the platform's pricing validation fail where it passes today."""
     if not profile.get("platform"):
         return
-    base = platform_verdict(pricing_payload(tgt, profile), profile)
+    base = gate_verdict(tgt, profile)
     if base is not None:
         items.append(item("alert", "alert", f"the platform's pricing validation already fails on the target ({base}); "
                           "changes are not held back by this check until it passes",
@@ -851,7 +1081,7 @@ def platform_gate(items, tgt, profile, desired=None):
     relevant = [it for it in items if it["class"] in ("auto", "hold") and it["kind"] in (
         "opt", "map", "chan-create", "chan-model-add", "chan-model-remove", "chan-field")]
     for it in relevant:
-        res = platform_verdict(pricing_payload(simulate(tgt, [it], profile, desired), profile), profile)
+        res = gate_verdict(simulate(tgt, [it], profile, desired), profile)
         if res is not None:
             it["class"], it["reason"] = "alert", f"would make the platform's pricing validation fail ({res})"
     combined_gate([it for it in relevant if it["class"] == "auto"], tgt, profile, desired)
@@ -861,9 +1091,9 @@ def combined_gate(chosen, tgt, profile, desired=None):
     """All chosen items together must keep the platform's validation passing."""
     if not profile.get("platform") or not chosen:
         return True
-    if platform_verdict(pricing_payload(tgt, profile), profile) is not None:
+    if gate_verdict(tgt, profile) is not None:
         return True
-    res = platform_verdict(pricing_payload(simulate(tgt, chosen, profile, desired), profile), profile)
+    res = gate_verdict(simulate(tgt, chosen, profile, desired), profile)
     if res is None:
         return True
     for it in chosen:
@@ -934,7 +1164,7 @@ _OPEN_STATES = []
 
 class State:
     """holds.json in the state directory (0700 dir, 0600 file), with a run lock.
-    read_only=True (plan): no lock, no directory created, never saved."""
+    read_only=True (plan, verify): no lock, no directory created, never saved."""
 
     def __init__(self, path, read_only=False):
         self.dir, self.read_only = path, read_only
@@ -948,12 +1178,15 @@ class State:
             except OSError:
                 raise SyncError(f"another apporo_sync run holds {path}/.lock") from None
         if os.path.exists(self.file):
-            with open(self.file) as f:
-                self.data = json.load(f)
-            if self.data.get("schema") != 1:
+            try:
+                with open(self.file) as f:
+                    self.data = json.load(f)
+            except ValueError:
+                raise SyncError(f"{self.file} is not JSON: restore it from the journal or a backup") from None
+            if not isinstance(self.data, dict) or self.data.get("schema") != 1:
                 raise SyncError(f"{self.file}: unknown schema")
         else:
-            self.data = {"schema": 1, "holds": {}, "notices": {}, "alerts": {}, "runs": []}
+            self.data = {"schema": 1, "holds": {}, "notices": {}, "alerts": {}, "runs": [], "served": {}}
 
     def close(self):
         lock = getattr(self, "lock", None)
@@ -980,28 +1213,35 @@ def hold_subject(it):
 
 
 def process_holds(items, state, now, days, persist):
-    """Match hold items with open holds; mark matured ones applicable; open new holds."""
+    """Match hold items with open holds; mark matured ones applicable; open new holds.
+    A kept (deferred) item keeps a matching hold alive but never opens or applies one."""
     open_holds = state.open_holds() if state else {}
     used, new = set(), []
     for it in items:
-        if it["class"] != "hold":
+        deferred = it["class"] == "alert" and it.get("deferred")
+        if it["class"] != "hold" and not deferred:
             continue
         match = next((h for h in open_holds.values() if h["subject"] == hold_subject(it)), None)
         if match and match["old"] == it["old"] and match["new"] == it["new"]:
             used.add(match["id"])
             it["hold_id"] = match["id"]
+            if deferred:
+                it["reason"] += f"; hold {match['id']} waits until the model is offered again"
+                continue
             due = match.get("eligible_at")
             if match["state"] == "notified" and due and parse_iso(due) <= now:
                 it["apply"] = True
-                it["reason"] += f"; notice sent {match['notice_sent_at']}, matured {due}"
+                it["reason"] += f"; notice sent {match['notice_sent_at']}, effective {due}"
             else:
                 it["reason"] += "; held: " + ("waiting for notice-sent" if match["state"] == "pending-notice"
-                                               else f"applies after {due}")
+                                               else f"applies from {due}")
             continue
         if match:
             used.add(match["id"])
             if persist:
                 match.update(state="superseded", closed_at=iso(now), close_reason="the desired value changed again")
+        if deferred:
+            continue
         day = now.astimezone(TPE).strftime("%Y%m%d")
         hid = f"H-{day}-" + nc.digest([hold_subject(it), it["old"], it["new"]])[:8]
         it["hold_id"] = hid
@@ -1011,8 +1251,8 @@ def process_holds(items, state, now, days, persist):
             state.data["holds"][hid] = {"id": hid, "subject": hold_subject(it), "old": it["old"], "new": it["new"],
                                         "reason": it["reason"], "detected_at": iso(now), "state": "pending-notice",
                                         "notice_id": None, "notice_sent_at": None, "eligible_at": None,
-                                        "applied_at": None, "closed_at": None, "close_reason": None,
-                                        "notice_days": days}
+                                        "effective_date": None, "applied_at": None, "closed_at": None,
+                                        "close_reason": None, "notice_days": days}
     if persist:
         for hid, h in open_holds.items():
             if hid not in used:
@@ -1058,33 +1298,48 @@ def model_prices(state, model, profile, group="default"):
     return out
 
 
-def draft_notice(nid, holds_items, tgt, profile, now, days):
-    """English customer notice for the held increases: old vs new US$ per 1M tokens."""
-    final = simulate(tgt, holds_items, profile)
-    served = served_models(tgt)
+def draft_notice(nid, holds_items, base, profile, now, days, offered):
+    """English customer notice for the held increases: US$ prices before and after, per model.
+    `base` is the target after this run's automatic writes; `offered` maps models to groups
+    (offered now, after this run or recently)."""
+    final = simulate(base, holds_items, profile)
     models = set()
     for it in holds_items:
         if it["kind"] == "map" and it["key"] == "GroupRatio":
-            models |= {m for m, gs in served.items() if it["entry"] in gs}
+            models |= {m for m, gs in offered.items() if it["entry"] in gs}
         elif it["kind"] == "map":
             models.add(it["entry"])
-    rows = []
+    rows, by_hand = [], []
     for m in sorted(models, key=str.encode):
-        if "default" not in served.get(m, set()):
+        if "default" not in offered.get(m, set()):
             continue
-        before, after = model_prices(tgt, m, profile), model_prices(final, m, profile)
+        if nc.billed_by_expression(base["options"], m) or nc.billed_by_expression(final["options"], m):
+            by_hand.append(m)
+            rows.append(f"| `{m}` | billing expression | (by hand) | (by hand) | |")
+            continue
+        before, after = model_prices(base, m, profile), model_prices(final, m, profile)
         if not before or not after:
+            by_hand.append(m)
+            rows.append(f"| `{m}` | (price not computable) | (by hand) | (by hand) | |")
             continue
         for comp in after:
             b, a = before.get(comp), after[comp]
             if b is None or a != b:
                 change = "" if not b else f"{(a - b) / b * 100:+.1f}%"
                 rows.append(f"| `{m}` | {comp} | {usd(b) if b is not None else 'n/a'} | {usd(a)} | {change} |")
-    earliest = (now + datetime.timedelta(days=days)).astimezone(TPE).strftime("%B %d, %Y")
+    if not rows:
+        subjects = ", ".join(it["subject"] for it in holds_items)
+        rows = [f"| (BY HAND: the held change(s) {subjects} do not map to a per-model price in the default "
+                "group; write this table yourself) | | | | |"]
+    earliest = earliest_effective(now, days)
     lines = [
         f"<!-- {nid}: DRAFT for the owner. Fill the placeholders, send it by email to every customer with an",
-        "     AI account, then run: apporo_sync.py notice-sent " + nid + " --at <send time>. The increase is",
-        f"     applied by the daily sync no earlier than {days} days after that time. -->",
+        "     AI account, then run:",
+        f"       apporo_sync.py notice-sent {nid} --effective <the EFFECTIVE_DATE you wrote, YYYY-MM-DD> --at <send time>",
+        f"     notice-sent refuses an effective date earlier than {days} days after sending. The daily sync applies",
+        "     the increase from the first run after the effective date has begun everywhere (00:00 UTC-12).",
+        *([f"     BY HAND: {', '.join(by_hand)} (billing expression or no computable price)."] if by_hand else []),
+        "-->",
         "",
         "Subject: Price change for Apporo AI Models, effective {EFFECTIVE_DATE}",
         "",
@@ -1097,7 +1352,7 @@ def draft_notice(nid, holds_items, tgt, profile, now, days):
         "",
         "| Model | Price | Current (US$) | New (US$) | Change |",
         "|---|---|---:|---:|---:|",
-        *(rows or ["| (no served model in the default group is affected) | | | | |"]),
+        *rows,
         "",
         "Usage before {EFFECTIVE_DATE} is charged at the current prices. AI credit is not price-protected: from "
         "{EFFECTIVE_DATE}, usage is charged at the new prices. If you do not accept this increase, you can contact "
@@ -1108,13 +1363,13 @@ def draft_notice(nid, holds_items, tgt, profile, now, days):
         "",
         "APPORO UNION INC.",
         "",
-        f"<!-- earliest {{EFFECTIVE_DATE}} if sent now: {earliest} (Asia/Taipei). Holds: "
-        + ", ".join(it["hold_id"] for it in holds_items) + " -->",
+        f"<!-- earliest {{EFFECTIVE_DATE}} if sent now: {earliest:%B} {earliest.day}, {earliest.year} "
+        f"({earliest.isoformat()}). Holds: " + ", ".join(it["hold_id"] for it in holds_items) + " -->",
     ]
     return "\n".join(lines) + "\n"
 
 
-def open_notice(state, new_holds, tgt, profile, now, days):
+def open_notice(state, new_holds, base, profile, now, days, offered):
     if not new_holds:
         return None
     day = now.astimezone(TPE).strftime("%Y%m%d")
@@ -1122,9 +1377,9 @@ def open_notice(state, new_holds, tgt, profile, now, days):
     nid = f"N-{day}-{n}"
     path = os.path.join(state.dir, "notices", nid + ".md")
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    nc.write_private_new(path, draft_notice(nid, new_holds, tgt, profile, now, days))
+    nc.write_private_new(path, draft_notice(nid, new_holds, base, profile, now, days, offered))
     state.data["notices"][nid] = {"id": nid, "created_at": iso(now), "hold_ids": [it["hold_id"] for it in new_holds],
-                                  "draft": path, "sent_at": None}
+                                  "draft": path, "sent_at": None, "effective_date": None}
     for it in new_holds:
         state.data["holds"][it["hold_id"]]["notice_id"] = nid
     return nid
@@ -1171,11 +1426,11 @@ def collect_alerts(items, state, now, extra=()):
     out = []
     for it in items:
         if it["class"] == "alert" or it["alert"] or (it["class"] == "hold" and not it["apply"]):
-            sev = "action" if it["class"] in ("alert", "hold") or it["alert"] else "info"
-            title = ("HOLD " if it["class"] == "hold" else "") + it["subject"]
+            sev = it.get("severity") or ("action" if it["class"] in ("alert", "hold") or it["alert"] else "info")
+            title = ("HOLD " if it["class"] == "hold" else "KEPT " if it.get("deferred") else "") + it["subject"]
             details = [it["reason"]]
             if it["kind"] in ("opt", "map", "chan-field"):
-                details.append(f"target {short(it.get('old'))} -> source {short(it.get('new'))}")
+                details.append(f"target {show(it, 'old')} -> source {show(it, 'new')}")
             if it.get("hold_id"):
                 details.append(f"hold {it['hold_id']}")
             out.append({"severity": sev, "title": title, "details": details, "class": it["class"],
@@ -1183,6 +1438,7 @@ def collect_alerts(items, state, now, extra=()):
     out += list(extra)
     seen = state.data.setdefault("alerts", {}) if state else {}
     for al in out:
+        al.setdefault("details", [])
         fp = nc.digest([al["title"], al.get("hold_id") or al["details"][:1]])[:16]
         rec = seen.get(fp)
         al["fingerprint"], al["new"] = fp, rec is None
@@ -1196,6 +1452,61 @@ def short(v, n=90):
     s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
     s = nc.redact(s)
     return s if len(s) <= n else s[:n] + f"... ({len(s)} chars)"
+
+
+def masked(v):
+    """A channel value that may hold a credential: only its sha256 prefix and length."""
+    if v is None:
+        return "null"
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, sort_keys=True)
+    return f"sha256:{nc.sha256_text(s)[:12]} ({len(s)} chars)"
+
+
+def show(it, which, n=90):
+    """old/new of an item for people: channel fields outside the printable list are masked."""
+    if it["kind"] == "chan-field" and it.get("field") not in nc.CHANNEL_PRINTABLE_FIELDS:
+        return masked(it.get(which))
+    return short(it.get(which), n)
+
+
+def public_item(it):
+    """An item for `plan --json` (masked like the text output)."""
+    out = dict(it)
+    if it["kind"] == "chan-field" and it.get("field") not in nc.CHANNEL_PRINTABLE_FIELDS:
+        out["old"], out["new"] = masked(it.get("old")), masked(it.get("new"))
+    return out
+
+
+def apply_failure_alert(run):
+    """An action alert for a run whose writes failed or left differences (None when it succeeded)."""
+    if run.get("ok"):
+        return None
+    if not run.get("write_ok", True):
+        title = "apply failed at " + str(run.get("failed") or "an unknown step")[:160]
+    else:
+        title = "apply left differences that it should have written"
+    return {"severity": "action", "title": title, "details": [
+        f"run {run['id']} ({run.get('command')})",
+        "written: " + (", ".join(run.get("written") or []) or "nothing")[:800],
+        "still differs: " + (", ".join(run.get("left") or []) or "nothing")[:800],
+        "the journal in the state directory lists every write; the next run retries what is left"]}
+
+
+def pat_expiry_alerts(a, profile, now):
+    if a.token_file or a.auth != "pat":
+        return []
+    exp = read_annotation(kubectl_argv(a), profile["target"]["namespace"],
+                          profile.get("auth", {}).get("pat_secret", "newapi-sync-pat"), "woowtech.io/expires-at")
+    if not exp or not exp.isdigit():
+        return [{"severity": "info", "title": "the sync PAT's expiry is unknown",
+                 "details": ["the Secret has no woowtech.io/expires-at annotation (unix seconds), or it could not "
+                             "be read: the 14-day warning cannot work"]}]
+    left = (int(exp) - now.timestamp()) / 86400
+    if left < PAT_WARN_DAYS:
+        return [{"severity": "action", "title": f"the sync PAT expires in {left:.0f} days",
+                 "details": ["mint a new root PAT in the browser (scopes " + ", ".join(PAT_SCOPES)
+                             + ") and replace the Secret"]}]
+    return []
 
 
 # ------------------------------------------------------------- writes
@@ -1233,23 +1544,37 @@ class Journal:
         self.f.close()
 
 
-def execute(client, a, profile, tgt, desired, chosen, keys, journal, out=None):
-    """Write the chosen items: options (prices first), then channels. Stops at the first failure."""
-    out = out or sys.stdout
-    final = simulate(tgt, chosen, profile, desired)
-    opt_keys = [k for k in final["options"] if final["options"][k] != tgt["options"].get(k)]
-    for key in option_write_order(opt_keys):
-        value = final["options"][key]
+def write_options(client, before, after, journal, out, result):
+    for key in option_write_order([k for k in after if after[k] != before.get(k)]):
+        value = after[key]
         journal.write(step="option", key=key, sha256=nc.sha256_text(value), length=len(value))
         ok, msg, _ = api(client, "PUT", "/api/option/", {"key": key, "value": value})
         journal.write(step="option-result", key=key, ok=ok, message=msg)
         print(f"{'ok  ' if ok else 'FAIL'} option {key} ({len(value)} chars)" + ("" if ok else f": {msg}"), file=out)
         if not ok:
+            result["failed"] = f"option {key}: {msg}"
             return False
+        result["written"].append(f"option {key}")
+    return True
+
+
+def execute(client, a, profile, tgt, desired, chosen, keys, journal, out=None):
+    """Write the chosen items so that an offered model never lacks its price, whatever step fails:
+    A) options, new and changed prices; B) channels (create, routes, keys); C) removed price entries.
+    Stops at the first failure. Returns {"ok", "written": [steps], "failed": step or None}."""
+    out = out or sys.stdout
+    result = {"ok": False, "written": [], "failed": None}
+    late = {id(it) for it in chosen if it["kind"] == "map" and it["new"] is None}
+    phase_a = simulate(tgt, [it for it in chosen if id(it) not in late], profile, desired)
+    final = simulate(tgt, chosen, profile, desired)
+    if not write_options(client, tgt["options"], phase_a["options"], journal, out, result):
+        return result
     creates = sorted(it["channel"] for it in chosen if it["kind"] == "chan-create")
     for cid in creates:
         if not create_channel(client, a, profile, cid, desired, keys, journal, out):
-            return False
+            result["failed"] = f"channel {cid} create"
+            return result
+        result["written"].append(f"channel {cid} create")
     for cid in sorted(set(final["channels"]) - set(creates)):
         before, after = tgt["channels"].get(cid), final["channels"][cid]
         if before is None:
@@ -1271,11 +1596,16 @@ def execute(client, a, profile, tgt, desired, chosen, keys, journal, out=None):
         ok, msg, _ = api(client, "PUT", "/api/channel/", req)
         req = None
         journal.write(step="channel-update-result", channel=cid, ok=ok, message=msg)
-        print(f"{'ok  ' if ok else 'FAIL'} channel {cid} update {sorted(body)}" + (" + key" if rekey else "")
-              + ("" if ok else f": {msg}"), file=out)
+        step = f"channel {cid} update {sorted(body)}" + (" + key" if rekey else "")
+        print(f"{'ok  ' if ok else 'FAIL'} {step}" + ("" if ok else f": {msg}"), file=out)
         if not ok:
-            return False
-    return True
+            result["failed"] = f"{step}: {msg}"
+            return result
+        result["written"].append(step)
+    if not write_options(client, phase_a["options"], final["options"], journal, out, result):
+        return result
+    result["ok"] = True
+    return result
 
 
 PLACEHOLDER = {"name": "apporo-sync id placeholder (deleted at once)", "type": 62, "key": "placeholder-not-a-key",
@@ -1365,8 +1695,12 @@ def verify_report(src, tgt, desired, profile, keys, expected_items=()):
         for f in nc.CHANNEL_COPY_FIELDS:
             ok = d.get(f) == t.get(f)
             exp_ok = ok or (cid, f) in allowed_chan
+            if f in nc.CHANNEL_PRINTABLE_FIELDS:
+                diff = f"{short(t.get(f), 60)} != {short(d.get(f), 60)}"
+            else:
+                diff = f"{masked(t.get(f))} != {masked(d.get(f))}"
             rows.append(("channel", f"{cid}.{f}", exp_ok, None if ok else
-                         ("expected difference" if exp_ok else f"{short(t.get(f), 60)} != {short(d.get(f), 60)}")))
+                         ("expected difference" if exp_ok else diff)))
         if keys is not None:
             ok = t.get("key_sha256_16") == keys[desired["channel_slots"][cid]].sha16()
             rows.append(("channel", f"{cid}.key", ok or (cid, "key") in allowed_chan,
@@ -1381,6 +1715,7 @@ def verify_report(src, tgt, desired, profile, keys, expected_items=()):
                  None if exp_ab == got_ab else f"{len(got_ab)} rows, expected {len(exp_ab)}"))
     src_ids = {desired["source_ids"][cid]: cid for cid in managed}
     src_ab = [dict(r, channel_id=src_ids[r["channel_id"]]) for r in src["abilities"] if r["channel_id"] in src_ids]
+
     def route(rs):
         return sorted((r["group"], r["model"], r["channel_id"], r["priority"], r["weight"], r["tag"] or "") for r in rs)
     model_diff = any(f == "models" for _, f in allowed_chan)
@@ -1446,17 +1781,20 @@ def image_alerts(repo, kube=None, live=False, profile=None):
                                         "runs it); the owner merges it, then helm upgrade"]})
     if live and kube and profile:
         def images(ns):
-            r = subprocess.run(kube + ["-n", ns, "get", "deploy,statefulset,cronjob", "-o", "json"],
-                               capture_output=True, timeout=60)
-            if r.returncode != 0:
+            try:
+                r = subprocess.run(kube + ["-n", ns, "get", "deploy,statefulset,cronjob", "-o", "json"],
+                                   capture_output=True, timeout=60)
+                if r.returncode != 0:
+                    return None
+                got = {}
+                for obj in json.loads(r.stdout or b"{}").get("items", []):
+                    spec = obj["spec"].get("jobTemplate", {}).get("spec", obj["spec"])
+                    pod = spec.get("template", {}).get("spec", {})
+                    for c in pod.get("containers", []) + pod.get("initContainers", []):
+                        got[f"{obj['kind']}/{obj['metadata']['name']}/{c['name']}"] = c.get("image")
+                return got
+            except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
                 return None
-            got = {}
-            for obj in json.loads(r.stdout or b"{}").get("items", []):
-                spec = obj["spec"].get("jobTemplate", {}).get("spec", obj["spec"])
-                pod = spec.get("template", {}).get("spec", {})
-                for c in pod.get("containers", []) + pod.get("initContainers", []):
-                    got[f"{obj['kind']}/{obj['metadata']['name']}/{c['name']}"] = c.get("image")
-            return got
         w, p = images(profile["source"]["namespace"]), images(profile["target"]["namespace"])
         if w is None or p is None:
             out.append({"severity": "info", "title": "images: live comparison unavailable (kubectl get failed)",
@@ -1478,13 +1816,15 @@ def load(a):
     return profile
 
 
-def plan_all(a, profile, bootstrap, keys=None):
+def plan_all(a, profile, bootstrap, keys=None, history=None):
     src = read_source(a, profile)
     tgt = read_target(a, profile)
     check_versions(src, tgt)
     desired, notes = nc.transform(src, profile)
     items = build_items(src, tgt, desired, notes, profile, keys, bootstrap)
-    classify(items, tgt, profile, bootstrap, desired)
+    classify(items, tgt, profile, bootstrap, desired, history)
+    if bootstrap:
+        items += bootstrap_blockers(desired)
     return src, tgt, desired, items
 
 
@@ -1507,13 +1847,16 @@ def print_items(items, out=None):
         tag = {"auto": "AUTO ", "hold": "HOLD ", "alert": "ALERT"}.get(it["class"], "?    ")
         if it["class"] == "hold" and it["apply"]:
             tag = "HOLD+"
+        elif it.get("deferred"):
+            tag = "KEPT "
         extra = ""
         if it["kind"] in ("opt", "map", "chan-field"):
-            extra = f"  {short(it.get('old'), 60)} -> {short(it.get('new'), 60)}"
+            extra = f"  {show(it, 'old', 60)} -> {show(it, 'new', 60)}"
         print(f"{tag} {it['subject']}: {it['reason']}{extra}", file=out)
     counts = {c: sum(1 for i in items if i["class"] == c) for c in ("auto", "hold", "alert")}
+    kept = sum(1 for i in items if i.get("deferred"))
     print(f"plan: {counts['auto']} auto, {counts['hold']} hold ({sum(1 for i in items if i['apply'])} matured), "
-          f"{counts['alert']} alert", file=out)
+          f"{counts['alert']} alert" + (f" ({kept} kept)" if kept else ""), file=out)
 
 
 def cmd_export(a):
@@ -1530,12 +1873,15 @@ def cmd_export(a):
     for cid, ch in sorted(snap["channels"].items()):
         print(f"  channel {cid}: group {ch.get('group')}, {len(_models(ch.get('models')))} models, status "
               f"{ch.get('status')}, config {nc.channel_fingerprint(ch)[:12]}")
+    if snap.get("unsafe_channels"):
+        print(f"  channels with credential-looking fields (redacted, never copied): "
+              f"{ {k: v for k, v in sorted(snap['unsafe_channels'].items())} }")
     if snap["skipped_keys"]:
         print(f"  not read (secret-looking or invalid): {sorted(snap['skipped_keys'])}")
     if a.out:
-        real = os.path.realpath(a.out)
-        if real.startswith(REPO + os.sep):
-            raise SyncError("keep snapshots outside the repository")
+        real, repo = os.path.realpath(a.out), os.path.realpath(REPO)
+        if real == repo or real.startswith(repo + os.sep):
+            raise SyncError("keep snapshots outside the repository (its main branch is mirrored to a public GitHub)")
         out = dict(snap, channels={str(k): v for k, v in snap["channels"].items()},
                    _meta={"side": side, "namespace": profile[side]["namespace"], "taken_at": iso(now_utc())})
         out["channels"] = {k: {f: x for f, x in v.items() if f not in ("key_sha256_16", "key_length")}
@@ -1548,80 +1894,132 @@ def cmd_export(a):
 def cmd_plan(a):
     profile = load(a)
     keys = channel_keys(a, profile) if a.check_keys else None
-    src, tgt, desired, items = plan_all(a, profile, a.bootstrap, keys)
+    now = now_utc()
     state = None if a.bootstrap else State(a.state_dir, read_only=True)
-    process_holds(items, state, now_utc(), profile.get("price_increase_notice_days", 7), persist=False)
+    hist = offered_history(state, now, history_days(profile))
+    src, tgt, desired, items = plan_all(a, profile, a.bootstrap, keys, hist)
+    process_holds(items, state, now, notice_days(profile), persist=False)
     if not a.bootstrap:
         combined_gate(chosen_items(items), tgt, profile, desired)
     if a.json:
-        print(json.dumps({"items": items}, ensure_ascii=False, indent=1, default=str))
+        print(json.dumps({"items": [public_item(it) for it in items]}, ensure_ascii=False, indent=1, default=str))
     else:
         print_items(items)
     return 0
 
 
+def daily_view(src, tgt, desired, profile, keys, history):
+    """The hold and alert items the daily rules would leave alone (what a forced replay overrides)."""
+    items = build_items(src, tgt, desired, [], profile, keys, False)
+    classify(items, tgt, profile, False, desired, history)
+    return [it for it in items if it["class"] in ("hold", "alert")]
+
+
+def check_bootstrap(a, state, src, tgt, desired, items, profile, keys, history, out):
+    """Replay copies everything at once: only for a fresh target, or with --force and a reason."""
+    blockers = [it for it in items if it.get("blocker")]
+    if blockers:
+        raise SyncError("replay refused: " + "; ".join(f"{it['subject']} ({it['reason']})" for it in blockers))
+    fresh = target_is_fresh(tgt, desired)
+    started = state.data.get("sync_started_at")
+    if fresh and not started:
+        return []
+    if not a.force:
+        why = ("the daily sync already ran against this state" if started else
+               "the target is not a fresh install (its ServerAddress is set, or managed channels exist)")
+        raise SyncError(f"{why}: `replay` would skip the price-notice rule. Use `apply` (the daily rules), or "
+                        "`plan --bootstrap` to check a finished replay; to resume a failed bootstrap before any "
+                        "customer exists, pass --force --why '<reason>'")
+    overridden = daily_view(src, tgt, desired, profile, keys, history)
+    for it in overridden:
+        print(f"OVERRIDE {it['class']} {it['subject']}: {it['reason']}", file=out)
+    return overridden
+
+
 def run_apply(a, profile, bootstrap, out=None):
+    """One write run (replay or the daily rules). Returns {"ok", "items", "run", "state", "tgt", "alerts"}."""
     out = out or sys.stdout
     now = now_utc()
-    days = profile.get("price_increase_notice_days", 7)
+    days, hdays = notice_days(profile), history_days(profile)
     state = State(a.state_dir)
+    command = "replay" if bootstrap else "apply"
+    run = {"id": iso(now), "started_at": iso(now), "command": command, "ok": False}
     try:
         keys = channel_keys(a, profile)
-        src, tgt, desired, items = plan_all(a, profile, bootstrap, keys)
-        if bootstrap and state.data.get("sync_started_at") and not a.force:
-            raise SyncError("the daily sync already ran against this state: `replay` would skip the price-notice "
-                            "rule. Use `apply`, or pass --force with a reason in --why")
+        history = offered_history(state, now, hdays)
+        src, tgt, desired, items = plan_all(a, profile, bootstrap, keys, history)
+        refuse_woow_database(tgt, profile)
+        alerts = [] if bootstrap else history_alerts(state, tgt, desired)
+        overridden = check_bootstrap(a, state, src, tgt, desired, items, profile, keys, history, out) \
+            if bootstrap else []
         new_holds = process_holds(items, state, now, days, persist=not bootstrap)
-        nid = open_notice(state, new_holds, tgt, profile, now, days) if not bootstrap else None
         if not bootstrap:
             combined_gate(chosen_items(items), tgt, profile, desired)
         chosen = chosen_items(items)
+        base = simulate(tgt, chosen, profile, desired)
+        nid = None if bootstrap else open_notice(state, new_holds, base, profile, now, days,
+                                                 merge_offered(routed_models(tgt), routed_models(base), history))
         print_items(items, out)
-        ok = True
+        res = {"ok": True, "written": [], "failed": None}
         if chosen:
-            with target_base(a, profile) as base:
-                client = make_client(a, profile, base)
+            with target_base(a, profile) as tb:
+                client = make_client(a, profile, tb)
                 try:
                     guard_target(client, profile, tgt, bootstrap)
-                    journal = Journal(a.state_dir, "replay" if bootstrap else "apply", now)
-                    journal.write(step="start", items=len(chosen), why=getattr(a, "why", None))
+                    journal = Journal(a.state_dir, command, now)
+                    journal.write(step="start", items=len(chosen), force=bool(a.force), why=a.why,
+                                  overridden=[it["subject"] for it in overridden])
+                    res, error = {"ok": False, "written": [], "failed": "interrupted"}, None
                     try:
-                        ok = execute(client, a, profile, tgt, desired, chosen, keys, journal, out)
+                        res = execute(client, a, profile, tgt, desired, chosen, keys, journal, out)
+                    except BaseException as e:
+                        error = e.__class__.__name__
+                        raise
                     finally:
-                        journal.write(step="end", ok=ok)
+                        journal.write(step="end", ok=res["ok"], error=error, failed=res["failed"],
+                                      written=len(res["written"]))
                         journal.close()
                 finally:
                     client.close()
-            if ok:
+            if res["ok"]:
                 for it in chosen:
                     if it.get("hold_id") and it["hold_id"] in state.data["holds"]:
                         state.data["holds"][it["hold_id"]].update(state="applied", applied_at=iso(now_utc()))
         tgt2 = read_target(a, profile)
         items2 = build_items(src, tgt2, desired, [], profile, keys, bootstrap)
-        classify(items2, tgt2, profile, bootstrap, desired)
+        classify(items2, tgt2, profile, bootstrap, desired, history)
         process_holds(items2, state, now, days, persist=False)
-        leftover = chosen_items(items2) if ok else []
+        leftover = chosen_items(items2)
         for it in leftover:
             print(f"LEFT {it['subject']}: still differs after apply", file=out)
+        record_offered(state, tgt, now, hdays)
+        record_offered(state, tgt2, now, hdays)
         if not bootstrap:
             state.data.setdefault("sync_started_at", iso(now))
-        run = {"id": iso(now), "started_at": iso(now), "command": "replay" if bootstrap else "apply",
-               "applied": len(chosen) if ok else None, "ok": ok and not leftover, "notice": nid}
+        run.update(ok=res["ok"] and not leftover, write_ok=res["ok"], failed=res["failed"],
+                   applied=len(res["written"]), written=res["written"][:50],
+                   left=[it["subject"] for it in leftover][:50], notice=nid)
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
         state.save()
-        return ok and not leftover, items, run, state, tgt2
-    except BaseException:
+        return {"ok": run["ok"], "items": items, "run": run, "state": state, "tgt": tgt2, "alerts": alerts}
+    except BaseException as e:
+        run.update(ok=False, error=e.__class__.__name__)
+        state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
         state.save()
         raise
 
 
 def cmd_apply(a):
     profile = load(a)
-    ok, items, run, state, _ = run_apply(a, profile, bootstrap=False)
-    alerts = collect_alerts(items, state, now_utc())
-    state.save()
-    make_sink(a, a.state_dir).emit(alerts, run)
-    return 0 if ok else 1
+    res = run_apply(a, profile, bootstrap=False)
+    extra = list(res["alerts"])
+    fail = apply_failure_alert(res["run"])
+    if fail:
+        extra.append(fail)
+    alerts = collect_alerts(res["items"], res["state"], now_utc(), extra)
+    res["state"].save()
+    make_sink(a, a.state_dir).emit(alerts, res["run"])
+    return 0 if res["ok"] else 1
 
 
 def cmd_replay(a):
@@ -1629,9 +2027,10 @@ def cmd_replay(a):
         raise SyncError("replay copies everything, price increases and platform-coupled settings included: only for a "
                         "fresh target before customers exist. Pass --yes-bootstrap")
     profile = load(a)
-    ok, _, _, _, _ = run_apply(a, profile, bootstrap=True)
-    print("replay: " + ("done; now run verify --strict" if ok else "FAILED; inspect the journal, then run it again"))
-    return 0 if ok else 1
+    res = run_apply(a, profile, bootstrap=True)
+    print("replay: " + ("done; now run verify --strict, then plan --bootstrap (must be 0 auto)" if res["ok"] else
+                        "FAILED; inspect the journal, then resume with replay --force --why '<reason>'"))
+    return 0 if res["ok"] else 1
 
 
 def cmd_verify(a):
@@ -1643,8 +2042,9 @@ def cmd_verify(a):
     desired, notes = nc.transform(src, profile)
     expected = []
     if not a.strict:
+        state = State(a.state_dir, read_only=True)
         items = build_items(src, tgt, desired, notes, profile, keys)
-        classify(items, tgt, profile, False, desired)
+        classify(items, tgt, profile, False, desired, offered_history(state, now_utc(), history_days(profile)))
         expected = [it for it in items if it["class"] in ("alert", "hold") and not it["apply"]]
     rows, fps = verify_report(src, tgt, desired, profile, keys, expected)
     failed = [r for r in rows if not r[2]]
@@ -1670,14 +2070,18 @@ def cmd_verify(a):
 def cmd_daily(a):
     try:
         return _daily(a)
-    except (SyncError, nc.ContentError, na.Fatal) as e:
-        # A failed run is itself an alert (an e-mail sink must hear about it too).
+    except Exception as e:
+        # Any failed run is itself an alert (an e-mail sink must hear about it too),
+        # whatever the exception: IncompleteRead, TimeoutExpired, a broken state file, SIGTERM ...
         now = now_utc()
         run = {"id": iso(now), "started_at": iso(now), "command": "daily", "ok": False}
         try:
-            make_sink(a, a.state_dir).emit([{"severity": "action", "title": "daily sync failed",
-                                             "details": [str(e)[:300]], "new": True, "fingerprint": "daily-failed"}], run)
-        except OSError:
+            make_sink(a, a.state_dir).emit([{
+                "severity": "action", "title": "daily sync failed",
+                "details": [f"{e.__class__.__name__}: {nc.redact(str(e))[:300]}",
+                            "writes done before the failure are in the journal of the state directory"],
+                "new": True, "fingerprint": "daily-failed-" + iso(now)}], run)
+        except Exception:  # noqa: BLE001 - the original error matters more
             pass
         raise
 
@@ -1686,30 +2090,35 @@ def _daily(a):
     profile = load(a)
     now = now_utc()
     extra = image_alerts(REPO, kubectl_argv(a), a.live_images, profile)
-    exp = read_annotation(kubectl_argv(a), profile["target"]["namespace"],
-                          profile.get("auth", {}).get("pat_secret", "newapi-sync-pat"), "woowtech.io/expires-at")
-    if exp and exp.isdigit():
-        left = (int(exp) - now.timestamp()) / 86400
-        if left < PAT_WARN_DAYS:
-            extra.append({"severity": "action", "title": f"the sync PAT expires in {left:.0f} days",
-                          "details": ["mint a new root PAT in the browser (scopes "
-                                      + ", ".join(PAT_SCOPES) + ") and replace the Secret"]})
+    extra += pat_expiry_alerts(a, profile, now)
     if a.apply:
-        ok, items, run, state, _ = run_apply(a, profile, bootstrap=False)
+        res = run_apply(a, profile, bootstrap=False)
+        items, run, state, ok = res["items"], res["run"], res["state"], res["ok"]
+        extra += res["alerts"]
+        fail = apply_failure_alert(run)
+        if fail:
+            extra.append(fail)
     else:
         state = State(a.state_dir)
-        _, tgt, desired, items = plan_all(a, profile, False)
-        new = process_holds(items, state, now, profile.get("price_increase_notice_days", 7), persist=True)
+        days, hdays = notice_days(profile), history_days(profile)
+        history = offered_history(state, now, hdays)
+        _, tgt, desired, items = plan_all(a, profile, False, None, history)
+        extra += history_alerts(state, tgt, desired)
+        new = process_holds(items, state, now, days, persist=True)
         combined_gate(chosen_items(items), tgt, profile, desired)
-        nid = open_notice(state, new, tgt, profile, now, profile.get("price_increase_notice_days", 7))
+        base = simulate(tgt, chosen_items(items), profile, desired)
+        nid = open_notice(state, new, base, profile, now, days,
+                          merge_offered(routed_models(tgt), routed_models(base), history))
         print_items(items)
+        record_offered(state, tgt, now, hdays)
         ok, run = True, {"id": iso(now), "started_at": iso(now), "command": "daily-report", "notice": nid, "ok": True}
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
     alerts = collect_alerts(items, state, now, extra)
     if run.get("notice"):
         n = state.data["notices"][run["notice"]]
         alerts.append({"severity": "action", "title": f"price-increase notice {n['id']} drafted",
-                       "details": [n["draft"], f"after sending: apporo_sync.py notice-sent {n['id']} --at <time>"],
+                       "details": [n["draft"], f"after sending: apporo_sync.py notice-sent {n['id']} --effective "
+                                   "<YYYY-MM-DD> --at <send time>"],
                        "new": True, "fingerprint": n["id"]})
     state.save()
     make_sink(a, a.state_dir).emit(alerts, run)
@@ -1721,24 +2130,35 @@ def cmd_notice_sent(a):
     n = state.data["notices"].get(a.notice_id)
     if not n:
         raise SyncError(f"no notice {a.notice_id}; see `holds`")
-    at = parse_iso(a.at) if a.at else now_utc()
-    if at > now_utc() + datetime.timedelta(minutes=5):
+    if n.get("sent_at"):
+        raise SyncError(f"notice {a.notice_id} was already recorded as sent at {n['sent_at']} "
+                        f"(effective {n.get('effective_date')})")
+    now = now_utc()
+    at = parse_iso(a.at) if a.at else now
+    if at > now + datetime.timedelta(minutes=5):
         raise SyncError("--at is in the future")
     if at < parse_iso(n["created_at"]):
         raise SyncError("--at is before the notice was drafted")
-    days = None
-    marked = []
-    for hid in n["hold_ids"]:
-        h = state.data["holds"].get(hid)
-        if not h or h["state"] != "pending-notice":
-            continue
-        days = h.get("notice_days", 7)
-        h.update(state="notified", notice_sent_at=iso(at), eligible_at=iso(at + datetime.timedelta(days=days)))
-        marked.append(hid)
-    n["sent_at"] = iso(at)
+    backdated = now - at > BACKDATE_LIMIT
+    if backdated and not a.backdated:
+        raise SyncError(f"--at is more than {BACKDATE_LIMIT.total_seconds() / 3600:.0f} hours ago: pass --backdated "
+                        "only if the email really went out then")
+    effective = parse_date(a.effective)
+    holds = [state.data["holds"][hid] for hid in n["hold_ids"]
+             if hid in state.data["holds"] and state.data["holds"][hid]["state"] == "pending-notice"]
+    days = max([nc.MIN_NOTICE_DAYS] + [int(h.get("notice_days") or nc.MIN_NOTICE_DAYS) for h in holds])
+    start = effective_start(effective)
+    if start < at + datetime.timedelta(days=days):
+        raise SyncError(f"--effective {effective.isoformat()} is less than {days} days after sending "
+                        f"({iso(at)}); the earliest effective date is {earliest_effective(at, days).isoformat()} "
+                        "(AI Models Terms, Section 3). Send a corrected notice if the email named an earlier date")
+    for h in holds:
+        h.update(state="notified", notice_sent_at=iso(at), effective_date=effective.isoformat(), eligible_at=iso(start))
+    n.update(sent_at=iso(at), effective_date=effective.isoformat(), recorded_at=iso(now), backdated=backdated)
     state.save()
-    print(f"notice {a.notice_id} sent at {iso(at)}: {len(marked)} hold(s) apply from "
-          + (iso(at + datetime.timedelta(days=days)) if marked else "-") + " on")
+    print(f"notice {a.notice_id} sent at {iso(at)}, effective {effective.isoformat()}: "
+          + (f"{len(holds)} hold(s) apply from the first daily run after {iso(start)} (00:00 UTC-12)"
+             if holds else "no hold was waiting for this notice (cancelled or superseded)"))
     return 0
 
 
@@ -1747,9 +2167,10 @@ def cmd_holds(a):
     for h in sorted(state.data["holds"].values(), key=lambda h: h["detected_at"]):
         print(f"{h['id']} {h['state']:<15} {'/'.join(str(x) for x in h['subject'] if x)}: "
               f"{short(h['old'], 40)} -> {short(h['new'], 40)}  notice {h.get('notice_id')} "
-              f"sent {h.get('notice_sent_at')} eligible {h.get('eligible_at')}")
+              f"sent {h.get('notice_sent_at')} effective {h.get('effective_date')} from {h.get('eligible_at')}")
     for n in state.data["notices"].values():
-        print(f"{n['id']} sent {n['sent_at']} holds {n['hold_ids']} draft {n['draft']}")
+        print(f"{n['id']} sent {n['sent_at']} effective {n.get('effective_date')} holds {n['hold_ids']} "
+              f"draft {n['draft']}")
     return 0
 
 
@@ -1765,24 +2186,38 @@ def cmd_check_images(a):
     return 1 if any(al["severity"] == "action" for al in alerts) else 0
 
 
+def revoke_pat(client, password, token_id):
+    """Revoke one of the caller's PATs (proof by password); True when the server confirmed it."""
+    if token_id is None:
+        return False
+    ok, _, ans = api(client, "POST", "/api/verify", {"method": "password", "scope": "access_token.revoke",
+                                                     "context": {"token_id": token_id}, "password": password.reveal()})
+    if not ok:
+        return False
+    proof = (ans.get("data") or {}).get("proof_token") or ""
+    ok, _, _ = api(client, "DELETE", f"/api/user/access_tokens/{token_id}", headers={"X-Security-Proof": proof})
+    return ok
+
+
 def cmd_mint_sync_pat(a):
-    """Bootstrap only (root has no 2FA yet): root PAT for the sync, straight into a Secret."""
+    """Bootstrap only (root has no 2FA yet): root PAT for the sync, straight into a Secret.
+    If the Secret cannot be written, the new PAT is revoked at once (no orphan credential)."""
     profile = load(a)
     ns = profile["target"]["namespace"]
     name = profile.get("auth", {}).get("pat_secret", "newapi-sync-pat")
     expires = int(time.time()) + PAT_DAYS * 86400
-    with PortForward(kubectl_argv(a), ns) as base:
+    with target_base(a, profile) as base:
         a.auth = "password"
         client = make_client(a, profile, base)
         try:
             tgt = read_target(a, profile)
             guard_target(client, profile, tgt, bootstrap=True)
-            creds = read_secret(kubectl_argv(a), ns, profile.get("auth", {}).get("password_secret",
-                                                                                 "newapi-root-credentials"), "password")
+            password = read_secret(kubectl_argv(a), ns, profile.get("auth", {}).get("password_secret",
+                                                                                    "newapi-root-credentials"),
+                                   "password")
             ok, msg, ans = api(client, "POST", "/api/verify", {
                 "method": "password", "scope": "access_token.generate",
-                "context": {"scopes": sorted(PAT_SCOPES), "expires_at": expires}, "password": creds.reveal()})
-            creds = None
+                "context": {"scopes": sorted(PAT_SCOPES), "expires_at": expires}, "password": password.reveal()})
             if not ok:
                 raise SyncError(f"password proof refused ({msg}): root may already have 2FA; mint the PAT in the browser")
             proof = (ans.get("data") or {}).get("proof_token")
@@ -1791,25 +2226,44 @@ def cmd_mint_sync_pat(a):
                                 "expires_at": expires}, headers={"X-Security-Proof": proof or ""})
             if not ok:
                 raise SyncError(f"PAT not created: {msg}")
-            token = Secret(ans["data"]["token"])
-            hint = (ans["data"].get("item") or {}).get("token_hint", "")
-            ans = None
+            data = ans.get("data") or {}
+            token = Secret(data.get("token") or "")
+            meta = data.get("item") or {}
+            hint, token_id = meta.get("token_hint", ""), meta.get("id")
+            ans = data = None
+            if not na.PAT_RE.fullmatch(token.reveal()):
+                revoked = revoke_pat(client, password, token_id)
+                raise SyncError("the server's answer did not hold one nap_... token; the PAT was "
+                                + ("revoked" if revoked else "NOT revoked: revoke it by hand (root, access tokens)"))
+            manifest = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+                        "metadata": {"name": name, "namespace": ns,
+                                     "labels": {"app.kubernetes.io/part-of": "woow-k3s-newapi"},
+                                     "annotations": {"woowtech.io/expires-at": str(expires), "woowtech.io/hint": hint,
+                                                     "woowtech.io/scopes": ",".join(sorted(PAT_SCOPES))}},
+                        "data": {"token": base64.b64encode(token.reveal().encode()).decode()}}
+            try:
+                ok, msg = write_secret(kubectl_argv(a), ns, name, manifest)
+            finally:
+                manifest = token = None
+            if not ok:
+                revoked = revoke_pat(client, password, token_id)
+                raise SyncError(f"secret {ns}/{name} not written ({msg}); the new PAT (hint {hint}) was "
+                                + ("revoked" if revoked else "NOT revoked: revoke it by hand (root, access tokens)"))
         finally:
             client.close()
-    manifest = {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
-                "metadata": {"name": name, "namespace": ns, "labels": {"app.kubernetes.io/part-of": "woow-k3s-newapi"},
-                             "annotations": {"woowtech.io/expires-at": str(expires), "woowtech.io/hint": hint,
-                                             "woowtech.io/scopes": ",".join(sorted(PAT_SCOPES))}},
-                "data": {"token": base64.b64encode(token.reveal().encode()).decode()}}
-    kube = kubectl_argv(a)
-    exists = subprocess.run(kube + ["-n", ns, "get", "secret", name], capture_output=True).returncode == 0
-    r = subprocess.run(kube + ["replace" if exists else "create", "-f", "-"], input=json.dumps(manifest).encode(),
-                       capture_output=True)
-    manifest = token = None
-    if r.returncode != 0:
-        raise SyncError(f"kubectl {'replace' if exists else 'create'} secret {ns}/{name} failed")
-    print(f"secret {ns}/{name} written (PAT hint {hint}, scopes {', '.join(sorted(PAT_SCOPES))}, expires "
+    print(f"secret {ns}/{name} {msg} (PAT hint {hint}, scopes {', '.join(sorted(PAT_SCOPES))}, expires "
           f"{datetime.datetime.fromtimestamp(expires, TPE):%Y-%m-%d})")
+    return 0
+
+
+def cmd_failure_alert(a):
+    """For systemd OnFailure= (a crash, SIGKILL or timeout the tool could not report itself)."""
+    now = now_utc()
+    run = {"id": iso(now), "started_at": iso(now), "command": "failure-alert", "ok": False}
+    make_sink(a, a.state_dir).emit([{"severity": "action", "title": "daily sync unit failed",
+                                     "details": [nc.redact(a.reason or "the systemd unit reported a failure")[:300],
+                                                 "see journalctl --user -u apporo-newapi-sync.service"],
+                                     "new": True, "fingerprint": "unit-failed-" + iso(now)}], run)
     return 0
 
 
@@ -1839,7 +2293,7 @@ def build_parser():
     p.set_defaults(fn=cmd_apply)
     p = sub.add_parser("replay", help="bootstrap a fresh target (after /api/setup, before DNS and customers)")
     p.add_argument("--yes-bootstrap", action="store_true")
-    p.add_argument("--force", action="store_true", help="even after the daily sync started (needs --why)")
+    p.add_argument("--force", action="store_true", help="also on a target that is not fresh (needs --why)")
     p.add_argument("--why", help="journaled reason for --force")
     p.set_defaults(fn=cmd_replay)
     p = sub.add_parser("verify", help="read-only SQL fingerprints of the target vs the transform")
@@ -1849,13 +2303,16 @@ def build_parser():
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(fn=cmd_verify)
     p = sub.add_parser("daily", help="images + plan + holds + alerts (+ apply)")
-    p.add_argument("--apply", action="store_true", help="write the target (the timer passes it)")
+    p.add_argument("--apply", action="store_true", help="write the target (the timer passes it in apply mode)")
     p.add_argument("--live-images", action="store_true", help="also compare running images (kubectl get)")
     p.add_argument("--alert-sink", help="file (default); e-mail is not implemented yet")
     p.set_defaults(fn=cmd_daily)
-    p = sub.add_parser("notice-sent", help="record that a drafted price notice was sent")
+    p = sub.add_parser("notice-sent", help="record that a drafted price notice was sent, and its effective date")
     p.add_argument("notice_id")
+    p.add_argument("--effective", required=True,
+                   help="the effective date written in the email (YYYY-MM-DD); at least 7 days after sending")
     p.add_argument("--at", help="send time, ISO-8601 with zone (default now)")
+    p.add_argument("--backdated", action="store_true", help="--at is more than 24 hours ago, deliberately")
     p.set_defaults(fn=cmd_notice_sent)
     p = sub.add_parser("holds", help="list holds and notices")
     p.set_defaults(fn=cmd_holds)
@@ -1864,7 +2321,15 @@ def build_parser():
     p.set_defaults(fn=cmd_check_images)
     p = sub.add_parser("mint-sync-pat", help="bootstrap: root PAT for the sync into the Secret (root without 2FA)")
     p.set_defaults(fn=cmd_mint_sync_pat)
+    p = sub.add_parser("failure-alert", help="record a failed unit run as an alert (systemd OnFailure=)")
+    p.add_argument("--reason", help="short text (no secrets)")
+    p.add_argument("--alert-sink", help="file (default)")
+    p.set_defaults(fn=cmd_failure_alert)
     return ap
+
+
+def _on_sigterm(signum, frame):
+    raise Terminated("terminated by SIGTERM (systemd stop or TimeoutStartSec)")
 
 
 def main(argv=None):
@@ -1875,9 +2340,15 @@ def main(argv=None):
             print("error: --target-base must be http://127.0.0.1:<port> (a port-forward)", file=sys.stderr)
             return 2
         a.target_base = f"http://{u.netloc}"
-    for attr in ("check_keys", "force", "why", "live_images", "alert_sink"):
+    for attr in ("check_keys", "force", "why", "live_images", "alert_sink", "backdated"):
         if not hasattr(a, attr):
             setattr(a, attr, None)
+    if a.force and not (a.why or "").strip():
+        print("error: --force needs --why '<reason>' (it is journaled)", file=sys.stderr)
+        return 2
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         return a.fn(a)
     except (SyncError, nc.ContentError, na.Fatal) as e:
@@ -1887,6 +2358,8 @@ def main(argv=None):
         print(f"error: {getattr(e, 'filename', '') or ''} {e.strerror or e}", file=sys.stderr)
         return 2
     finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
         while _OPEN_STATES:
             _OPEN_STATES.pop().close()
 

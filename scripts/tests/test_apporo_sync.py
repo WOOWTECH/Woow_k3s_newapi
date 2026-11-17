@@ -9,15 +9,18 @@ created from defaults), other options stored raw, ServerAddress deriving the
 passkey rows, channel ids from a sequence (explicit ids honoured), abilities =
 models x groups, PUT /api/channel/ ignoring empty plain strings.
 """
+import base64
 import contextlib
 import copy
 import datetime
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import threading
@@ -40,6 +43,14 @@ SMTP_SECRET = "sk-" + "Z" * 30
 def load_json(path):
     with open(path) as f:
         return json.load(f)
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def zulu(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def read_text(path):
@@ -220,7 +231,7 @@ class FakeNewAPI:
     """The admin API the sync writes through (rc.44 semantics it relies on)."""
 
     def __init__(self, db):
-        self.db, self.requests, self.sessions = db, [], set()
+        self.db, self.requests, self.sessions, self.pats = db, [], set(), {}
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -266,7 +277,10 @@ class FakeNewAPI:
                     return self._send({"success": ok, "data": {"proof_token": "proof-1"} if ok else None})
                 if self.path == "/api/user/access_tokens":
                     ok = self.headers.get("X-Security-Proof") == "proof-1"
-                    return self._send({"success": ok, "data": {"token": PAT, "item": {"token_hint": "nap_...SSSS"}}})
+                    if ok:
+                        fake.pats[7] = PAT
+                    return self._send({"success": ok, "data": {"token": PAT, "item": {"id": 7,
+                                                                                       "token_hint": "nap_...SSSS"}}})
                 if self.path == "/api/channel/":
                     return self._send(fake.add_channel(body))
                 self._send({"success": False}, 404)
@@ -289,6 +303,12 @@ class FakeNewAPI:
                     return self._send({"success": True})
                 if not self._authed():
                     return self._send({"success": False, "message": "unauthorized"}, 401)
+                m = re.fullmatch(r"/api/user/access_tokens/(\d+)", self.path)
+                if m:
+                    ok = self.headers.get("X-Security-Proof") == "proof-1" and int(m.group(1)) in fake.pats
+                    if ok:
+                        del fake.pats[int(m.group(1))]
+                    return self._send({"success": ok, "message": "" if ok else "not found"})
                 m = re.fullmatch(r"/api/channel/(\d+)", self.path)
                 if m and int(m.group(1)) in fake.db.channels:
                     del fake.db.channels[int(m.group(1))]
@@ -400,6 +420,31 @@ class Harness(unittest.TestCase):
     def state_data(self):
         with open(os.path.join(self.state, "holds.json")) as f:
             return json.load(f)
+
+    def save_state(self, st):
+        with open(os.path.join(self.state, "holds.json"), "w") as f:
+            json.dump(st, f)
+
+    def alerts(self):
+        out = []
+        d = os.path.join(self.state, "alerts")
+        if os.path.isdir(d):
+            for name in sorted(os.listdir(d)):
+                with open(os.path.join(d, name)) as f:
+                    out += [json.loads(line) for line in f]
+        return out
+
+    def mr(self, model):
+        return json.loads(self.tgt.options["ModelRatio"]).get(model)
+
+    def send_notice(self, nid, sent_days_ago=10, effective_days_ago=2):
+        """Record a notice as sent long enough ago that its effective date has begun everywhere."""
+        st = self.state_data()
+        st["notices"][nid]["created_at"] = zulu(utcnow() - datetime.timedelta(days=sent_days_ago + 1))
+        self.save_state(st)
+        sent = (utcnow() - datetime.timedelta(days=sent_days_ago)).isoformat()
+        effective = (utcnow() - datetime.timedelta(days=effective_days_ago)).date().isoformat()
+        return self.run_cli("notice-sent", nid, "--effective", effective, "--at", sent, "--backdated")
 
 
 # ------------------------------------------------------------------ tests
@@ -616,14 +661,8 @@ class DailyTest(Harness):
         self.assertEqual(rc, 0, out)
         self.assertEqual([r for r in self.api.requests[before:] if r[0] != "DELETE"], [])
         self.assertEqual(len(self.state_data()["notices"]), 1)
-        # the owner sends the notice; 8 days later the increase applies
-        sent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=8)).isoformat()
-        st = self.state_data()
-        st["notices"][nid]["created_at"] = (datetime.datetime.now(datetime.timezone.utc)
-                                            - datetime.timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        with open(os.path.join(self.state, "holds.json"), "w") as f:
-            json.dump(st, f)
-        rc, out = self.run_cli("notice-sent", nid, "--at", sent)
+        # the owner sends the notice; once its effective date has begun everywhere, the increase applies
+        rc, out = self.send_notice(nid)
         self.assertEqual(rc, 0, out)
         rc, out = self.run_cli("apply")
         self.assertEqual(rc, 0, out)
@@ -638,7 +677,10 @@ class DailyTest(Harness):
         self.run_cli("daily", "--apply")
         st = self.state_data()
         (h,) = [h for h in st["holds"].values()]
-        rc, out = self.run_cli("notice-sent", h["notice_id"])                    # sent now
+        earliest = aps.earliest_effective(utcnow(), 7)
+        rc, out = self.run_cli("notice-sent", h["notice_id"], "--effective", earliest.isoformat())   # sent now
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.state_data()["holds"][h["id"]]["eligible_at"], zulu(aps.effective_start(earliest)))
         self.run_cli("apply")
         self.assertEqual(json.loads(self.tgt.options["CacheRatio"])["openai/gpt-6-luna"], 0.1)
         self.assertEqual(self.state_data()["holds"][h["id"]]["state"], "notified")
@@ -655,15 +697,25 @@ class DailyTest(Harness):
         states = sorted(h["state"] for h in self.state_data()["holds"].values())
         self.assertEqual(states, ["cancelled", "superseded"])
 
-    def test_removing_a_model_and_its_price_together_is_automatic(self):
+    def test_a_taken_off_models_price_is_kept_for_the_window_then_removed(self):
         self.src.channels[1]["models"] = self.src.channels[1]["models"].replace(",openai/gpt-6-luna", "")
         self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", None)
         self.src.channels[1]["test_model"] = "anthropic/claude-haiku-5.5"
         rc, out = self.run_cli("daily", "--apply")
         self.assertEqual(rc, 0, out)
-        self.assertNotIn("openai/gpt-6-luna", json.loads(self.tgt.options["ModelRatio"]))
-        self.assertNotIn("openai/gpt-6-luna", self.tgt.channels[1]["models"])
+        self.assertNotIn("openai/gpt-6-luna", self.tgt.channels[1]["models"])       # route removed at once
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)                     # price kept (re-listing)
         self.assertIn("ALERT [action] channel 1 model openai/gpt-6-luna", out)
+        self.assertIn("ALERT [info] KEPT ModelRatio[openai/gpt-6-luna]", out)
+        rc, out = self.run_cli("daily", "--apply")                                     # still kept, no write
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)
+        st = self.state_data()                                                          # 31 days later
+        st["served"]["openai/gpt-6-luna"]["last_seen"] = zulu(utcnow() - datetime.timedelta(days=31))
+        self.save_state(st)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.mr("openai/gpt-6-luna"))
+        self.assertIn("AUTO  ModelRatio[openai/gpt-6-luna]: not offered on the target", out)
 
     def test_removing_only_the_price_of_a_served_model_is_alert_only(self):
         self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", None)
@@ -778,17 +830,483 @@ class ImagesTest(unittest.TestCase):
 
 class NoticeSentTest(Harness):
     def test_rejects_unknown_and_future_times(self):
-        rc, out = self.run_cli("notice-sent", "N-19990101-1")
+        rc, out = self.run_cli("notice-sent", "N-19990101-1", "--effective", "2026-12-01")
         self.assertEqual(rc, 2)
         self.replay()
         self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
         self.run_cli("daily", "--apply")
         nid = next(iter(self.state_data()["notices"]))
         future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()
-        rc, out = self.run_cli("notice-sent", nid, "--at", future)
+        rc, out = self.run_cli("notice-sent", nid, "--effective", "2099-01-01", "--at", future)
         self.assertEqual(rc, 2)
         self.assertIn("future", out)
 
+
+
+# ------------------------------------------------- review round 2 (PR #45)
+
+class OfferedModelsTest(Harness):
+    """A price matters while a model is offered: any channel status, and for served_history_days after it left."""
+
+    def setUp(self):
+        super().setUp()
+        self.replay()
+
+    def test_a_disabled_channel_still_offers_its_models(self):
+        self.tgt.channels[1]["status"] = 3                                   # auto-disabled by upstream errors
+        self.src.set_map_entry("ModelRatio", "anthropic/claude-sonnet-5.5", 1.5)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.mr("anthropic/claude-sonnet-5.5"), 1 / 30)      # held, not applied
+        self.assertIn("HOLD  ModelRatio[anthropic/claude-sonnet-5.5]: price increase", out)
+        self.tgt.channels[1]["status"] = 1                                   # rc.44 re-enables it
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.mr("anthropic/claude-sonnet-5.5"), 1 / 30)
+        self.assertEqual([h["state"] for h in self.state_data()["holds"].values()], ["pending-notice"])
+
+    def test_relisting_a_recent_model_at_a_higher_price_is_held(self):
+        ch1 = self.src.channels[1]
+        ch1["models"] = ch1["models"].replace(",openai/gpt-6-luna", "")
+        ch1["test_model"] = "anthropic/claude-haiku-5.5"
+        self.run_cli("daily", "--apply")                                       # day 1: taken off
+        self.assertNotIn("openai/gpt-6-luna", self.tgt.channels[1]["models"])
+        ch1["models"] += ",openai/gpt-6-luna"                                   # day 2: back at +20 %
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("openai/gpt-6-luna", self.tgt.channels[1]["models"])      # route back at once
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)               # at the old price
+        (h,) = self.state_data()["holds"].values()
+        self.assertEqual(h["subject"], ["map", "ModelRatio", "openai/gpt-6-luna"])
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| `openai/gpt-6-luna` | input | 0.106667 | 0.128 | +20.0% |", notice)
+
+    def test_taking_off_and_raising_then_relisting_is_held(self):
+        ch1 = self.src.channels[1]
+        ch1["models"] = ch1["models"].replace(",openai/gpt-6-luna", "")
+        ch1["test_model"] = "anthropic/claude-haiku-5.5"
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.1)          # same day: off and +100 %
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertIn("KEPT  ModelRatio[openai/gpt-6-luna]", out)
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)
+        ch1["models"] += ",openai/gpt-6-luna"                                   # next day: back
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)
+        self.assertIn("HOLD  ModelRatio[openai/gpt-6-luna]: price increase", out)
+
+    def test_a_notified_hold_survives_a_short_delisting(self):
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
+        self.run_cli("daily", "--apply")
+        (h,) = self.state_data()["holds"].values()
+        ch1 = self.src.channels[1]
+        ch1["models"] = ch1["models"].replace(",openai/gpt-6-luna", "")
+        ch1["test_model"] = "anthropic/claude-haiku-5.5"
+        self.run_cli("daily", "--apply")                                       # taken off: hold kept
+        rc, out = self.send_notice(h["notice_id"])
+        self.assertEqual(rc, 0, out)
+        self.run_cli("daily", "--apply")
+        self.assertEqual(self.state_data()["holds"][h["id"]]["state"], "notified")
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)
+        ch1["models"] += ",openai/gpt-6-luna"                                   # back: the matured hold applies
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.06 / 30)
+        self.assertEqual(self.state_data()["holds"][h["id"]]["state"], "applied")
+
+    def test_the_first_listing_of_a_model_takes_the_new_price(self):
+        self.src.set_map_entry("ModelRatio", "gpt-4", 20)                         # priced, never offered
+        self.src.channels[1]["models"] += ",gpt-4"
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.mr("gpt-4"), 20 / 30)
+        self.assertIn("gpt-4", self.tgt.channels[1]["models"])
+        self.assertEqual(self.state_data()["holds"], {})
+
+    def test_the_notice_shows_prices_after_this_runs_decreases(self):
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)         # held
+        self.src.set_map_entry("CacheRatio", "openai/gpt-6-luna", 0.05)         # decrease, written today
+        self.run_cli("daily", "--apply")
+        self.assertEqual(json.loads(self.tgt.options["CacheRatio"])["openai/gpt-6-luna"], 0.05)
+        notice = read_text(next(iter(self.state_data()["notices"].values()))["draft"])
+        self.assertIn("| `openai/gpt-6-luna` | cache read | 0.005333 | 0.0064 | +20.0% |", notice)
+
+
+class BillingExpressionTest(Harness):
+    """billing_setting.* and rc.44's built-in expressions are real US$ prices: never copied by the sync."""
+
+    def test_replay_refuses_billing_expressions(self):
+        self.src.set_map_entry("billing_setting.billing_mode", "anthropic/claude-sonnet-5.5", "tiered_expr")
+        self.src.set_map_entry("billing_setting.billing_expr", "anthropic/claude-sonnet-5.5", "p * 3 + c * 15")
+        rc, out = self.run_cli("replay", "--yes-bootstrap", auth="password")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("replay refused: billing-expression: billing_setting.billing_expr", out)
+        self.assertEqual(self.tgt.channels, {})
+        rc, out = self.run_cli("plan", "--bootstrap")
+        self.assertIn("ALERT billing-expression: billing_setting.billing_mode", out)
+
+    def test_a_new_expression_model_is_alert_only(self):
+        self.replay()
+        s = self.src
+        s.channels[1]["models"] += ",x/expr-model"
+        s.set_map_entry("billing_setting.billing_mode", "x/expr-model", "tiered_expr")
+        s.set_map_entry("billing_setting.billing_expr", "x/expr-model", "p * 3 + c * 15")
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(self.tgt.options["billing_setting.billing_expr"]), {})
+        self.assertNotIn("x/expr-model", self.tgt.channels[1]["models"])
+        self.assertIn("ALERT billing_setting.billing_expr[x/expr-model]: billing expressions are real US$", out)
+        self.assertIn("ALERT channel 1 model x/expr-model: x/expr-model is billed by a billing expression", out)
+
+    def test_an_offered_models_expression_change_is_alert_only(self):
+        self.replay()
+        self.src.set_map_entry("billing_setting.billing_mode", "anthropic/claude-sonnet-5.5", "tiered_expr")
+        self.src.set_map_entry("billing_setting.billing_expr", "anthropic/claude-sonnet-5.5", "p * 3 + c * 15")
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(json.loads(self.tgt.options["billing_setting.billing_mode"]), {})
+        self.assertEqual(self.state_data()["holds"], {})
+        self.assertIn("ALERT billing_setting.billing_mode[anthropic/claude-sonnet-5.5]", out)
+
+    def test_a_builtin_expression_model_without_a_ratio_is_not_routed(self):
+        self.replay()
+        self.src.channels[1]["models"] += ",gpt-6-astra"                          # rc.44 built-in US$ expression
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertNotIn("gpt-6-astra", self.tgt.channels[1]["models"].split(","))
+        self.assertIn("ALERT channel 1 model gpt-6-astra: gpt-6-astra is billed by a billing expression", out)
+        self.src.set_map_entry("ModelRatio", "gpt-6-astra", 3)                    # priced: routed normally
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertIn("gpt-6-astra", self.tgt.channels[1]["models"].split(","))
+        self.assertEqual(self.mr("gpt-6-astra"), 3 / 30)
+
+    def test_the_notice_marks_expression_models_by_hand(self):
+        self.replay()
+        st = {"options": dict(self.tgt.options), "channels": {}, "abilities": []}
+        st["options"]["billing_setting.billing_mode"] = nc.go_json({"openai/gpt-6-luna": "tiered_expr"})
+        it = aps.item("map", "hold", key="ModelRatio", entry="openai/gpt-6-luna", old=0.05 / 30, new=0.06 / 30,
+                      hold_id="H-1")
+        text = aps.draft_notice("N-1", [it], st, nc.load_profile(PROFILE), utcnow(), 7,
+                                {"openai/gpt-6-luna": {"default"}})
+        self.assertIn("| `openai/gpt-6-luna` | billing expression | (by hand) | (by hand) | |", text)
+        self.assertIn("BY HAND: openai/gpt-6-luna", text)
+        text = aps.draft_notice("N-2", [it], st, nc.load_profile(PROFILE), utcnow(), 7, {})
+        self.assertIn("(BY HAND: the held change(s) ModelRatio[openai/gpt-6-luna]", text)
+
+
+class NoticeEffectiveDateTest(Harness):
+    def setUp(self):
+        super().setUp()
+        self.replay()
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
+        self.run_cli("daily", "--apply")
+        self.nid = next(iter(self.state_data()["notices"]))
+
+    def test_the_effective_date_must_be_seven_days_after_sending(self):
+        early = (utcnow() + datetime.timedelta(days=6)).date().isoformat()
+        rc, out = self.run_cli("notice-sent", self.nid, "--effective", early)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("earliest effective date is " + aps.earliest_effective(utcnow(), 7).isoformat(), out)
+        self.assertIsNone(self.state_data()["notices"][self.nid]["sent_at"])
+
+    def test_a_later_effective_date_is_honoured(self):
+        later = (utcnow() + datetime.timedelta(days=14)).date()
+        rc, out = self.run_cli("notice-sent", self.nid, "--effective", later.isoformat())
+        self.assertEqual(rc, 0, out)
+        (h,) = self.state_data()["holds"].values()
+        self.assertEqual(h["eligible_at"], zulu(aps.effective_start(later)))
+        self.assertEqual(h["effective_date"], later.isoformat())
+        self.run_cli("apply")
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)                 # not before the date
+
+    def test_backdating_needs_a_flag_and_a_notice_is_recorded_once(self):
+        st = self.state_data()
+        st["notices"][self.nid]["created_at"] = zulu(utcnow() - datetime.timedelta(days=5))
+        self.save_state(st)
+        sent = (utcnow() - datetime.timedelta(days=3)).isoformat()
+        effective = (utcnow() + datetime.timedelta(days=5)).date().isoformat()
+        rc, out = self.run_cli("notice-sent", self.nid, "--effective", effective, "--at", sent)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--backdated", out)
+        rc, out = self.run_cli("notice-sent", self.nid, "--effective", effective, "--at", sent, "--backdated")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("notice-sent", self.nid, "--effective", effective)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("already recorded", out)
+
+    def test_aoe_start_and_earliest_date(self):
+        sent = datetime.datetime(2026, 11, 17, 2, 0, tzinfo=datetime.timezone.utc)     # 10:00 Taipei
+        self.assertEqual(aps.earliest_effective(sent, 7), datetime.date(2026, 11, 24))
+        self.assertEqual(aps.effective_start(datetime.date(2026, 11, 24)),
+                         datetime.datetime(2026, 11, 24, 12, 0, tzinfo=datetime.timezone.utc))
+        late = datetime.datetime(2026, 11, 17, 13, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(aps.earliest_effective(late, 7), datetime.date(2026, 11, 25))
+
+    def test_the_profile_cannot_shorten_the_notice(self):
+        p = load_json(PROFILE)
+        for bad in (0, 3, 6, "7", 7.5):
+            p["price_increase_notice_days"] = bad
+            with self.assertRaises(nc.ContentError):
+                nc.validate_profile(p)
+
+
+class ReplayGuardTest(Harness):
+    def test_replay_is_refused_on_a_synced_target_even_with_a_fresh_state_dir(self):
+        self.replay()
+        self.run_cli("apply")
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
+        self.run_cli("daily", "--apply")                                       # hold opened
+        other = os.path.join(self.tmp, "other-state")
+        out_io = io.StringIO()
+        with contextlib.redirect_stdout(out_io), contextlib.redirect_stderr(out_io):
+            rc = aps.main(["--state-dir", other, "--target-base", self.api.base, "--auth", "password",
+                           "replay", "--yes-bootstrap"])
+        self.assertEqual(rc, 2, out_io.getvalue())
+        self.assertIn("not a fresh install", out_io.getvalue())
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.05 / 30)
+
+    def test_force_needs_why_and_shows_what_it_overrides(self):
+        self.replay()
+        self.src.set_map_entry("ModelRatio", "openai/gpt-6-luna", 0.06)
+        rc, out = self.run_cli("replay", "--yes-bootstrap", "--force", auth="password")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--force needs --why", out)
+        rc, out = self.run_cli("replay", "--yes-bootstrap", "--force", "--why", "test: resume", auth="password")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("OVERRIDE hold ModelRatio[openai/gpt-6-luna]", out)
+        self.assertEqual(self.mr("openai/gpt-6-luna"), 0.06 / 30)
+
+    def test_plan_bootstrap_after_a_replay_is_empty(self):
+        self.replay()
+        rc, out = self.run_cli("plan", "--bootstrap")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("plan: 0 auto, 0 hold", out)
+
+
+class FailureTest(Harness):
+    def setUp(self):
+        super().setUp()
+        self.replay()
+
+    def test_an_uncleared_field_is_alert_only(self):
+        self.src.channels[1]["test_model"] = None
+        rc1, out1 = self.run_cli("daily", "--apply")
+        rc2, out2 = self.run_cli("daily", "--apply")
+        self.assertEqual((rc1, rc2), (0, 0), out1 + out2)
+        self.assertIn("ALERT channel 1 test_model: rc.44's PUT /api/channel/ cannot clear this field", out2)
+        self.assertNotIn("LEFT", out2)
+
+    def test_a_failed_write_is_an_alert_and_prices_go_last(self):
+        self.src.set_map_entry("ModelRatio", "gpt-4", None)                       # never offered: removed (phase C)
+        self.src.set_map_entry("ModelRatio", "anthropic/claude-sonnet-5.5", 0.8)  # decrease (phase A)
+        self.src.channels[1]["name"] = "renamed"                                  # channel update (phase B)
+        orig = self.api.update_channel
+        self.api.update_channel = lambda body: {"success": False, "message": "database is locked"}
+        try:
+            rc, out = self.run_cli("daily", "--apply")
+        finally:
+            self.api.update_channel = orig
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.mr("anthropic/claude-sonnet-5.5"), 0.8 / 30)       # phase A written
+        self.assertEqual(self.mr("gpt-4"), 15 / 30)                               # phase C not reached
+        self.assertIn("LEFT channel 1 name", out)
+        self.assertIn("LEFT ModelRatio[gpt-4]", out)
+        (al,) = [al for al in self.alerts() if al["title"].startswith("apply failed")]
+        self.assertEqual(al["severity"], "action")
+        self.assertIn("database is locked", al["title"])
+        self.assertIn("option ModelRatio", al["details"][1])
+        self.assertIn("ModelRatio[gpt-4]", al["details"][2])
+        rc, out = self.run_cli("daily", "--apply")                                # the next run finishes it
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(self.mr("gpt-4"))
+        self.assertEqual(self.tgt.channels[1]["name"], "renamed")
+
+    def test_a_broken_connection_is_an_unknown_outcome_not_a_crash(self):
+        class Broken:
+            def open(self, req, timeout=None):
+                raise http.client.IncompleteRead(b"")
+        self.addCleanup(setattr, aps.na, "_OPENER", aps.na._OPENER)
+        client = aps.na.Client(self.api.base, token=PAT)
+        aps.na._OPENER = Broken()
+        ok, msg, ans = aps.api(client, "PUT", "/api/option/", {"key": "RetryTimes", "value": "3"})
+        self.assertEqual((ok, ans), (False, {}))
+        self.assertIn("IncompleteRead (outcome unknown)", msg)
+
+    def test_an_unexpected_exception_is_an_alert_and_the_journal_says_so(self):
+        self.src.options["RetryTimes"] = "3"
+        self.src.set_map_entry("ModelRatio", "anthropic/claude-sonnet-5.5", 0.8)
+        real = aps.api
+        calls = {"n": 0}
+
+        def flaky(client, method, path, body=None, headers=None):
+            if method == "PUT" and path == "/api/option/":
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise ValueError("unexpected")
+            return real(client, method, path, body, headers)
+        aps.api = flaky
+        self.addCleanup(setattr, aps, "api", real)
+        with self.assertRaises(ValueError):
+            self.run_cli("daily", "--apply")
+        titles = [al["title"] for al in self.alerts()]
+        self.assertIn("daily sync failed", titles)
+        jdir = os.path.join(self.state, "journal")
+        last = sorted(n for n in os.listdir(jdir) if "-apply-" in n)[-1]
+        with open(os.path.join(jdir, last)) as f:
+            end = [json.loads(line) for line in f][-1]
+        self.assertEqual((end["step"], end["ok"], end["error"]), ("end", False, "ValueError"))
+        self.assertEqual(self.state_data()["runs"][-1]["error"], "ValueError")
+
+    def test_sigterm_is_reported(self):
+        real = aps.plan_all
+
+        def killed(*args, **kw):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return real(*args, **kw)
+        aps.plan_all = killed
+        self.addCleanup(setattr, aps, "plan_all", real)
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("SIGTERM", out)
+        self.assertIn("daily sync failed", [al["title"] for al in self.alerts()])
+        self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+
+    def test_failure_alert_command(self):
+        rc, out = self.run_cli("failure-alert", "--reason", "apporo-newapi-sync.service: timeout")
+        self.assertEqual(rc, 0, out)
+        (al,) = [al for al in self.alerts() if al["title"] == "daily sync unit failed"]
+        self.assertIn("timeout", al["details"][0])
+
+
+class CredentialTest(Harness):
+    CF_SECRET = "0123456789abcdef" * 4
+    BEARER = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+
+    def test_a_channel_credential_is_never_read_out_copied_or_printed(self):
+        self.replay()
+        self.src.channels[1]["header_override"] = json.dumps({"CF-Access-Client-Secret": self.CF_SECRET,
+                                                              "Authorization": "Bearer " + self.BEARER})
+        texts = []
+        for args in (("plan",), ("plan", "--json"), ("daily", "--apply"), ("verify",)):
+            rc, out = self.run_cli(*args)
+            texts.append(out)
+        texts.append(json.dumps(self.alerts()))
+        for text in texts:
+            self.assertNotIn(self.CF_SECRET[:24], text)
+            self.assertNotIn(self.BEARER[:20], text)
+        self.assertIn("source-channel-unsafe: channel 1", texts[0])
+        self.assertIsNone(self.tgt.channels[1]["header_override"])
+        snap = nc.read_snapshot(FakePsql(self.src), nc.load_profile(PROFILE))
+        self.assertEqual(snap["unsafe_channels"], {1: ["header_override"]})
+        self.assertNotIn(self.CF_SECRET, json.dumps(snap))
+
+    def test_non_printable_channel_fields_are_masked(self):
+        self.replay()
+        self.src.channels[4]["param_override"] = '{"max_tokens": 2048, "stop": ["zz-unique-marker"]}'
+        for args in (("plan",), ("plan", "--json"), ("daily", "--apply"), ("verify", "--strict")):
+            rc, out = self.run_cli(*args)
+            self.assertNotIn("zz-unique-marker", out, args)
+        self.assertNotIn("zz-unique-marker", json.dumps(self.alerts()))
+        rc, out = self.run_cli("plan")
+        self.assertIn("ALERT channel 4 param_override", out)
+        self.assertIn("sha256:", out)
+
+    def test_the_real_shapes_are_not_flagged(self):
+        db = FakeDB().load_woow()
+        self.assertEqual(nc.read_snapshot(FakePsql(db), nc.load_profile(PROFILE))["unsafe_channels"], {})
+        for field, value in (("param_override", '{"max_tokens": 2048, "budget_tokens": 1000}'),
+                             ("header_override", '{"anthropic-beta": "prompt-caching-2024-07-31"}'),
+                             ("model_mapping", '{"gpt-4": "Qwen3-Coder-480B-A35B-Instruct-FP8"}'),
+                             ("param_override", '{"system": "basic instructions; token budget is small"}'),
+                             ("remark", "LiteLLM key alias newapi-litellm (US$5 budget)")):
+            self.assertFalse(nc.channel_field_unsafe(field, value), (field, value))
+        for field, value in (("header_override", '{"x-api-key": "abc"}'), ("header_override", '{"X": "Bearer abcdefgh1"}'),
+                             ("setting", '{"cookie": "a=b"}'), ("base_url", "https://x.example/v1?api_key=abc"),
+                             ("other", "Authorization: Basic Zm9vOmJhcg=="), ("remark", "sk-" + "Q" * 17)):
+            self.assertTrue(nc.channel_field_unsafe(field, value), (field, value))
+
+    def test_short_keys_are_redacted(self):
+        key = "sk-" + "Q" * 16
+        self.assertTrue(nc.UPSTREAM_KEY_RE.fullmatch(key))
+        self.assertEqual(nc.redact("echo " + key), "echo [redacted]")
+
+
+class SQLGuardBypassTest(unittest.TestCase):
+    BYPASSES = (
+        "SELECT * FROM channels;", "SELECT jsonb_agg(to_jsonb(c)) FROM channels c;",
+        "SELECT row_to_json(channels) FROM channels;", "SELECT jsonb_agg(c.*) FROM channels c;",
+        "SELECT id FROM public.users;", 'SELECT id FROM "users" u;', "SELECT 1 FROM options, tokens t;",
+        "SELECT 1 FROM setups, two_fas x;", "SELECT pg_read_file('/etc/hostname');", "SELECT 1 \\! id;",
+        "SELECT 1 \\o /tmp/x;", "SELECT 1 \\gexec;", "SELECT jsonb_agg(channels) FROM channels;",
+        "SELECT 1 FROM channels JOIN tokens ON true;", "SELECT E'x' FROM options;", "SELECT $$x$$ FROM options;",
+        "SELECT 1 FROM options -- c\n;", "SELECT :foo FROM options;", "SELECT set_config('a', 'b', false);",
+        "SELECT id FROM channels AS c;", "SELECT count(id) FROM channels;", 'SELECT "key" FROM channels;',
+        "SELECT 1 FROM options UNION SELECT key FROM channels;", "SELECT lo_import('/x');",
+        "SELECT id FROM channels WHERE id IN (SELECT id FROM tokens);",
+    )
+
+    def test_whole_rows_aliases_joins_meta_commands_and_functions_are_refused(self):
+        for bad in self.BYPASSES:
+            with self.assertRaises(nc.ContentError, msg=bad):
+                nc.check_read_only_sql(nc.READ_ONLY_PREAMBLE + bad)
+
+    def test_literals_cannot_smuggle_anything(self):
+        for keys in (["it's"], ["a;b"], ["--x"], ["$$"], ["\\\\! id"], ["*"], ["users"]):
+            nc.check_read_only_sql(nc.sql_content(keys, True))
+
+    def test_pinned_sql(self):
+        sql = nc.READ_ONLY_PREAMBLE + "SELECT 1;"
+        nc.check_pinned_sql(sql, nc.sha256_text(sql))
+        with self.assertRaises(nc.ContentError):
+            nc.check_pinned_sql(sql + " ", nc.sha256_text(sql))
+
+
+class ExportTargetTest(Harness):
+    def test_export_refuses_the_repo_through_a_symlink(self):
+        link = os.path.join(self.tmp, "repo-link")
+        os.symlink(REPO, link)
+        target = os.path.join(link, "snap-test.json")
+        rc, out = self.run_cli("export", "--out", target)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("outside the repository", out)
+        self.assertFalse(os.path.exists(os.path.join(REPO, "snap-test.json")))
+
+
+class MintPatTest(Harness):
+    def setUp(self):
+        super().setUp()
+        self.replay()
+        self.written = []
+        self.addCleanup(setattr, aps, "SECRET_WRITER", None)
+
+    def test_the_pat_goes_into_the_secret(self):
+        def writer(ns, name, manifest):
+            self.written.append((ns, name, manifest))
+            return True, "created"
+        aps.SECRET_WRITER = writer
+        rc, out = self.run_cli("mint-sync-pat")
+        self.assertEqual(rc, 0, out)
+        ((ns, name, manifest),) = self.written
+        self.assertEqual((ns, name), ("new-api-apporo", "newapi-sync-pat"))
+        self.assertEqual(base64.b64decode(manifest["data"]["token"]).decode(), PAT)
+        self.assertIn(7, self.api.pats)
+
+    def test_a_secret_write_failure_revokes_the_new_pat(self):
+        aps.SECRET_WRITER = lambda ns, name, manifest: (False, "kubectl create exit 1")
+        rc, out = self.run_cli("mint-sync-pat")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("was revoked", out)
+        self.assertEqual(self.api.pats, {})
+        self.assertIn(("DELETE", "/api/user/access_tokens/7", None), self.api.requests)
+
+
+class TemplateTest(unittest.TestCase):
+    def test_the_daily_templates_default_to_report(self):
+        script = read_text(os.path.join(REPO, "scripts", "apporo-sync-daily.sh"))
+        self.assertIn('${APPORO_SYNC_MODE:-report}', script)
+        self.assertNotIn("APPORO_SYNC_MODE:-apply", script)
+        env = read_text(os.path.join(REPO, "deploy", "apporo-sync", "env.example"))
+        self.assertIn("\nAPPORO_SYNC_MODE=report\n", env)
+        cron = read_text(os.path.join(REPO, "deploy", "apporo-sync", "crontab.example"))
+        self.assertIn("umask 077", cron)
+        self.assertIn("mkdir -p", cron)
 
 if __name__ == "__main__":
     unittest.main()

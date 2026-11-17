@@ -1,0 +1,12 @@
+# systemd *user* unit (template; not installed by this repo): OnFailure= of
+# apporo-newapi-sync.service. Records the failure in the sync's alert channel
+# (scripts/apporo_sync.py failure-alert). If APPORO_SYNC_STATE_DIR in the env
+# file is not the default, use the same directory here (systemd does not read
+# that shell file). docs/APPORO-SYNC.md 〈排程〉
+[Unit]
+Description=Record a failed Apporo New API daily sync as an alert
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 %h/woow-repos/Woow_k3s_newapi/scripts/apporo_sync.py --state-dir %h/.local/state/apporo-newapi-sync failure-alert --reason "apporo-newapi-sync.service failed (crash, kill or timeout)"

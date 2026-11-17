@@ -13,10 +13,20 @@ What is read (and nothing else):
   - channels: every column except `key` and the counters (used_quota,
     balance, test_time, response_time, created_time, balance_updated_time).
     For the *target* only, sha256(key) truncated to 16 hex characters, to
-    compare with the Apporo Secret without reading the key.
+    compare with the Apporo Secret without reading the key. A field that may
+    hold a credential (a credential-like member name in header_override,
+    param_override, setting ..., an auth scheme, a long hex or random-looking
+    token, URL user info or a key-like query parameter) is replaced by
+    "[redacted]" as soon as it is read: such a channel is never copied,
+    printed or exported.
   - abilities, setups.version and channels_id_seq.
   Never: users, tokens, user_access_tokens, two_fas, passkeys, sessions,
   logs, quota_data, audit_logs or any other customer or identity table.
+
+The read-only SQL is checked against a whitelist (check_read_only_sql): the
+preamble, one SELECT over options/channels/abilities/setups/channels_id_seq,
+whitelisted functions only, no *, alias, join, quoted or schema-qualified
+table, comment, psql meta-command or variable.
 
 rc.44 facts this module depends on (docs/APPORO-SYNC.md):
   - The 11 pricing options are stored as Go json.Marshal output
@@ -31,6 +41,7 @@ import math
 import os
 import re
 import subprocess
+import urllib.parse
 
 NEWAPI_VERSION = "v1.0.0-rc.44"
 
@@ -69,9 +80,10 @@ OPTION_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 # oidc.client_secret, discord.client_secret.
 SECRET_KEY_RE = re.compile(r"(secret|token|password|passwd|private|credential|cert|apikey|api_key|webhook)"
                            r"|key$", re.IGNORECASE)
-# Values that look like credentials (newapi_admin.SECRET_VALUE_RE plus PEM and URL user info).
+# Values that look like credentials (newapi_admin.SECRET_VALUE_RE plus PEM and URL user info; the
+# sk- length bound equals UPSTREAM_KEY_RE, so every key the tool accepts is also redacted).
 SECRET_VALUE_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{20,}|nap_[A-Za-z0-9_-]{16,})"
+    r"(?<![A-Za-z0-9])(?:sk-[A-Za-z0-9_-]{16,}|nap_[A-Za-z0-9_-]{16,})"
     r"|eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@")
@@ -96,6 +108,35 @@ CHANNEL_COPY_FIELDS = (
     "priority", "weight", "auto_ban", "tag", "test_model", "openai_organization", "other",
     "other_info", "setting", "param_override", "header_override", "remark", "settings",
 )
+# Channel fields whose values may be printed (alerts, plan, verify). Every other
+# field is shown only as a sha256 prefix and a length: header_override,
+# param_override, setting, settings, other, base_url, remark ... can carry a
+# credential that no value pattern recognises.
+CHANNEL_PRINTABLE_FIELDS = frozenset(("name", "models", "group", "test_model", "type", "status", "priority",
+                                      "weight", "auto_ban", "tag"))
+# Channel fields that hold JSON (headers, request overrides, settings): their member
+# names are checked, not only their values.
+CHANNEL_JSON_FIELDS = ("header_override", "param_override", "setting", "settings", "other", "other_info",
+                       "model_mapping", "status_code_mapping")
+# A member name (header or parameter) that carries a credential. `max_tokens`,
+# `budget_tokens` and the like do not match (a trailing `token` must stand alone).
+CHANNEL_SECRET_NAME_RE = re.compile(
+    r"(authorization|cookie|secret|password|passwd|credential|private[_-]?key|api[_-]?key|access[_-]?key|"
+    r"auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|id[_-]?token|bearer|signature|"
+    r"^cf-access-|(^|[_.-])token$|(^|[_.-])key$|^key$|^token$)", re.IGNORECASE)
+# Values that carry a credential without a recognisable prefix (a backstop: member
+# names are the main signal). A whole value that is an HTTP auth scheme plus a
+# credential; a long hex string (e.g. a Cloudflare Access client secret); a long
+# run without separators that mixes upper case, lower case and digits (random
+# tokens; model names and URL paths are split by - . / and are rarely mixed case).
+AUTH_SCHEME_VALUE_RE = re.compile(r"(?i)^\s*(?:bearer|basic|token|digest)\s+[A-Za-z0-9._~+/=-]{8,}\s*$")
+OPAQUE_SECRET_RE = re.compile(
+    r"(?<![A-Za-z0-9])[0-9a-fA-F]{32,}(?![A-Za-z0-9])"
+    r"|(?<![A-Za-z0-9+_=])(?=[A-Za-z0-9+_]*[A-Z])(?=[A-Za-z0-9+_]*[a-z])(?=[A-Za-z0-9+_]*[0-9])"
+    r"[A-Za-z0-9+_]{24,}={0,2}(?![A-Za-z0-9+_=])")
+# Fields that never hold free text a value pattern could misread (model lists, names).
+_CHANNEL_NAME_FIELDS = frozenset(("name", "models", "group", "test_model", "tag", "type", "priority", "weight",
+                                  "auto_ban", "status"))
 ABILITY_COLUMNS = ("group", "model", "channel_id", "enabled", "priority", "weight", "tag")
 # Tables an export must never touch (unit-tested against every SQL string).
 FORBIDDEN_TABLES = (
@@ -258,22 +299,79 @@ def sql_literal(text):
     return "'" + text.replace("'", "''") + "'"
 
 
+# The read-only SQL the tool sends is built from these parts only (a whitelist:
+# anything else, even if harmless, is refused). Whole-row references
+# (to_jsonb(c), row_to_json(channels), c.*), aliases, comma joins,
+# schema-qualified or quoted table names, psql meta-commands (backslash) and
+# variables, comments, dollar quoting and escape strings are all refused.
+_SQL_TABLES = ("options", "channels", "abilities", "setups", "channels_id_seq")
+_SQL_FUNCTIONS = frozenset(("jsonb_build_object", "jsonb_agg", "jsonb_build_array", "coalesce", "encode", "sha256",
+                            "convert_to", "left", "length"))
+_SQL_KEYWORDS_BEFORE_PAREN = frozenset(("in",))
+_SQL_QUOTED = frozenset(('"group"', '"C"'))
+_SQL_FROM_RE = re.compile(r"\b(from|join)\b")
+_SQL_FROM_TARGET_RE = re.compile(r"\s+(" + "|".join(_SQL_TABLES) + r")\b\s*(\)|;|where\b|order\b|limit\b|$)")
+_SQL_TABLE_RE = re.compile(r"\b(" + "|".join(_SQL_TABLES + FORBIDDEN_TABLES) + r")\b")
+_SQL_CALL_RE = re.compile(r"\b([a-z_][a-z0-9_$]*)\s*\(")
+_KEY_CONTEXTS = (
+    "jsonb_agg(key order by key collate",      # option key names
+    "jsonb_build_array(key, value,",           # option rows
+    "order by key collate",
+    "where key in (",
+    "sha256(convert_to(key, ''))",             # channel key fingerprint (literal stripped)
+    "length(key)",
+)
+
+
 def check_read_only_sql(sql):
-    """The only SQL this module sends: the read-only preamble, then one SELECT."""
-    if not sql.startswith(READ_ONLY_PREAMBLE):
+    """The only SQL this module sends: the read-only preamble, then one SELECT built from a whitelist."""
+    if not isinstance(sql, str) or not sql.startswith(READ_ONLY_PREAMBLE):
         raise ContentError("SQL must start with SET default_transaction_read_only = on")
     body = sql[len(READ_ONLY_PREAMBLE):]
+    if "\x00" in body:
+        raise ContentError("NUL in SQL")
     # Literals (option keys) may contain anything; check the statement shape without them.
+    # Only plain '...' literals (quotes doubled) exist in the generated SQL: E'..', U&'..'
+    # and $$..$$ are refused below, so a literal cannot hide a quote.
     bare = re.sub(r"'(?:[^']|'')*'", "''", body)
-    if not bare.lstrip().upper().startswith("SELECT ") or bare.count(";") != 1 or not bare.rstrip().endswith(";"):
+    lowered = bare.lower()
+    if not lowered.lstrip().startswith("select ") or bare.count(";") != 1 or not bare.rstrip().endswith(";"):
         raise ContentError("SQL must be exactly one SELECT statement")
+    if "\\" in bare:
+        raise ContentError("SQL contains a backslash outside a literal (psql meta-command)")
+    if "$" in bare or "--" in bare or "/*" in bare:
+        raise ContentError("SQL contains dollar quoting or a comment")
+    if re.search(r"(?<![a-z0-9_])[eub]&?''", lowered) or "u&" in lowered:
+        raise ContentError("SQL contains an escape, bit or unicode string literal")
+    if re.search(r"(?<!:):(?!:)", bare):
+        raise ContentError("SQL contains a psql variable (a single colon)")
+    if "*" in bare:
+        raise ContentError("SQL contains * (whole rows are never read)")
+    for quoted in re.findall(r'"[^"]*"', bare):
+        if quoted not in _SQL_QUOTED:
+            raise ContentError(f"SQL contains the quoted identifier {quoted}")
     found = _WRITE_WORDS.search(bare)
     if found:
         raise ContentError(f"SQL contains {found.group(0)!r}")
-    lowered = bare.lower()
+    if "pg_" in lowered or "information_schema" in lowered:
+        raise ContentError("SQL reads a system catalogue or calls a server function")
     for table in FORBIDDEN_TABLES:
         if re.search(r"\b(from|join)\s+" + re.escape(table) + r"\b", lowered):
             raise ContentError(f"SQL reads forbidden table {table}")
+    sources = 0
+    for m in _SQL_FROM_RE.finditer(lowered):
+        if m.group(1) == "join":
+            raise ContentError("SQL contains a join")
+        if not _SQL_FROM_TARGET_RE.match(lowered, m.end()):
+            raise ContentError("SQL reads something other than one whitelisted table per FROM "
+                               "(alias, comma join, schema or quoted name)")
+        sources += 1
+    names = len(_SQL_TABLE_RE.findall(lowered))
+    if names != sources:
+        raise ContentError("SQL names a table outside FROM (whole-row reference)")
+    for m in _SQL_CALL_RE.finditer(lowered):
+        if m.group(1) not in _SQL_FUNCTIONS and m.group(1) not in _SQL_KEYWORDS_BEFORE_PAREN:
+            raise ContentError(f"SQL calls {m.group(1)}(), which is not on the whitelist")
     # The bare identifier `key` may appear only in these places: the options
     # table's key column, and channels.key inside sha256()/length() (target
     # key fingerprint). Anything else could return a channel key.
@@ -285,14 +383,13 @@ def check_read_only_sql(sql):
     return sql
 
 
-_KEY_CONTEXTS = (
-    "jsonb_agg(key order by key collate",      # option key names
-    "jsonb_build_array(key, value,",           # option rows
-    "order by key collate",
-    "where key in (",
-    "sha256(convert_to(key, ''))",             # channel key fingerprint (literal stripped)
-    "length(key)",
-)
+def check_pinned_sql(sql, sha256_hex):
+    """A fixed SQL text reviewed once (test harnesses): the preamble, one statement, the pinned sha256."""
+    if not isinstance(sql, str) or not sql.startswith(READ_ONLY_PREAMBLE):
+        raise ContentError("SQL must start with SET default_transaction_read_only = on")
+    if sha256_text(sql) != sha256_hex:
+        raise ContentError("SQL text differs from its pinned sha256: review it, then update the pin")
+    return sql
 
 
 def sql_option_keys():
@@ -389,9 +486,9 @@ def read_snapshot(psql, profile=None, key_hashes=False):
             raise ContentError("invalid channel row")
         if "key" in ch:
             raise ContentError("a channel key reached the export")
-        bad = sorted(f for f, v in ch.items() if f in CHANNEL_COPY_FIELDS and secret_like(v))
+        bad = channel_unsafe_fields(ch)
         if bad:
-            # A credential inside base_url, header_override, ...: never copied or printed.
+            # A credential inside base_url, header_override, ...: never copied, printed or exported.
             unsafe[ch["id"]] = bad
             ch = {f: ("[redacted]" if f in bad else v) for f, v in ch.items()}
         channels[ch["id"]] = ch
@@ -449,7 +546,46 @@ def validate_profile(p):
     labels = p.get("group_labels")
     need(labels is None or (isinstance(labels, dict) and all(isinstance(v, str) for v in labels.values())),
          "group_labels must map group -> label")
+    # The AI Models Terms promise at least 7 days' notice of a price increase.
+    days = p.get("price_increase_notice_days", MIN_NOTICE_DAYS)
+    need(type(days) is int and days >= MIN_NOTICE_DAYS,
+         f"price_increase_notice_days must be an integer >= {MIN_NOTICE_DAYS} (AI Models Terms, Section 3)")
+    hist = p.get("served_history_days", DEFAULT_HISTORY_DAYS)
+    need(type(hist) is int and 1 <= hist <= 3650, "served_history_days must be an integer from 1 to 3650")
     return p
+
+
+MIN_NOTICE_DAYS = 7
+DEFAULT_HISTORY_DAYS = 30
+
+# rc.44 setting/billing_setting/builtin_billing.go: models billed by a built-in
+# expression in real US$ per 1M tokens when no billing_mode entry, ModelRatio or
+# ModelPrice names them (GetBillingMode). The 30:1 rule never reaches these.
+RC44_BUILTIN_EXPR_MODELS = frozenset(("gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-6-astra"))
+
+
+def _option_object(options, key):
+    try:
+        value = json.loads(options.get(key) or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def billed_by_expression(options, model):
+    """True when rc.44 bills `model` with a billing expression (real US$ prices), not ModelRatio/ModelPrice."""
+    mode = _option_object(options, "billing_setting.billing_mode").get(model)
+    if mode is not None:
+        return mode == "tiered_expr"
+    if model in RC44_BUILTIN_EXPR_MODELS:
+        return (model not in _option_object(options, "ModelRatio")
+                and model not in _option_object(options, "ModelPrice"))
+    return False
+
+
+def billing_entries(options):
+    """{billing map: number of entries} for the billing_setting.* maps that are not empty."""
+    return {k: len(_option_object(options, k)) for k in BILLING_MAPS if _option_object(options, k)}
 
 
 # ------------------------------------------------------------- transform
@@ -557,6 +693,78 @@ def channel_fingerprint(ch, fields=CHANNEL_COPY_FIELDS):
 
 def secret_like(value):
     return bool(isinstance(value, str) and SECRET_VALUE_RE.search(value))
+
+
+_SECRET_WORD_RE = re.compile(r"(?i)(authorization|cookie|secret|password|passwd|bearer|api[_-]?key|cf-access-|"
+                             r"private[_-]?key|access[_-]?token)")
+# "Name: value" or "Name=value" lines inside a string (headers written as text).
+_HEADER_LINE_RE = re.compile(r"(?m)^\s*([A-Za-z0-9_.-]{1,80})\s*[:=]\s*\S")
+
+
+def _value_unsafe(text):
+    if SECRET_VALUE_RE.search(text) or OPAQUE_SECRET_RE.search(text) or AUTH_SCHEME_VALUE_RE.match(text):
+        return True
+    return any(CHANNEL_SECRET_NAME_RE.search(m.group(1)) for m in _HEADER_LINE_RE.finditer(text))
+
+
+class _TooDeep(Exception):
+    pass
+
+
+def _json_names_and_strings(value, names, strings, depth=0):
+    if depth > 20:
+        raise _TooDeep()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            names.append(str(k))
+            _json_names_and_strings(v, names, strings, depth + 1)
+    elif isinstance(value, list):
+        for v in value:
+            _json_names_and_strings(v, names, strings, depth + 1)
+    elif isinstance(value, str):
+        strings.append(value)
+
+
+def channel_field_unsafe(field, value):
+    """True when a channel field may hold a credential (it is then never copied or printed)."""
+    if not isinstance(value, str) or not value:
+        return False
+    if SECRET_VALUE_RE.search(value):
+        return True
+    if field in _CHANNEL_NAME_FIELDS:
+        return False
+    if field in CHANNEL_JSON_FIELDS:
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            names, strings = [], []
+            try:
+                _json_names_and_strings(parsed, names, strings)
+            except _TooDeep:
+                return True                     # cannot be checked: treat as unsafe
+            if any(CHANNEL_SECRET_NAME_RE.search(n) for n in names):
+                return True
+            return any(_value_unsafe(s) for s in strings)
+        # not JSON (or a bare JSON string/number): any credential-looking word or value makes it unsafe
+        return _value_unsafe(value) or bool(_SECRET_WORD_RE.search(value))
+    if field == "base_url":
+        try:
+            u = urllib.parse.urlsplit(value)
+        except ValueError:
+            return True
+        if u.username or u.password:
+            return True
+        for name, v in urllib.parse.parse_qsl(u.query, keep_blank_values=True):
+            if CHANNEL_SECRET_NAME_RE.search(name) or OPAQUE_SECRET_RE.search(v):
+                return True
+        return bool(OPAQUE_SECRET_RE.search(u.path))
+    return bool(OPAQUE_SECRET_RE.search(value))
+
+
+def channel_unsafe_fields(ch):
+    return sorted(f for f, v in ch.items() if f in CHANNEL_COPY_FIELDS and channel_field_unsafe(f, v))
 
 
 def redact(text):

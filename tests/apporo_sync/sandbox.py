@@ -13,12 +13,18 @@ by the tool's own read-only export. Run the phases in order:
   python3 tests/apporo_sync/sandbox.py seed-source   # replay it 1:1 (mirror profile) + fingerprints
   python3 tests/apporo_sync/sandbox.py replay-target # Apporo profile replay, verify, idempotency
   python3 tests/apporo_sync/sandbox.py quota         # WOOW charge / 30 through a mock upstream
-  python3 tests/apporo_sync/sandbox.py daily         # classification, holds, notice, maturity
+  python3 tests/apporo_sync/sandbox.py daily         # classification, holds, notice, maturity, write order
+  python3 tests/apporo_sync/sandbox.py rbac          # daily as the deploy/apporo-sync/rbac.yaml identity
+  python3 tests/apporo_sync/sandbox.py mint-revoke   # a failed Secret write revokes the new PAT
   python3 tests/apporo_sync/sandbox.py platform <llm_pricing.py>
   python3 tests/apporo_sync/sandbox.py down          # delete both namespaces (confirm NotFound)
 
 Output (export, state, journal; no secret) goes to $APPORO_SYNC_SANDBOX_OUT
 (default ~/.local/state/apporo-newapi-sync-sandbox/<suffix>), never into the repo.
+To test without reading WOOW production again, copy an earlier export-woow result
+(woow-prod-export.json and woow-prod-fingerprints.json) into that directory and
+skip export-woow. The throwaway sandbox credentials (0600 sandbox-secrets.json)
+are deleted by `down`.
 """
 import base64
 import datetime
@@ -55,6 +61,9 @@ FP_SQL = nc.READ_ONLY_PREAMBLE + """SELECT json_build_object(
 'abilities', (SELECT json_build_array(count(*), encode(sha256(convert_to(string_agg(concat_ws('|',"group",model,channel_id,enabled,priority,weight,coalesce(tag,'')), E'\\n' ORDER BY "group",model,channel_id),'UTF8')),'hex')) FROM abilities),
 'channels', (SELECT json_build_array(count(*), encode(sha256(convert_to(string_agg(concat_ws('|', id, type, name, status, coalesce(base_url,''), "group", coalesce(models,''), coalesce(model_mapping,''), coalesce(status_code_mapping,''), coalesce(priority,0), coalesce(weight,0), coalesce(auto_ban,0), coalesce(tag,''), coalesce(test_model,''), coalesce(open_ai_organization,''), coalesce(other,''), coalesce(other_info,''), coalesce(setting,''), coalesce(param_override,''), coalesce(header_override,''), coalesce(remark,''), coalesce(channel_info::text,''), coalesce(settings,'')), E'\\n' ORDER BY id),'UTF8')),'hex')) FROM channels)
 )::text;"""
+# The two fixed SQL texts of this harness are pinned (newapi_content.check_pinned_sql):
+# reviewed once; any edit must update the pin. FP_SQL returns counts and sha256 only.
+FP_SQL_SHA256 = "bd2d2298662f5df1d9fe2844f603f27272b183d73b7ce8da787d2729891411e6"
 
 
 def k(*args, data=None, check=True):
@@ -122,8 +131,12 @@ def profiles():
 
 
 def fingerprints(ns, pod="newapi-postgres-0"):
+    """Research fingerprints (hashes only): a sandbox namespace, or WOOW production read-only."""
+    if not ns.startswith("dev-sandbox-") and ns != "new-api":
+        raise SystemExit(f"fingerprints: {ns} is neither a sandbox nor WOOW production (read-only)")
+    nc.check_pinned_sql(FP_SQL, FP_SQL_SHA256)
     psql = nc.Psql(KUBECTL, ns, pod)
-    r = subprocess.run(psql.argv(), input=FP_SQL.encode(), capture_output=True)
+    r = subprocess.run(psql.argv(), input=FP_SQL.encode(), capture_output=True, timeout=120)
     if r.returncode != 0:
         raise SystemExit(r.stderr.decode()[-300:])
     return json.loads([ln for ln in r.stdout.decode().splitlines() if ln.strip()][-1])
@@ -205,8 +218,10 @@ def phase_replay_target():
     p = profiles()
     tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap")
     tool("--profile", p["apporo"], "verify", "--strict", "--check-keys", "-v")
-    rc, text = tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap")
-    assert "plan: 0 auto" in text, "second replay must be a no-op"
+    rc, text = tool("--profile", p["apporo"], "plan", "--bootstrap")
+    assert "plan: 0 auto" in text, "a finished replay leaves nothing to copy"
+    rc, text = tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap", check=False)
+    assert rc == 2 and "not a fresh install" in text, "a second replay must be refused"
     rc, text = tool("--profile", p["apporo"], "plan")
     src, tgt = fingerprints(SRC), fingerprints(TGT)
     print("target research fingerprints:", json.dumps(tgt))
@@ -248,11 +263,14 @@ def chat(base, token, model):
 
 LOG_SQL = nc.READ_ONLY_PREAMBLE + ("SELECT coalesce(json_agg(x), '[]')::text FROM (SELECT quota, prompt_tokens, completion_tokens, "
                                    "model_name, channel_id, other FROM logs WHERE type = 2 ORDER BY id DESC LIMIT 1) x;")
+LOG_SQL_SHA256 = "0c4e9d69c4268b543392d6a0b03386af487d92f87e09116f6c8a940ed7c67a30"
 
 
 def last_log(ns):
+    guard(ns)                                   # the logs table: sandbox namespaces only
+    nc.check_pinned_sql(LOG_SQL, LOG_SQL_SHA256)
     psql = nc.Psql(KUBECTL, ns)
-    r = subprocess.run(psql.argv(), input=LOG_SQL.encode(), capture_output=True)
+    r = subprocess.run(psql.argv(), input=LOG_SQL.encode(), capture_output=True, timeout=120)
     return json.loads([ln for ln in r.stdout.decode().splitlines() if ln.strip()][-1])[0]
 
 
@@ -268,7 +286,8 @@ def set_source_base_url(url):
 def phase_quota():
     p = profiles()
     set_source_base_url("http://mock-llm:4000")
-    tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap")
+    tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap", "--force", "--why",
+         "sandbox quota test: point channel 1 at the mock upstream")
     time.sleep(65)  # rc.44 refreshes channel and option caches once a minute (SYNC_FREQUENCY)
     model = "anthropic/claude-sonnet-5.5"
     result = {}
@@ -288,7 +307,8 @@ def phase_quota():
     print(f"quota source {qs}, target {qt}, source/30 = {qs / 30:.4f}, |target - source/30| = {abs(qt - qs / 30):.4f}")
     assert abs(qt - qs / 30) <= 1, "target charge must equal WOOW's / 30 within rounding"
     set_source_base_url(LITELLM)
-    tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap")
+    tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap", "--force", "--why",
+         "sandbox quota test: channel 1 back to LiteLLM")
     tool("--profile", p["apporo"], "verify", "--strict", "--check-keys")
 
 
@@ -318,6 +338,7 @@ def phase_daily():
             put_map_entry(c, snap, "ModelRatio", "test/sandbox-new-model", 0.3)            # new model
             put_map_entry(c, snap, "CompletionRatio", "test/sandbox-new-model", 4)
             put_map_entry(c, snap, "CompletionRatio", "anthropic/claude-opus-5.5", 0)      # pilot output 0
+            put_map_entry(c, snap, "ModelRatio", "apporo/gpt-6-luna", None)                # never offered: removed last
             api_call(c, "PUT", "/api/option/", {"key": "RetryTimes", "value": "3"})        # non-price option
             api_call(c, "PUT", "/api/option/", {"key": "GroupRatio",
                                                  "value": '{"default": 1.3, "internal": 1, "free": 0}'})
@@ -346,9 +367,20 @@ def phase_daily():
         "free channel alert-only": "qwen3-sbx-extra" not in tgt["channels"][4]["models"],
         "new channel alert-only": 5 not in tgt["channels"],
         "pilot output 0 alert-only": json.loads(tgt["options"]["CompletionRatio"])["anthropic/claude-opus-5.5"] == 5,
+        "never-offered price removed": "apporo/gpt-6-luna" not in mr,
     }
     for name, ok in checks.items():
         print(f"{'PASS' if ok else 'FAIL'} {name}")
+    jdir = os.path.join(STATE, "journal")
+    last = sorted(n for n in os.listdir(jdir) if "-apply-" in n)[-1]
+    with open(os.path.join(jdir, last)) as f:
+        steps = [json.loads(line) for line in f]
+    order = [(r["step"], r.get("key") or r.get("channel")) for r in steps if r["step"] in ("option", "channel-update")]
+    print("write order (option keys / channel ids):", order)
+    mr_writes = [i for i, (step, key) in enumerate(order) if key == "ModelRatio"]
+    ch_writes = [i for i, (step, key) in enumerate(order) if step == "channel-update"]
+    print(f"{'PASS' if len(mr_writes) == 2 and mr_writes[0] < min(ch_writes) < mr_writes[1] else 'FAIL'} "
+          "ModelRatio written before the channels (new/changed) and after them (removed entries)")
     rc, text2 = tool("--profile", p["apporo"], "daily", "--apply")
     assert "plan: 0 auto" in text2, "second daily must apply nothing"
     with open(os.path.join(STATE, "holds.json")) as f:
@@ -358,13 +390,14 @@ def phase_daily():
     nid = pending[0]["notice_id"]
     with open(st["notices"][nid]["draft"]) as f:
         print(f.read())
-    # simulate a notice sent 8 days ago (only the test edits created_at)
-    st["notices"][nid]["created_at"] = (datetime.datetime.now(datetime.timezone.utc)
-                                        - datetime.timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # simulate a notice sent 10 days ago, effective 2 days ago (only the test edits created_at)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    st["notices"][nid]["created_at"] = (now - datetime.timedelta(days=11)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(os.path.join(STATE, "holds.json"), "w") as f:
         json.dump(st, f)
-    sent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=8)).isoformat()
-    tool("notice-sent", nid, "--at", sent)
+    sent = (now - datetime.timedelta(days=10)).isoformat()
+    effective = (now - datetime.timedelta(days=2)).date().isoformat()
+    tool("notice-sent", nid, "--effective", effective, "--at", sent, "--backdated")
     tool("--profile", p["apporo"], "apply")
     tgt = nc.read_snapshot(nc.Psql(KUBECTL, TGT), prof)
     print("increase applied after maturity:", json.loads(tgt["options"]["ModelRatio"])["openai/gpt-6-luna"] == 0.06 / 30)
@@ -375,6 +408,72 @@ def phase_daily():
     tool("--profile", p["apporo"], "verify")
     tool("--profile", p["apporo"], "verify", "--strict", check=False)
     tool("holds")
+
+
+def as_sync_identity():
+    """kubectl that acts as the rbac.yaml ServiceAccount (impersonation: no token is handled)."""
+    return KUBECTL + ["--as", f"system:serviceaccount:{TGT}:apporo-newapi-sync"]
+
+
+def phase_rbac():
+    """deploy/apporo-sync/rbac.yaml, with new-api -> SRC and new-api-apporo -> TGT, is enough for the daily job."""
+    with open(os.path.join(REPO, "deploy", "apporo-sync", "rbac.yaml")) as f:
+        text = f.read()
+    text = text.replace("namespace: new-api-apporo", "namespace: " + TGT).replace("namespace: new-api\n",
+                                                                                  "namespace: " + SRC + "\n")
+    body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "new-api" not in body.replace(SRC, "").replace(TGT, ""), "rbac.yaml names another namespace"
+    for ns in (SRC, TGT):
+        guard(ns)
+    k("apply", "-f", "-", data=text.encode())
+    p = profiles()
+    as_sa = " ".join(as_sync_identity())
+    env = dict(ENV, APPORO_SYNC_KUBECTL=as_sa)
+    for args in (["daily", "--apply", "--live-images"], ["verify"], ["export", "--side", "target"]):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "scripts", "apporo_sync.py"), "--state-dir", STATE,
+                            "--profile", p["apporo"], *args], capture_output=True, text=True, env=env, timeout=600)
+        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+        print(f"{'PASS' if r.returncode == 0 else 'FAIL'} as the sync ServiceAccount: {' '.join(args)} -> rc "
+              f"{r.returncode}: {tail}")
+    for verb, res, ns, want in (("get", "secret/newapi-root-credentials", TGT, "no"),
+                                ("get", "secret/newapi-upstream-keys", TGT, "yes"),
+                                ("create", "secret", TGT, "no"),
+                                ("patch", "deployment/newapi-master", TGT, "no"),
+                                ("get", "secret/newapi-upstream-keys", SRC, "no"),
+                                ("create", "pods/exec", SRC, "yes")):
+        args = ["auth", "can-i", verb, res, "-n", ns, "--as", f"system:serviceaccount:{TGT}:apporo-newapi-sync"]
+        if res == "pods/exec":
+            args = ["auth", "can-i", verb, "pods/newapi-postgres-0", "--subresource=exec", "-n", ns,
+                    "--as", f"system:serviceaccount:{TGT}:apporo-newapi-sync"]
+        got = k(*args, check=False).stdout.decode().strip()
+        print(f"{'PASS' if got == want else 'FAIL'} can-i {verb} {res} in {ns}: {got} (want {want})")
+
+
+def list_pat_names(ns):
+    with aps.PortForward(KUBECTL, ns) as base:
+        c = root_client(ns, base)
+        try:
+            ans = c.req("GET", "/api/user/access_tokens")
+        finally:
+            c.close()
+    data = ans.get("data") or []
+    items = data.get("items", data) if isinstance(data, dict) else data
+    return sorted((it.get("id"), it.get("name")) for it in items)
+
+
+def phase_mint_revoke():
+    """mint-sync-pat whose Secret write fails must revoke the PAT it created (real rc.44 revoke API)."""
+    p = profiles()
+    before = list_pat_names(TGT)
+    aps.SECRET_WRITER = lambda ns, name, manifest: (False, "sandbox: simulated kubectl failure")
+    try:
+        rc = aps.main(["--profile", p["apporo"], "--kubectl", " ".join(KUBECTL), "--state-dir", STATE,
+                       "mint-sync-pat"])
+    finally:
+        aps.SECRET_WRITER = None
+    after = list_pat_names(TGT)
+    print(f"{'PASS' if rc == 2 and after == before else 'FAIL'} mint-sync-pat with a failed Secret write: rc {rc}, "
+          f"PATs before {len(before)} after {len(after)}")
 
 
 def phase_platform(module_path):

@@ -1,0 +1,129 @@
+# Least-privilege identity for the Apporo New API daily sync (template; NOT applied
+# by anything in this repo). docs/APPORO-SYNC.md 〈排程〉: the unattended daily job
+# uses this ServiceAccount's kubeconfig instead of a cluster-admin context. Create
+# it only with the owner's approval (kubectl create -f, not apply).
+#
+# What the daily job runs (scripts/apporo_sync.py daily --live-images [--apply]):
+#   new-api         exec -i newapi-postgres-0 -c postgres -- psql   whitelisted read-only SELECTs
+#                   get deploy,statefulset,cronjob -o json          live image comparison
+#   new-api-apporo  exec -i newapi-postgres-0 -c postgres -- psql   whitelisted read-only SELECTs
+#                   port-forward svc/newapi                         admin API writes (PAT)
+#                   get secret newapi-upstream-keys, newapi-sync-pat
+#                   get deploy,statefulset,cronjob -o json
+# Not granted: newapi-root-credentials and Secret writes (replay --auth password and
+# mint-sync-pat are bootstrap steps a person runs with their own access), every
+# other namespace and resource.
+# Residual risk: pods/exec into a Postgres pod can run any SQL as the database's
+# owner role; the tool itself sends only read-only SQL to WOOW. A NOSUPERUSER
+# read-only database role (column-level grant without channels.key) is a separate,
+# owner-approved change.
+# kubectl exec / port-forward over WebSockets (kubectl >= 1.30) is authorized as
+# get or create depending on the API server version: both verbs are listed.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: apporo-newapi-sync
+  namespace: new-api-apporo
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: apporo-newapi-sync-token
+  namespace: new-api-apporo
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+  annotations:
+    kubernetes.io/service-account.name: apporo-newapi-sync
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: apporo-newapi-sync-source-read
+  namespace: new-api
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: ["newapi-postgres-0"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: ["newapi-postgres-0"]
+    verbs: ["create", "get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: apporo-newapi-sync-source-read
+  namespace: new-api
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: apporo-newapi-sync-source-read
+subjects:
+  - kind: ServiceAccount
+    name: apporo-newapi-sync
+    namespace: new-api-apporo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: apporo-newapi-sync-target
+  namespace: new-api-apporo
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+rules:
+  # port-forward svc/newapi resolves the Service, then picks one of its pods (names change on rollout)
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["newapi"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    resourceNames: ["newapi-postgres-0"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["newapi-upstream-keys", "newapi-sync-pat"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["list"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: apporo-newapi-sync-target
+  namespace: new-api-apporo
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: apporo-newapi-sync-target
+subjects:
+  - kind: ServiceAccount
+    name: apporo-newapi-sync
+    namespace: new-api-apporo
