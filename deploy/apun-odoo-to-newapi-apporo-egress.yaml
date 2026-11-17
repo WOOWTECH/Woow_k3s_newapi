@@ -1,0 +1,43 @@
+# Applied in the Apporo Odoo namespace apun (not part of any Helm release;
+# docs/APPORO-K3S.md): lets the apun Odoo web and cron pods reach the Apporo
+# newapi-proxy on 8080 (signed proxy) and 8081 (/readyz). apun-odoo's egress is
+# limited by allow-odoo-to-mailcow (private ranges blocked, so another namespace is
+# unreachable). Egress policies add up: allow-odoo-to-mailcow and
+# default-deny-external stay untouched. The other half is proxy.clients in
+# deploy/apporo-k3s.yaml (same pod selector; both sides must allow).
+# Order: a pod selected by any egress policy may only use what the selecting
+# policies allow. Apply this together with, never before, the cron pod's own egress
+# policy (the allow-odoo-to-mailcow copy that selects component cron, owned by the
+# odoo-tenant change): alone it would leave a cron pod without DNS, DB and mail.
+#   kubectl apply -f deploy/apun-odoo-to-newapi-apporo-egress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: apun-odoo-to-newapi-apporo-egress
+  namespace: apun
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: apun
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [application, cron]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: new-api-apporo
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: newapi
+              app.kubernetes.io/instance: newapi
+              app.kubernetes.io/component: proxy
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081

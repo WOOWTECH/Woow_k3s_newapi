@@ -1,0 +1,87 @@
+# Apporo production values for woow-k3s (release newapi, namespace new-api-apporo).
+# Serves the Apporo AI PaaS (Odoo 18 at www.apporo.ai, namespace apun); runbook
+# docs/APPORO-K3S.md. A 1:1 copy of deploy/woow-k3s.yaml: the only differences are
+# publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and proxy.ap/opExpiresAt
+# (plus proxy.image while an upgrade is rolling out, which needs its own green stg
+# contract report). scripts/tests/test_apporo_values.py fails on any other change,
+# so a WOOW prod values change is mirrored here in the same PR.
+#   helm upgrade --install newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml --wait
+# The very first install runs before the AP/OP PATs exist: docs/APPORO-K3S.md 〈安裝〉.
+publicUrl: https://newapi.apporo.ai
+
+newapi:
+  env:
+    # Customer-visible new-api messages in English (owner decision 2026-11-17);
+    # rc.44 accepts en, zh-CN and zh-TW. Every other env keeps the chart default.
+    DEFAULT_LANGUAGE: en
+
+networkPolicy:
+  upstreams:
+    # WoowTech's own LiteLLM in the PaaS (workspace 37, service 203), shared with
+    # WOOW prod through Apporo-only LiteLLM keys (channel keys, not in values).
+    # Its namespace carries the matching ingress allow
+    # (deploy/litellm-from-newapi-apporo-ingress.yaml).
+    - name: litellm-svc203
+      namespace: paas-ws-32e92be2
+      podLabels:
+        app.kubernetes.io/instance: svc-a8389061
+        app.kubernetes.io/name: litellm
+        app.kubernetes.io/component: app
+      port: 4000
+
+backup:
+  schedule: "45 3 * * *"
+  keepDays: 7
+  suspend: false
+
+# Same as WOOW prod: the encrypted track stays off; the daily backup above is active.
+encryptedBackup:
+  enabled: false
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true
+  pruneEnabled: false
+
+retention:
+  enabled: true
+  suspend: false
+
+# Same image, tuning and Secret names as WOOW prod; the Secrets themselves are new
+# values created by hand in new-api-apporo (docs/APPORO-K3S.md 〈Secret〉).
+proxy:
+  enabled: true
+  replicas: 2
+  image:
+    # Keep equal to deploy/woow-k3s.yaml. Bump it only after WOOW prod, in its own
+    # PR (owner decision D7); CI requires a green stg report for this pin.
+    tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb
+    digest: sha256:0fdf5e12da8c8fec9d4b1650d2a134d6dc58d1ba86b82d54ea62b8b6fb8ce3bd
+  imagePullSecrets:
+    - name: newapi-proxy-registry
+  patsSecret: newapi-proxy-pats
+  hmacSecret: newapi-proxy-hmac
+  usernameRegex: '^wp\d{10}$'
+  tenantIpRange: 198.18.1.0-198.19.255.255
+  # PLACEHOLDER until the Apporo AP/OP PATs exist (""= unknown: /readyz reports
+  # null days left, so the PaaS cannot warn before they expire). Once created, put
+  # the unix seconds from the woowtech.io/ap-expires-at / op-expires-at annotations
+  # of Secret new-api-apporo/newapi-proxy-pats here in a PR, before apun traffic is
+  # switched on; update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
+  apExpiresAt: ""
+  opExpiresAt: ""
+  clients:
+    # The apun Odoo web pod (component application, live) and its planned cron pod
+    # (component cron), same name label; not apun-cloudflared or apun-postgres.
+    # Same shape as WOOW prod (paas-odoo server|cron). The apun side's egress
+    # allow is deploy/apun-odoo-to-newapi-apporo-egress.yaml.
+    - name: apun-odoo
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: apun
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: apun
+        matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [application, cron]

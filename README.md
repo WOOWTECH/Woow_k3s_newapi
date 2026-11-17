@@ -7,6 +7,16 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 - GitHub `WOOWTECH/Woow_k3s_newapi` 是 Gitea 的**單向公開鏡像**（`.gitea/workflows/mirror-to-github.yml` 推 main＋tag），不要在 GitHub 提交或開 PR
 - 舊版 chart 2.x（`latest`＋NodePort，2026-10-04 已下線）留在歷史裡：tag `legacy-v2.1.0`
 
+## 部署（同一個 chart，各自一份 values）
+
+| 站 | namespace | values | 網址 | 呼叫端（`proxy.clients`） |
+|---|---|---|---|---|
+| WOOW 正式 | `new-api` | `deploy/woow-k3s.yaml` | <https://newapi.woowtech.io> | `paas-system` 平台 Odoo（web／cron） |
+| WOOW staging | `new-api-stg` | `deploy/woow-k3s-stg.yaml` | 未公開（tunnel 只回 404） | dev 沙盒 Odoo、`paas-stg-system` 平台 Odoo |
+| Apporo 正式 | `new-api-apporo` | `deploy/apporo-k3s.yaml` | <https://newapi.apporo.ai> | `apun` 官網 Odoo（web／cron），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md) |
+
+Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與 PAT 到期日；CI 的 `scripts/tests/test_apporo_values.py` 擋其他差異。
+
 ## 架構
 
 | 元件 | 說明 |
@@ -34,6 +44,8 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 4. port-forward 後 `NEWAPI_ROOT_USER=<管理員帳號> scripts/bootstrap-root.sh http://127.0.0.1:3300`（`/api/setup` 先到先得，一定要在 DNS 之前）
 5. 正式站用 PAT 做唯讀 `get-options`／`verify-settings` 對帳；固定 `CUSTOM`／`32` 兩項顯示值可用 [`display-settings`](docs/NA04-DISPLAY-SETTINGS.md) 預覽，明確加 `--apply` 才修正。`newapi_admin.py` 對正式站的 `apply-settings`、`apply-pricing`、`apply-channels` 與非 GET `call` 均預設拒絕，原始 GET 也只允許四條已確認唯讀路徑。待公告、逐人回執、七天成熟及全寫入者互鎖完成後，再另行設計受信任的正式調價流程。正式站即使尚未開 2FA 也不得使用 `--creds`，見 OPERATIONS〈設定即程式碼〉。
 6. `scripts/cf-tunnel.sh dns`（公開網址生效）
+
+Apporo 那套的安裝順序不同（PAT 建好之前先關 proxy、root 帳密只存在叢集），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈安裝〉。
 
 ## 授權
 

@@ -1,0 +1,31 @@
+# Applied in the LiteLLM namespace (not part of the Helm release); Apporo new-api
+# (namespace new-api-apporo, docs/APPORO-K3S.md). Same as
+# deploy/litellm-from-newapi-ingress.yaml except the name and the source namespace.
+#   kubectl apply -f deploy/litellm-from-newapi-apporo-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm-from-newapi-apporo-ingress
+  namespace: paas-ws-32e92be2
+  labels:
+    app.kubernetes.io/part-of: woow-k3s-newapi
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: svc-a8389061
+      app.kubernetes.io/name: litellm
+      app.kubernetes.io/component: app
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: new-api-apporo
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: newapi
+              app.kubernetes.io/instance: newapi
+              newapi.woowtech.io/serves-relay: "true"
+      ports:
+        - protocol: TCP
+          port: 4000

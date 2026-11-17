@@ -2,6 +2,8 @@
 
 適用：release `newapi`、namespace `new-api`、網址 <https://newapi.woowtech.io>。
 
+同一個 chart 另有兩套：staging（`new-api-stg`，見〈staging〉），以及 Apporo 那套（`new-api-apporo`、<https://newapi.apporo.ai>、`deploy/apporo-k3s.yaml`），和正式站的差異與安裝順序見 [APPORO-K3S.md](APPORO-K3S.md)。下面的指令用在 Apporo 時，namespace 換成 `new-api-apporo`。
+
 > **NA-04 正式一般寫入暫停中：** `newapi_admin.py --target prod` 的 `apply-settings`、`apply-pricing`、非 dry-run 的 `apply-channels` 及任何非 GET 的 `call` 一律在寫入前拒絕，原始 GET 也限 `/api/status`、`/api/option/`、`/api/pricing`、`/api/channel/` 四條已確認唯讀路徑，沒有覆寫參數。唯一限定例外是 `display-settings --apply`：只接受 PAT、已知目標與 rc.44，固定修正 `CUSTOM`／`32` 兩項顯示值，無法帶入任何價格設定，預設不加 `--apply` 只預覽；見 [NA04-DISPLAY-SETTINGS.md](NA04-DISPLAY-SETTINGS.md)。正式站即使尚未開 2FA 也禁止 `--creds`，以免登入產生 session。下方正式套用與回滾命令是尚未開放的流程紀錄，不能照抄執行。須先有負責人／法務定稿、AI 分頁公告、全體受影響者可信寄信回執、七天成熟、現價與受眾重核，以及覆蓋 console／直接 API／其他腳本的全寫入者互鎖，再另行審核受信任的調價流程。這支 CLI 的拒絕只保護它自己，不代表服務端已有互鎖；staging 寫入與正式唯讀對帳仍可使用。
 
 ## 機密資料放哪裡
@@ -521,7 +523,7 @@ Job 耗時及鎖等待；retention 期間 `/v1/chat/completions` 正常；新舊
 
   **`networkPolicy.clients` 加進來的客戶端同樣被信任 XFF**，可以任意冒用別人的限流桶與稽核 IP：只能加會自己覆寫 XFF 的代理。PaaS 一律走 `newapi-proxy`，Odoo 與租戶 pod 都不能加進 `clients`。
 - Valkey：只收 new-api（預設使用者，`requirepass`）與 `newapi-proxy`（`proxy.enabled` 時；ACL 使用者 `newapi-proxy`，只能 `SET` `newapi-proxy:replay:*` 與 `PING`，讀不到 new-api 的 session、快取與限流計數）。
-- 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。
+- 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`；namespace `new-api-apporo` 建好之後再加上 Apporo 的 `deploy/litellm-from-newapi-apporo-ingress.yaml`、`deploy/apun-odoo-to-newapi-apporo-egress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。
 - 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
 
 ## 已知限制
