@@ -239,7 +239,7 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 | 跑不完（逾時 600 秒、找不到 python） | `action`「values: … did not finish」 |
 | checkout 裡兩支都沒有（PR #44 還沒合併） | `info`，提醒合併後更新 checkout |
 
-同一個落後狀態每天的告警 fingerprint 相同（只有第一次是 `new`，之後 email 管道可以只寄一次）；落後的 key 改變了才是新告警。修正方式不變：開一張 Apporo 自己的 values PR（APPORO-K3S.md〈跟著 WOOW 改〉），負責人合併後、`scripts/apporo_checks.py --strict` 通過再 `helm upgrade`；自動開 PR 和映像一樣是之後的工作。排程主機要有 `helm`（cluster1：`/usr/local/bin/helm`，systemd user unit 的預設 PATH 找得到）。整套檢查約 1 分鐘（含 `scripts/tests/test_apporo_*.py`），systemd 範本的 `TimeoutStartSec` 是 1800 秒。
+告警的第一行是檢查工具自己的結論（`FAILED  Apporo checks: …`，或舊 checkout 的 parity `FAILED …`），不是它引用的子工具輸出（例如 unittest 的 `FAILED (failures=2, skipped=6)`）。fingerprint 由標題、這個結論（哪幾項檢查失敗）與「values that differ」各列組成：同一個落後狀態每天相同（只有第一次是 `new`，之後 email 管道可以只寄一次），測試數量變了不算新告警；失敗的檢查或落後的值變了才是新告警。修正方式不變：開一張 Apporo 自己的 values PR（APPORO-K3S.md〈跟著 WOOW 改〉），負責人合併後、`scripts/apporo_checks.py --strict` 通過再 `helm upgrade`；自動開 PR 和映像一樣是之後的工作。排程主機要有 `helm`（cluster1：`/usr/local/bin/helm`，systemd user unit 的預設 PATH 找得到）。整套檢查約 1 分鐘（含 `scripts/tests/test_apporo_*.py`），systemd 範本的 `TimeoutStartSec` 是 1800 秒。
 
 實測（11-17，本機把 #44 head `7e110a5` 與本 PR 合併，未推送）：`apporo_checks.py --strict` 全部通過（render、proxy-on、images、proxy、values 153 個測試、parity），`daily` 的檢查不產生告警；只改 WOOW 的 `deploy/woow-k3s.yaml`（`backup.keepDays` 7→8）時，產生一筆 action 告警，內容是 `backup.keepDays: 8 | 7`。
 

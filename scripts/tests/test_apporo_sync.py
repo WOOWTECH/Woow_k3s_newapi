@@ -2090,6 +2090,45 @@ sys.exit(code)
 """
 
 
+# The shape of scripts/apporo_checks.py --strict output (Apporo values PR #44) for a values test failure
+# and a parity drift: sub-tool output is quoted behind "   | ", unittest's totals and apporo_parity.py's
+# own FAILED line included, before the tool's own verdict.
+CHECKS_REAL_STUB = """import os, sys
+skipped, value = os.environ.get("STUB_SKIPPED", "6"), os.environ.get("STUB_VALUE", "90")
+print("Apporo checks (strict; docs/APPORO-K3S.md 〈CI 與檢查〉)")
+print("mode: strict (--strict: before an Apporo install or helm upgrade, the daily sync)")
+print()
+print("-- render: helm lint and helm template of deploy/apporo-k3s.yaml in new-api-apporo, as committed")
+print("   OK   renders in new-api-apporo as committed (23 objects)")
+print()
+print("-- values: Apporo's own values, the AI terms' promises, these tools' tests (scripts/tests/test_apporo_*.py)")
+print("   FAIL 2 of 15%s tests failed: test_retention_days, test_terms_promises" % skipped)
+print("   | " + "=" * 70)
+print("   | FAIL: test_retention_days (test_apporo_values.ValuesTest.test_retention_days)")
+print("   | " + "-" * 70)
+print("   | AssertionError: %s != 180" % value)
+print("   | ")
+print("   | Ran 15%s tests in 12.345s" % skipped)
+print("   | ")
+print("   | FAILED (failures=2, skipped=%s)" % skipped)
+print()
+print("-- parity: everything else equals WOOW prod (scripts/apporo_parity.py --strict)")
+print("   FAIL scripts/apporo_parity.py --strict: differs from WOOW prod + the documented differences (exit 1)")
+print("   | DIFFERS values, proxy as committed (enabled: false): the renders differ in 2 line(s)")
+print("   |         values that differ (WOOW prod + documented differences | Apporo):")
+print("   |           retention.days: 180 | %s" % value)
+print("   |         render diff (proxy as committed (enabled: false)), first 60 lines:")
+print("   |           -  days: 180")
+print("   | FAILED  Apporo differs from WOOW prod + the documented differences (retention.days)")
+print()
+print("FAILED  Apporo checks: values, parity. strict (--strict: before an Apporo install or helm upgrade, the daily "
+      "sync). Do not install or helm upgrade Apporo until they pass: follow WOOW prod in an Apporo PR first "
+      "(docs/APPORO-K3S.md 〈跟著 WOOW 改〉).")
+print("::error file=deploy/apporo-k3s.yaml,title=Apporo values::2 of 15%s tests failed" % skipped)
+sys.exit(1)
+"""
+
+
 class ValuesDriftTest(unittest.TestCase):
     def setUp(self):
         self.repo = tempfile.mkdtemp()
@@ -2123,6 +2162,29 @@ class ValuesDriftTest(unittest.TestCase):
         self.assertIn("FAIL 1 of 21 tests failed: test_values_promised_in_the_ai_terms", al["details"])
         self.assertIn("retention.days: 180 | 90", al["details"])
         self.assertFalse(any("days: 180" == d.strip("- ") or d.startswith("::") for d in al["details"]))
+
+    def test_the_summary_is_the_checks_own_verdict_and_one_drift_state_is_one_alert(self):
+        with open(os.path.join(self.repo, "scripts", "apporo_checks.py"), "w") as f:
+            f.write(CHECKS_REAL_STUB)
+        os.environ["STUB_SKIPPED"], os.environ["STUB_VALUE"] = "6", "90"
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertTrue(al["details"][0].startswith("FAILED  Apporo checks: values, parity. strict"), al["details"])
+        self.assertNotIn("FAILED (failures=2, skipped=6)", al["details"])          # unittest's totals: not a verdict
+        self.assertIn("retention.days: 180 | 90", al["details"])
+        self.assertIn("FAIL 2 of 156 tests failed: test_retention_days, test_terms_promises", al["details"])
+        self.assertFalse(any(d.startswith("::") or "days: 180" == d.strip("- ") for d in al["details"]))
+        state = types_ns(data={})
+        now = aps.now_utc()
+        (first,) = aps.collect_alerts([], state, now, [al])
+        self.assertTrue(first["new"])
+        self.assertNotIn("fingerprint_basis", first)
+        os.environ["STUB_SKIPPED"] = "7"                                            # more tests ran: same drift
+        (again,) = aps.collect_alerts([], state, now, REAL_VALUES_ALERTS(self.repo))
+        self.assertEqual((again["fingerprint"], again["new"]), (first["fingerprint"], False))
+        os.environ["STUB_VALUE"] = "60"                                             # the drift changed: new
+        (changed,) = aps.collect_alerts([], state, now, REAL_VALUES_ALERTS(self.repo))
+        self.assertTrue(changed["new"])
+        self.assertNotEqual(changed["fingerprint"], first["fingerprint"])
 
     def test_in_sync_is_quiet_and_drift_or_errors_are_action_alerts(self):
         self.stub()

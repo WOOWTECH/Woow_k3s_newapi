@@ -1795,7 +1795,8 @@ def collect_alerts(items, state, now, extra=()):
     seen = state.data.setdefault("alerts", {}) if state else {}
     for al in out:
         al.setdefault("details", [])
-        fp = nc.digest([al["title"], al.get("hold_id") or al["details"][:1]])[:16]
+        basis = al.pop("fingerprint_basis", None)          # what makes it the same alert (default: first detail)
+        fp = nc.digest([al["title"], basis if basis is not None else (al.get("hold_id") or al["details"][:1])])[:16]
         rec = seen.get(fp)
         al["fingerprint"], al["new"] = fp, rec is None
         if state:
@@ -2233,31 +2234,53 @@ NEWAPI_IMAGE_RE = re.compile(r"(^|/)calciumion/new-api[:@]")
 VALUES_TOOLS = (("scripts/apporo_checks.py", "Apporo checks"), ("scripts/apporo_parity.py", "Apporo parity"))
 VALUES_TIMEOUT = 600
 PARITY_STATUS_RE = re.compile(r"^(DIFFERS|ERROR|WARN|FAILED)\b|^\s+FAIL\s")
+# unittest's own totals inside a quoted test run: they change with the number of tests, not with the drift
+UNITTEST_TOTALS_RE = re.compile(r"^(FAILED|OK) \((failures|errors|skipped)=")
 
 
 def parity_lines(text):
-    """The status lines of apporo_checks.py / apporo_parity.py and the "values that differ" block
-    (not render diffs). apporo_checks.py quotes the sub-tool's lines behind "   | "."""
-    out, in_block = [], False
+    """(lines, rows): the status lines of apporo_checks.py / apporo_parity.py and the "values that
+    differ" block (not render diffs; apporo_checks.py quotes the sub-tool's lines behind "   | "),
+    and the rows of that block alone ("key: WOOW | Apporo")."""
+    out, rows, in_block = [], [], False
     for raw in text.splitlines():
-        ln = raw[5:] if raw.startswith("   | ") else raw
+        quoted = raw.startswith("   | ")
+        ln = raw[5:] if quoted else raw
         if re.match(r"^\s+values that differ", ln):
             in_block = True
             out.append(ln.strip())
         elif in_block and re.match(r"^\s{10}\S", ln):
             out.append(ln.strip())
+            rows.append(ln.strip())
         else:
             in_block = False
+            if quoted and UNITTEST_TOTALS_RE.match(ln):
+                continue
             if PARITY_STATUS_RE.match(ln) and not ln.startswith("::"):
                 out.append(ln.strip())
-    return [nc.redact(ln)[:300] for ln in out]
+    return [nc.redact(ln)[:300] for ln in out], [nc.redact(ln)[:300] for ln in rows]
+
+
+def values_summary(text, returncode):
+    """The checking tool's own verdict, never a line it quotes from a sub-tool (apporo_checks.py
+    quotes unittest output, "FAILED (failures=2, skipped=6)", before its own "FAILED  Apporo checks:
+    values, parity ..."): its last FAILED line, else its first ERROR line or usage error."""
+    own = [ln.strip() for ln in text.splitlines()
+           if ln.strip() and not ln.startswith("   | ") and not ln.lstrip().startswith("::")]
+    failed = [ln for ln in own if ln.startswith("FAILED")]
+    if failed:
+        return nc.redact(failed[-1])[:300]
+    error = next((ln for ln in own if ln.startswith(("ERROR", "Apporo checks:"))), None)
+    return nc.redact(error)[:300] if error else f"exit {returncode}"
 
 
 def values_alerts(repo, run=subprocess.run):
     """Helm values drift, daily: scripts/apporo_checks.py --strict, or scripts/apporo_parity.py --strict
     in a checkout that only has that one (offline helm template; they come with the Apporo values PR).
     exit 1 (Apporo is behind WOOW prod, or one of its own checks fails) and exit 2 (error) are action
-    alerts; no tool in the checkout is info."""
+    alerts; no tool in the checkout is info. The first detail is the tool's own verdict; the alert's
+    fingerprint is the verdict (which checks failed) and the differing values, so one drift state is
+    one alert (new once), whatever the number of tests that ran."""
     found = [(rel, name) for rel, name in VALUES_TOOLS if os.path.exists(os.path.join(repo, rel))]
     if not found:
         return [{"severity": "info", "title": "values: scripts/apporo_checks.py is not in this checkout",
@@ -2273,14 +2296,15 @@ def values_alerts(repo, run=subprocess.run):
     if r.returncode == 0:
         return []
     text = ((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode("utf-8", "replace")
-    lines = parity_lines(text)
-    summary = next((ln for ln in lines if ln.startswith(("FAILED", "ERROR"))), f"exit {r.returncode}")
+    lines, rows = parity_lines(text)
+    summary = values_summary(text, r.returncode)
     title = {1: f"values: Apporo's Helm values fail the {name} or are behind WOOW prod ({rel} --strict exit 1)",
              2: f"values: the {name} could not run, or Apporo's values do not render ({rel} --strict exit 2)"
              }.get(r.returncode, f"values: {rel} --strict exit {r.returncode}")
     return [{"severity": "action", "title": title, "details": [summary] + [ln for ln in lines if ln != summary][:40] + [
         "bring deploy/apporo-k3s.yaml up to WOOW prod (or fix it) in a PR of its own (docs/APPORO-K3S.md "
-        "〈跟著 WOOW 改〉); the owner merges it, then helm upgrade once scripts/apporo_checks.py --strict passes"]}]
+        "〈跟著 WOOW 改〉); the owner merges it, then helm upgrade once scripts/apporo_checks.py --strict passes"],
+        "fingerprint_basis": [summary] + sorted(set(rows))}]
 
 
 def price_table_alerts(state, version):
