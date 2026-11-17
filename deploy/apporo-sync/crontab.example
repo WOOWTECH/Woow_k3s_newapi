@@ -1,0 +1,3 @@
+# Alternative to the systemd timer (template; not installed). crontab -e on cluster1:
+CRON_TZ=Asia/Taipei
+30 10 * * * $HOME/woow-repos/Woow_k3s_newapi/scripts/apporo-sync-daily.sh >> $HOME/.local/state/apporo-newapi-sync/daily.log 2>&1

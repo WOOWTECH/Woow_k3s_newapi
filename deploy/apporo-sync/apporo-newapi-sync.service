@@ -1,0 +1,15 @@
+# systemd *user* unit for cluster1 (template; not installed by this repo).
+#   cp deploy/apporo-sync/apporo-newapi-sync.{service,timer} ~/.config/systemd/user/
+#   fix the checkout path in ExecStart, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now apporo-newapi-sync.timer
+#   loginctl enable-linger "$USER"     # so the timer also runs without a login session
+# docs/APPORO-SYNC.md 〈排程〉
+[Unit]
+Description=Apporo New API daily content sync (WOOW new-api -> new-api-apporo)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/woow-repos/Woow_k3s_newapi/scripts/apporo-sync-daily.sh
+TimeoutStartSec=900
+Nice=10

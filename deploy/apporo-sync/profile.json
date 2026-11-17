@@ -1,0 +1,57 @@
+{
+  "_comment": "Apporo New API content profile for scripts/apporo_sync.py (docs/APPORO-SYNC.md). Source = WOOW production (read-only SQL); target = new-api-apporo (admin API). Keys starting with _ are comments.",
+  "schema": 1,
+  "newapi_version": "v1.0.0-rc.44",
+  "source": {
+    "namespace": "new-api",
+    "postgres_pod": "newapi-postgres-0",
+    "container": "postgres",
+    "user": "newapi",
+    "db": "newapi",
+    "server_address": "https://newapi.woowtech.io"
+  },
+  "target": {
+    "namespace": "new-api-apporo",
+    "postgres_pod": "newapi-postgres-0",
+    "container": "postgres",
+    "user": "newapi",
+    "db": "newapi",
+    "service": "newapi",
+    "port": 3000,
+    "server_address": "https://newapi.apporo.ai"
+  },
+  "_comment_price": "Apporo's 30:1 rule: ModelRatio and ModelPrice are divided by 30 in float64 and stored exactly as rc.44 stores them. CompletionRatio, CacheRatio, CreateCacheRatio, GroupRatio and the display rate (CUSTOM / 32) stay WOOW's.",
+  "price_divisor": 30,
+  "divided_maps": ["ModelRatio", "ModelPrice"],
+  "_comment_options": "Apporo's own values. UserUsableGroups keeps WOOW's groups with these English labels; the currency symbol row does not exist at WOOW (it shows the default).",
+  "group_labels": {"default": "Default", "free": "Free trial"},
+  "target_options": {"general_setting.custom_currency_symbol": "$"},
+  "secret_like_allowed": ["PasswordLoginEnabled", "PasswordRegisterEnabled"],
+  "_comment_channels": "Source channel id -> Apporo channel (same id unless target_id says otherwise, so abilities equal WOOW's rows for these ids). key_slot names a key of key_secret; set overrides copied fields.",
+  "channels": {
+    "1": {"key_slot": "api", "set": {"remark": "LiteLLM key alias apporo-newapi-litellm (monthly budget)"}},
+    "3": {"key_slot": "paid"},
+    "4": {"key_slot": "api"}
+  },
+  "excluded_channels": {
+    "2": "WOOW's internal ChatGPT subscription test route (group internal): not copied"
+  },
+  "free_groups": ["free"],
+  "key_secret": {"name": "newapi-upstream-keys", "slots": {"api": "api", "paid": "paid"}},
+  "auth": {"pat_secret": "newapi-sync-pat", "password_secret": "newapi-root-credentials"},
+  "price_increase_notice_days": 7,
+  "points_per_usd": 32,
+  "_comment_platform": "The Apporo platform's pricing check (woow_paas_platform services/llm_pricing.py): a change that would make it fail is alert-only.",
+  "platform": {
+    "pricing_profile": "litellm-three-providers-20261025-v1",
+    "allowed_groups": ["default", "free"],
+    "free_models": ["qwen3-4b-aicoder", "qwen3-4b-cluster1"],
+    "paid_pilot_models": [
+      "anthropic/claude-fable-5.1", "anthropic/claude-haiku-5.5", "anthropic/claude-opus-5.5",
+      "anthropic/claude-sonnet-5.5", "chatgpt/gpt-5.5", "chatgpt/gpt-5.6-luna", "chatgpt/gpt-5.6-sol",
+      "chatgpt/gpt-5.6-terra", "chatgpt/gpt-6-astra", "chatgpt/gpt-6-luna", "chatgpt/gpt-6-sol",
+      "chatgpt/gpt-6.1-sol", "deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4.1-flash"
+    ]
+  }
+}
