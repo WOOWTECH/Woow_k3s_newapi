@@ -1792,6 +1792,26 @@ class ToolPriceSyncTest(Harness):
         self.assertIn("HOLD  tool_price_setting.prices[web_search:x/*]", out)
         self.assertEqual(self.tool_map()["web_search:x/*"], 5 / 30)
 
+    def test_a_new_longer_key_is_held_while_the_shorter_keys_decrease_is_written(self):
+        # WOOW adds web_search:x/old* 30 (x/old-model: 20 -> 30, an increase) and lowers x/* 20 -> 5 (x/a-model:
+        # a decrease). x/* no longer prices x/old-model once x/old* exists: its decrease is written at once.
+        self.src.set_map_entry("ModelRatio", "x/a-model", 0.2)
+        self.src.channels[1]["models"] += ",x/a-model"
+        self.synced({"web_search:x/*": 20})
+        self.set_woow_tools({"web_search:x/*": 5, "web_search:x/old*": 30})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search:x/*"], 5 / 30)
+        self.assertNotIn("web_search:x/old*", self.tool_map())
+        self.assertEqual(self.apporo_price("web_search", "x/a-model"), 5 / 30)
+        self.assertEqual(self.apporo_price("web_search", "x/old-model"), 5 / 30)  # until the notice matures
+        self.assertIn("AUTO  tool_price_setting.prices[web_search:x/*]", out)
+        self.assertIn("HOLD  tool_price_setting.prices[web_search:x/old*]", out)
+        (h,) = [h for h in self.state_data()["holds"].values() if h["state"] == "pending-notice"]
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| tool `web_search` (models starting with `x/old`) | per 1,000 calls | 5.333333 | 32 | +500.0% |",
+                      notice)                                                     # current = after today's decrease
+
     def test_a_held_removal_applies_once_its_notice_matured(self):
         # WOOW drops its lower override for x/old (5): x/old-model goes back to the default 10, an increase.
         self.synced({"web_search:x/old*": 5})

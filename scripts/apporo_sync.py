@@ -969,8 +969,8 @@ def classify_tool_prices(tool_items, ctx):
     offered model (now, after this run, or in the last served_history_days days) pays before and after.
       - The entries that, written together, raise no price a customer paid (a model offered now or
         recently) are automatic: decreases, unchanged prices, first listings. Entries are taken out
-        of that set while some paid price still rises: those that set the risen price, or that
-        governed the model before (a removed or changed key).
+        of that set while some paid price still rises: the key that sets the risen price, and the key
+        that set it before when this run removes it.
       - The rest are judged together on top of them: held for a notice when a model still offered
         after this run pays more, kept (info) while only models taken off would.
     Decreases of other tools, and of this tool's other prefixes, are written at once (round 9)."""
@@ -987,13 +987,22 @@ def classify_tool_prices(tool_items, ctx):
         def prices(chosen):
             idx = tool_index(seed, _with_entries(cur, chosen))
             return {m: nc.tool_price(idx, tool, m) for m in models}
+
+        def present(chosen):
+            loaded, _ = nc.tool_price_overrides(json.dumps(_with_entries(cur, chosen), ensure_ascii=False))
+            return set(seed) | set(loaded)
         write = list(its)
         while True:
             pw = prices(write)
             raised = [m for m in sorted(paid, key=str.encode) if pw[m][0] > p0[m][0]]
             if not raised:
                 break
-            keys = {k for m in raised for k in (p0[m][1], pw[m][1]) if k is not None}
+            # The key that sets the risen price, and the key that set it before when this run removes
+            # it (its removal hands the model over). A key still present that no longer governs the
+            # model (a longer key now matches) does not affect its price: its own change stays.
+            kept = present(write)
+            keys = {pw[m][1] for m in raised} | {p0[m][1] for m in raised
+                                                  if p0[m][1] != pw[m][1] and p0[m][1] not in kept}
             left = [it for it in write if it["entry"] not in keys]
             if len(left) == len(write):     # cannot happen (a risen price comes from an entry of this run)
                 left = []
