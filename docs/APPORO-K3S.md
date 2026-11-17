@@ -12,9 +12,9 @@
 
 Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相同。
 
-- `scripts/apporo_parity.py` 比對兩邊 render 的結果：WOOW 正式站在 `new-api`、Apporo 在 `new-api-apporo` 各自 render，Apporo 的 render 要等於「WOOW 正式站＋下表的差異」。proxy pin 另外和 WOOW 正式站目前的 pin 比。CI 只警告、不擋（〈跟著 WOOW 改〉）。
-- 表裡 Apporo 這一欄的值，以及 AI 條款寫給顧客的期間（表下），由 `scripts/tests/test_apporo_values.py` 檢查，會擋。
-- `deploy/apporo-k3s.yaml` 照提交的狀態 render 不出來也是紅燈：共用的 chart 要能 render 每一份提交的 values，和 WOOW stg 一樣（〈跟著 WOOW 改〉的例外）。proxy 休眠期間，只有「打開 proxy」才 render 不出來的話，只會警告。
+- `scripts/apporo_parity.py` 比對兩邊 render 的結果：WOOW 正式站在 `new-api`、Apporo 在 `new-api-apporo` 各自 render，Apporo 的 render 要等於「WOOW 正式站＋下表的差異」。proxy pin 另外和 WOOW 正式站目前的 pin 比。
+- 表裡 Apporo 這一欄的值和〈AI 條款寫的事〉，由 `scripts/tests/test_apporo_values.py` 檢查。
+- 這些檢查全在 CI 最後的「Apporo checks」步驟：動到 Apporo 檔案的 PR 會被擋；只改 WOOW 的 PR 一律只警告，連 Apporo 的檔案 render 不出來也一樣（〈CI 與檢查〉）。
 
 | 項目 | WOOW 正式站 | Apporo |
 |---|---|---|
@@ -22,10 +22,10 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
 | `publicUrl`（＝`SESSION_COOKIE_TRUSTED_URL`） | `https://newapi.woowtech.io` | `https://newapi.apporo.ai` |
 | `newapi.env.DEFAULT_LANGUAGE` | `zh-TW`（chart 預設） | `en`（顧客看得到的錯誤訊息用英文） |
 | `proxy.clients` | `paas-system` 的 `paas-odoo-platform`，component In (server, cron) | `apun` 的 `app.kubernetes.io/name=apun`，component In (application, cron)：網頁 pod（現有）＋排程 pod（拆 pod 後） |
-| `proxy.enabled` | `true` | 先 `false`（休眠：沒有 proxy 的 workload、NetworkPolicy、Valkey ACL），由 Apporo 自己的啟用 PR 打開（〈打開 proxy〉）。休眠期間 `apporo_parity.py` 會另外把 proxy 打開再 render、再和 WOOW 比一次。render 不出來或不一致時，CI 只警告，`--strict` 算錯誤（exit 2）。所以 proxy 的其他設定一樣要跟 WOOW 同步，啟用 PR 之前要先補齊 |
+| `proxy.enabled` | `true` | 先 `false`（休眠：沒有 proxy 的 workload、NetworkPolicy、Valkey ACL），由 Apporo 自己的啟用 PR 打開（〈打開 proxy〉）。休眠期間，`proxy-on` 檢查會另外把 proxy 打開再 render，`apporo_parity.py` 也打開再和 WOOW 比一次（〈CI 與檢查〉）。所以 proxy 的其他設定一樣要跟 WOOW 同步，啟用 PR 之前要先補齊 |
 | `proxy.apExpiresAt`／`opExpiresAt` | `1808450171` | 休眠時 `""`；啟用 PR 填 Apporo PAT 的到期時間（10 位數 unix 秒），`enabled: true` 時測試要求兩個都有 |
 | `proxy.addQuotaHourlyCapPoints`（每小時加額度上限） | 沒設，用 chart 預設 `100000` | `20000`（負責人 2026-11-17 決定，理由見表下） |
-| `proxy.image` | `3947d2b0…`@`sha256:0fdf5e12…` | 相同。可以落後 WOOW 正式站、不能超前：測試只接受 `deploy/woow-k3s.yaml` 現在或以前用過的 pin，而且要有綠色 stg 報告。WOOW 正式站升版之後，另開 PR 跟上。和 WOOW 正式站目前的 pin 不同時，`apporo_parity.py` 會警告，`--strict` 算落後（exit 1）。WOOW 回退舊版、Apporo 反而超前時也一樣 |
+| `proxy.image` | `3947d2b0…`@`sha256:0fdf5e12…` | 相同。可以落後 WOOW 正式站、不能超前：測試只接受 `deploy/woow-k3s.yaml` 現在或以前用過的 pin，而且要有綠色 stg 報告。WOOW 正式站升版之後，另開 PR 跟上。和 WOOW 正式站目前的 pin 不同時，parity 算落後（只改 WOOW 的 PR 只警告）。WOOW 回退舊版、Apporo 反而超前時也一樣 |
 | `encryptedBackup` 的 `capacityVerification`、`restoreVerification`、`ageRecipient` | 目前沒設（加密備份關） | 每套自己的證據，**不可抄 WOOW**：chart 把前兩項綁在 release namespace 上；Apporo 要有自己的容量檢查與還原演練（`evidenceRef`、`archiveSha256` 和 WOOW 的相同，測試會擋）。age 公鑰用同一把或另一把由負責人決定 |
 
 **每小時加額度上限為什麼是 20000**：上限用點數算，兩套的一點不等值。
@@ -36,11 +36,7 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
 - 20000 點＝每小時最多 US$20,000 的轉換（約 US$18,750 的模型用量）。
 - 改副本數或單次上限時要重算：測試要求「上限 ÷ 副本數」至少容得下一筆 10,000 點的轉換。
 
-**AI 條款寫給顧客的期間**：Apporo 的 AI 條款寫了「AI 閘道的每筆用量紀錄與稽核紀錄保留 180 天、每天清理」，以及「AI 閘道的備份 7 天輪替」。對應的值寫在 `deploy/apporo-k3s.yaml` 裡，測試會擋，數值和 WOOW 正式站目前相同：
-
-- `retention.enabled: true`、`retention.suspend: false`、`retention.days: 180`。`days` 是 chart 預設，特地寫出來，chart 改預設時才不會悄悄跟著變。
-- `backup.keepDays: 7`、`backup.suspend: false`，以及 `backup.enabled` 不可是 `false`。加密備份將來打開時，它的 `keepDays` 也要是 `7`。
-- WOOW 改這幾個值時，CI 只警告，Apporo 不自動跟。要改 Apporo，先改 AI 條款（負責人決定），再同時改 values 和測試。
+AI 條款寫給顧客的保留期間、備份、Cloudflare 與 New API 版本，見下一節〈AI 條款寫的事〉。
 
 **WOOW 正式站的 values 有其他改動時，同一個 PR 不必改 `deploy/apporo-k3s.yaml`。** CI 只印警告、job 仍是綠的。目前沒有東西會自動把它拉回來，Apporo 另開 PR 跟上（〈跟著 WOOW 改〉）。真的要讓兩邊不同，就把它加進 `scripts/apporo_parity.py` 的差異清單、`scripts/tests/test_apporo_values.py` 的檢查和這張表，給負責人審。
 
@@ -62,10 +58,29 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
   - 其他設定照抄 WOOW。
 - `scripts/newapi_admin.py` 只認得 WOOW 兩站（`TARGET_URLS`），對 Apporo 一律拒絕寫入。不要改它來繞過，內容重播用專用工具。
 
+## AI 條款寫的事
+
+Apporo 的 AI 條款（v2.2，草稿）對顧客寫了幾件關於 AI 閘道的事。對應的值都寫在 `deploy/apporo-k3s.yaml` 裡，**和 chart 預設相同的也寫出來**：WOOW 改 chart 預設時，Apporo 才不會悄悄跟著變。`values` 檢查（`scripts/tests/test_apporo_values.py` 的 `AiTermsTests`）看兩件事：檔案自己有寫，而且 render 出來的物件真的是這樣。
+
+| 條款 | values（Apporo 檔案自己寫的） | render 裡檢查的 |
+|---|---|---|
+| 6-3「每筆用量紀錄與稽核紀錄保留 180 天，每天清理」 | `retention.enabled: true`、`suspend: false`、`days: 180`、`schedule: "30 4 * * *"` | CronJob `newapi-retention` 沒暫停、每天跑、`RETENTION_DAYS` 是 `180`，清的是 `logs` 與 `audit_logs` |
+| 6-3「AI 閘道的備份 7 天輪替」；負責人決定：叢集內的明文備份 | `backup.enabled: true`、`suspend: false`、`keepDays: 7`、`schedule: "45 3 * * *"`、`storageClassName: longhorn` | CronJob `newapi-pg-backup` 沒暫停、每天跑、明文 `pg_dump -Fc`、`KEEP_DAYS` 是 `7` 並刪掉更舊的檔；備份 PVC 是 Longhorn |
+| 6-1「經過 Cloudflare，我們的網路邊緣」 | `cloudflared.enabled: true` | 有 `newapi-cloudflared` |
+| 1-2「AI 閘道在 newapi.apporo.ai」 | `publicUrl`（上一節的決定值） | `SESSION_COOKIE_TRUSTED_URL` |
+| 12-1「使用未修改的 New API」 | 不寫 `newapi.image`（見下） | new-api 容器用上游的 `docker.io/calciumion/new-api` |
+
+- 這一輪新寫出來的 `backup.enabled`、`backup.storageClassName`、`retention.schedule`、`cloudflared.enabled` 都等於 chart 預設，所以 Apporo 的 render 逐 byte 不變（休眠與打開 proxy 兩種都比過），效果完全相同。差別只在 chart 改預設時，Apporo 不會跟著變。
+- 排程只要求「每天跑」（`分 時 * * *`），不鎖時刻。WOOW 改時刻，Apporo 跟上只要改值，不必改測試。
+- **new-api 映像不寫進 Apporo 的檔案。** chart 附帶的檔案都對應 chart 的 new-api 版本（Valkey 限流腳本與它的 SHA-1、retention 的 rc.44 schema 檢查），Apporo 自己釘別的版本會對不上。所以檢查的是「實際用的映像是上游的 `docker.io/calciumion/new-api`」。WOOW 換成改過的映像時，WOOW 的 PR 只警告，下一個 Apporo 的 PR 與 `--strict` 會擋：要先改條款。
+- 條款 12-2 寫的是發布當時的版本（v1.0.0-rc.44）。條款發布前，確認它和 `chart/values.yaml` 的 `newapi.image.tag` 一致。
+- 加密備份將來打開時，它也要 7 天、Longhorn。
+- 要改這些值：先改 AI 條款（負責人決定），再同時改 values 與 `scripts/tests/test_apporo_values.py`。WOOW 改它自己的這些值時，Apporo 不跟：WOOW 的 PR 只警告，但之後每個 Apporo 的 PR 都會被 `parity` 擋，直到另開 PR 把它寫成文件化的差異（`scripts/apporo_parity.py` 的差異清單、上一節的表），給負責人審。
+
 ## 和 WOOW 相同（不要改）
 
 - chart（同一份 `chart/`，不分叉）、release 名稱 `newapi`：物件名稱相同，proxy 的上游自動是 `http://newapi:3000`。
-- 映像：new-api `v1.0.0-rc.44`、postgres、valkey、cloudflared、newapi-proxy，全部同一個 digest。
+- 映像：new-api `v1.0.0-rc.44`、postgres、valkey、cloudflared、newapi-proxy，全部同一個 digest。new-api 的映像不寫進 Apporo 的檔案，一律用 chart 的（〈AI 條款寫的事〉）。
 - 儲存與備份：Postgres 20Gi＋備份 20Gi（Longhorn 2 份複本）；每天 03:45 明文 `pg_dump`、保留 7 天；180 天清理；加密備份與監控關；helm test 開。WOOW 沒有異地備份，這個缺口也一起照抄。
 - proxy：2 副本、`^wp\d{10}$`、`198.18.1.0-198.19.255.255`、in-flight 與連線上限、免費模型清單（每小時加額度上限除外，見上表）。
 - Secret 名稱：`newapi-secrets`、`newapi-cloudflared`、`newapi-proxy-hmac`、`newapi-proxy-pats`、`newapi-proxy-registry`。
@@ -104,7 +119,7 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
 
 | 檔案 | namespace | 作用 |
 |---|---|---|
-| `deploy/litellm-from-newapi-apporo-ingress.yaml` | `paas-ws-32e92be2`（WOOW 的 LiteLLM，PaaS 工作區 37） | 放行 `new-api-apporo` 的 relay pod 連 LiteLLM 4000。測試檢查它和 `deploy/apporo-k3s.yaml` 的上游設定一致（會擋）；和 `litellm-from-newapi-ingress.yaml` 是否仍只差名稱與來源 namespace，由 `apporo_parity.py` 比對（只警告） |
+| `deploy/litellm-from-newapi-apporo-ingress.yaml` | `paas-ws-32e92be2`（WOOW 的 LiteLLM，PaaS 工作區 37） | 放行 `new-api-apporo` 的 relay pod 連 LiteLLM 4000。`values` 檢查它和 `deploy/apporo-k3s.yaml` 的上游設定、render 出來的 relay pod label 一致；和 `litellm-from-newapi-ingress.yaml` 是否仍只差名稱與來源 namespace，由 `parity` 比對（〈CI 與檢查〉） |
 | `deploy/apun-odoo-to-newapi-apporo-egress.yaml` | `apun` | apun 網頁＋排程 pod 出口到 proxy 8080／8081。`allow-odoo-to-mailcow`、`default-deny-external` 不動。apun 切換**之後**才套（兩個前提見下一點） |
 
 - **apun 那條有兩個前提，兩個都要滿足才套**：
@@ -120,7 +135,7 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
 
 開始前：
 
-- `scripts/apporo_parity.py --strict` 要印 `in sync`。CI 對 Apporo 落後 WOOW 正式站只警告，所以安裝前（以及之後每次 `helm upgrade` 前）自己確認；不是 `in sync` 就先開 PR 讓 `deploy/apporo-k3s.yaml` 跟上。
+- `scripts/apporo_checks.py --strict` 要印 `all Apporo checks passed`（裡面包含 `apporo_parity.py --strict` 的 `in sync`）。CI 對只改 WOOW 的 PR 只警告，所以安裝前（以及之後每次 `helm upgrade` 前）自己確認；沒過就先開 Apporo 的 PR 跟上。
 - 重查一次 Longhorn 剩餘空間：這套是兩個 20Gi 的 volume，各 2 份複本＝80Gi。剩餘空間的下限是 25%（`storage-minimal-available-percentage`），超額配置上限是 205%。
   - 2026-11-17 晚上：31zix 剩 27.9%（194Gi），59mqj 剩 26.4%（181Gi），只比下限多約 10Gi；pggrg 剩 48.1%、z0v3w 剩 43.5%。
   - pggrg 已排程 1,335Gi，上限約 1,408Gi（687Gi×205%），也不寬。
@@ -171,7 +186,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
    接著把兩個帳密檔建成 `newapi-root-credentials`、`newapi-svc-credentials`（`kubectl -n $NS create secret generic <名稱> --from-env-file=<檔>`），然後 `shred -u` 兩個檔。
 8. 簽章金鑰：照 OPERATIONS〈newapi-proxy〉〈第一次建立簽章金鑰〉，namespace 換成 `$NS`；Odoo 端的那一份等 apun 切換時再建（〈apun 那一側〉）。
-9. 開啟用 PR（〈打開 proxy〉），合併後先跑 `scripts/apporo_parity.py --strict`（要 `in sync`）再套用（Valkey 會重啟一次，這時還沒有流量）：
+9. 開啟用 PR（〈打開 proxy〉），合併後先跑 `scripts/apporo_checks.py --strict`（要全部通過）再套用（Valkey 會重啟一次，這時還沒有流量）：
 
    ```bash
    helm upgrade newapi ./chart -n $NS -f deploy/apporo-k3s.yaml --wait
@@ -188,7 +203,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 - 前提：〈安裝〉第 1–8 步做完。`newapi-proxy-registry`、`newapi-proxy-hmac`、`newapi-proxy-pats` 都在，`newapi-secrets` 是 chart 第一次安裝時產生的那一份。
 - 啟用 PR 只改兩件事：`proxy.enabled: true`，以及 `proxy.apExpiresAt`／`opExpiresAt`（〈AP／OP 到期日〉）。測試要求兩個到期日都是 10 位數的 unix 秒；`""` 只在休眠時可以。
 - 每小時加額度上限已經定了（`20000`，〈和 WOOW 正式站的差異〉），啟用 PR 不用改它。
-- 合併後才做〈安裝〉第 9 步。打開之後，CI 對 Apporo 的 render 也會檢查 proxy 元件（和 WOOW 兩套一樣）。
+- 合併後才做〈安裝〉第 9 步。打開之後，「Apporo checks」的 `proxy` 檢查改看提交的 render（五種物件、釘住的映像，和 WOOW 兩套一樣），`proxy-on` 就不用再跑。
 
 ## AP／OP 到期日
 
@@ -231,21 +246,48 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 排程 pod 不接受其他 pod 的連線（Woow_k3s_odoo PR #4 的決定）：排程 pod 的 Odoo 只聽 `127.0.0.1`、健康檢查用 exec 探針，pod IP 上沒有在聽的 port。所以 ingress 方向不用為它新增或修改 NetworkPolicy。出口方向仍要先套 `allow-odoo-cron-to-mailcow`（〈手動套用的物件〉前提 1）。
 
+## CI 與檢查
+
+Apporo 的檢查全部在 CI 最後一個步驟「Apporo checks」（`scripts/apporo_checks.py`）。前面 WOOW 的步驟完全不看 Apporo。
+
+- **只改 WOOW 的 PR 一律不會因為 Apporo 變紅**（負責人 2026-11-17 決定）。檢查照跑，失敗只印 `WARNING (not blocking)` 與 `::warning::`，步驟仍是綠的。包括：
+  - WOOW 的 values、LiteLLM 那條 NP、proxy pin 改了，Apporo 沒跟上；
+  - 共用 chart 改了之後，`deploy/apporo-k3s.yaml` 照提交的狀態 render 不出來，或休眠中的 proxy 設定打開後過不了 chart 的檢查；
+  - WOOW 升 new-api 映像，而 Apporo 落後的 proxy pin 配新映像沒有綠色 stg 報告。
+- **動到 Apporo 檔案的 PR 嚴格檢查**，任何一項失敗都是紅燈。
+  - Apporo 的檔案＝路徑含 `apporo`（不分大小寫）：`deploy/apporo-k3s.yaml`、兩個 Apporo 的 NetworkPolicy 檔、`scripts/apporo_*.py`、`scripts/tests/test_apporo_*.py`、`docs/APPORO-*.md`，以及 PR #45 的 `deploy/apporo-sync/`。
+  - 這樣的 PR 也要讓 Apporo 和 WOOW 正式站一致（`parity`）：WOOW 之前留下的差距，要在這個 PR 一起補上，或寫成文件化的差異。
+- **怎麼判斷改了哪些檔**：和 contract gate（`tests/contract/gate_check.py`）判斷映像升版一樣，拿 base 已提交的檔案和工作目錄比，base 的取法也相同（PR 用 `origin/<base>`，push 到 main 用 `HEAD~1`）。不同的是從 PR 分支和 base 的 merge base 開始比：PR 開了之後才合進 main 的別人的改動，不算這個 PR 的。
+
+| 檢查 | 內容 |
+|---|---|
+| `render` | `helm lint`，以及照提交的狀態在 `new-api-apporo` render |
+| `proxy-on` | proxy 休眠時，把 proxy 打開再 render 一次：chart 的 proxy 檢查（呼叫端、pin、帳號格式…）要過，proxy 的五種物件和釘住的映像都要在。`scripts/chart-guards.sh` 只放 WOOW 的形狀，Apporo 的呼叫端形狀在這裡檢查 |
+| `images` | 照提交的 render，每個映像都釘 digest |
+| `proxy` | 休眠時 render 裡沒有 proxy 物件；打開後和 WOOW 一樣，要有五種物件和一個釘 commit tag＋digest 的映像 |
+| `values` | `scripts/tests/test_apporo_*.py`：〈和 WOOW 正式站的差異〉的決定值、〈AI 條款寫的事〉、proxy pin 與 stg 報告、兩條手動 NP，以及這些工具自己的測試 |
+| `parity` | `scripts/apporo_parity.py --strict`：其他全部等於 WOOW 正式站＋文件化的差異（values、LiteLLM NP 的複本、proxy pin） |
+
+```bash
+scripts/apporo_checks.py --base-ref origin/main   # CI：動到 Apporo 檔案才嚴格
+scripts/apporo_checks.py --strict                 # 安裝與每次 helm upgrade 前、每日同步：全部要過
+scripts/apporo_checks.py                          # 只看報告（只警告）
+scripts/apporo_checks.py --only render,values     # 只跑其中幾項
+```
+
+- `scripts/tests/test_apporo_*.py` 只在 `APPORO_CHECKS=1` 時跑（`values` 檢查會設），在 WOOW 的「Admin tool unit tests」步驟整個 skip。
+- `apporo_parity.py --strict` 單獨跑仍然是嚴格的（落後 exit 1、錯誤 exit 2），但只比 parity；安裝前請跑 `apporo_checks.py --strict`，它也包含 Apporo 自己的值與 render。
+- 不要把這個步驟改成 `continue-on-error`，也不要把 Apporo 的檢查放回 WOOW 的步驟；`scripts/tests/test_apporo_checks.py` 會檢查 CI 只有這一步提到 Apporo。
+
 ## 跟著 WOOW 改
 
-- **values**：WOOW 正式站改 values 的 PR **不必**同時改 `deploy/apporo-k3s.yaml`（負責人 2026-11-17 決定：一致性檢查只警告，絕不擋 WOOW 的 PR）。
-  - CI 的「Apporo follows WOOW prod (warn-only)」步驟跑 `scripts/apporo_parity.py`。Apporo 跟 WOOW 不一致時，它印出不同的 key、render 差異和 `::warning::`，job 仍是綠的。不一致包括：values 不同、LiteLLM 那條 NP 的複本沒跟上、proxy pin 不是 WOOW 正式站目前的 pin、休眠中的 proxy 打開後 render 不出來。
-  - **目前沒有東西會自動把 values 拉回來。** 每天的同步工具（`scripts/apporo_sync.py`，PR #45）只比資料庫內容和映像 pin（pin 不同會告警），不比 values。所以 values 落後，只看得到兩個地方：WOOW 那個 PR 的 CI 警告，以及安裝或 `helm upgrade` 前手動跑的 `--strict`。
-  - 在每天的同步也跑 `scripts/apporo_parity.py --strict` 之前（exit 1／2 就告警，之後再自動開 PR；PR #45 那邊的待辦）：
-    - 每次 Apporo 安裝或 `helm upgrade` 前，自己跑一次 `--strict`，要 `in sync`；
-    - 不是 `in sync`，就先開 PR 讓 `deploy/apporo-k3s.yaml` 跟上，負責人合併後才 `helm upgrade`。
-  - 會擋的只有 Apporo 自己的檢查（`scripts/tests/test_apporo_values.py`、lint、render）：Apporo 的檔案壞了，或上表的值、AI 條款的期間不對，CI 是紅的。
-  - 例外：
-    - **共用 chart**：chart 要能 render 每一份提交的 values，Apporo 和 WOOW stg 一樣。WOOW 的 chart PR 如果讓 `deploy/apporo-k3s.yaml` 照提交的狀態 render 不出來（例如新增必填值），CI 會紅，要在同一個 PR 補上 Apporo 的值。Apporo 的 proxy 休眠期間，只影響「打開 proxy」的新必填值只會警告，等 Apporo 自己的 PR 補；proxy 打開之後，就屬於這個例外。
-    - **共用的 new-api 映像**（`chart/values.yaml`）：測試要求 Apporo 的 proxy pin 搭配目前的 new-api 映像有綠色 stg 報告。Apporo 的 pin 落後 WOOW 時，WOOW 升 new-api 的 PR 會因為這個組合沒有報告而變紅：同一個 PR 讓 Apporo 的 pin 跟上 WOOW（那個組合 WOOW 自己的 gate 已經驗過），或附上這個組合的報告。
-    - proxy 映像：WOOW 正式站先升，Apporo 另開 PR 跟上（負責人合併後再 `helm upgrade`）。Apporo 不能用 WOOW 正式站沒用過的 pin（測試會擋）。
-    - AI 條款寫給顧客的期間（〈和 WOOW 正式站的差異〉表下）：WOOW 改了只會警告，Apporo 不自動跟，要先改條款。
-    - 每套自己的證據（〈和 WOOW 正式站的差異〉）：同步打開的功能要附 Apporo 自己的證據，不抄 WOOW 的。
+- **values、chart、映像**：WOOW 的 PR **不必**同時改 Apporo 的檔案，也**不會**因為 Apporo 變紅（負責人 2026-11-17 決定）。CI 的「Apporo checks」只印警告（〈CI 與檢查〉），連共用 chart 的改動讓 Apporo 的檔案 render 不出來、Apporo 的 pin 落後時 WOOW 升 new-api 映像，也都只警告。
+  - **目前沒有東西會自動把 values 拉回來。** 每天的同步工具（`scripts/apporo_sync.py`，PR #45）只比資料庫內容和映像 pin（pin 不同會告警），不比 values。所以 values 落後只看得到三個地方：WOOW 那個 PR 的 CI 警告、下一個 Apporo PR 的紅燈、安裝或 `helm upgrade` 前跑的 `scripts/apporo_checks.py --strict`。
+  - 看到警告，就另開 Apporo 的 PR 跟上：改 `deploy/apporo-k3s.yaml`；chart 的改動讓 Apporo 的檢查本身要調整時，也改 `scripts/tests/test_apporo_values.py`。這個 PR 是嚴格檢查，全部過了才合併，負責人合併後才 `helm upgrade`。
+  - 在每天的同步也跑 `scripts/apporo_checks.py --strict` 之前（PR #45 那邊的待辦，exit 1／2 就告警，之後再自動開 PR）：每次 Apporo 安裝或 `helm upgrade` 前自己跑一次，要全部通過。
+  - proxy 映像：WOOW 正式站先升，Apporo 另開 PR 跟上（負責人合併後再 `helm upgrade`）。Apporo 不能用 WOOW 正式站沒用過的 pin（測試會擋）。Apporo 的 pin 落後時 WOOW 升 new-api 映像，只會警告；Apporo 的 PR 把 pin 跟上 WOOW 正式站就好，那個組合 WOOW 自己的 gate 已經驗過。
+  - 〈AI 條款寫的事〉的值：WOOW 改了只會警告，Apporo 不自動跟，要先改條款。
+  - 每套自己的證據（〈和 WOOW 正式站的差異〉）：同步打開的功能要附 Apporo 自己的證據，不抄 WOOW 的。
 - **資料庫內容**（新模型、倍率、渠道模型清單）：由每天的同步工具比對 WOOW 指紋後重播，排除 Apporo 專用金鑰、渠道 2、英文化的選項，`ModelRatio`／`ModelPrice` 自動 ÷30。要連動 Apporo 平台設定的變更先不套，寄告警給負責人。
   - 價格（負責人 2026-11-17 決定）：WOOW 降價，Apporo 立即跟著降。WOOW 漲價，Apporo 先**不套**：寄告警、代擬客戶通知，通知發出滿 7 天才套用（Apporo AI 條款的 7 天預告）。
 - 合併任何 PR 都不等於部署：Apporo 的 `helm upgrade` 要另外做。
