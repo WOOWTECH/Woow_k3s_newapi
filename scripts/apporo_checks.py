@@ -70,6 +70,10 @@ NESTED_ENV = 'APPORO_CHECKS_NESTED'
 DETAIL_LINES = 80
 HINT = ('Bring Apporo up to date in a PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉); '
         'scripts/apporo_checks.py --strict must pass before any Apporo install or helm upgrade.')
+STRICT_HINT = ('Fix them in this change: a gap WOOW left behind is closed here too, or written down as a '
+               'documented difference (docs/APPORO-K3S.md 〈CI 與檢查〉).')
+INSTALL_HINT = ('Do not install or helm upgrade Apporo until they pass: follow WOOW prod in an Apporo PR first '
+                '(docs/APPORO-K3S.md 〈跟著 WOOW 改〉).')
 
 
 class UsageError(Exception):
@@ -336,7 +340,7 @@ def main(argv=None, checks=CHECKS):
         return 0
     names = ', '.join(name for name, _ in failed)
     if strict:
-        print(f'FAILED  Apporo checks: {names}. {why}.')
+        print(f'FAILED  Apporo checks: {names}. {why}. {INSTALL_HINT if args.strict else STRICT_HINT}')
         for name, message in failed:
             print(f'::error file={APPORO},title=Apporo {name}::{one_line(message)}')
         return 1

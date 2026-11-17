@@ -334,6 +334,12 @@ class AiTermsTests(unittest.TestCase):
             self.skipTest(f'deploy/apporo-k3s.yaml does not render as committed ({self.render_error}); '
                           'see ApporoValuesTests.test_renders_as_committed')
 
+    def test_daily_schedule_reader(self):
+        for schedule in ('30 4 * * *', '45 3 * * *', '0 */6 * * *', '15 1,13 * * *'):
+            self.assertTrue(runs_every_day(schedule), schedule)
+        for schedule in ('30 4 * * 0', '30 4 1 * *', '30 4 * 1 *', '30 4 */2 * *', '@weekly', '30 4 * *', '', None):
+            self.assertFalse(runs_every_day(schedule), schedule)
+
     def test_terms_values_are_written_out_in_the_apporo_file(self):
         for key, want in TERMS_VALUES.items():
             with self.subTest(key=key):
