@@ -244,6 +244,20 @@ class ParityCheckTests(unittest.TestCase):
     committed Apporo proxy settings would render switched on.
     """
 
+    @classmethod
+    def setUpClass(cls):
+        # The fixtures start from the committed Apporo values. When that file
+        # does not render as committed, CI is red already (Lint and render,
+        # ApporoValuesTests.test_renders_as_committed): skip instead of
+        # repeating that failure in every test below.
+        try:
+            enabled = (parity.values(APPORO).get('proxy') or {}).get('enabled')
+            parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}})
+        except (parity.RenderError, OSError) as err:
+            first = str(err).splitlines()[0] if str(err) else repr(err)
+            raise unittest.SkipTest(f'deploy/apporo-k3s.yaml does not render as committed ({first}); '
+                                    'see ApporoValuesTests.test_renders_as_committed')
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -330,7 +344,9 @@ class ParityCheckTests(unittest.TestCase):
         woow = self.woow({'proxy': {'paritySelftest': 'woow'}})
         rc, out = self.run_tool('--chart', chart, '--woow', woow, '--apporo', self.apporo())
         self.assertEqual(rc, 0, out)
-        self.assertIn('proxy.paritySelftest is required', out)
+        # Which guard helm reports first depends on its template order, so look
+        # for the warning itself and the value-level line.
+        self.assertIn(f'would not render in {parity.APPORO_NAMESPACE} with the proxy switched on', out)
         self.assertIn('values that differ', out)
         self.assertRegex(out, r'\n\s+proxy\.paritySelftest: "woow" \| <unset>\n')
         self.assertIn('::warning', out)
