@@ -20,7 +20,7 @@ Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼
 - Apporo 的檢查全部在 CI 最後的「Apporo checks」步驟（`scripts/apporo_checks.py`），前面 WOOW 的步驟不看 Apporo。
 - **只改 WOOW 的 PR 不會因為 Apporo 變紅**：Apporo 沒跟上、共用 chart 讓 Apporo 的檔案 render 不出來、Apporo 落後的 proxy pin 配新 new-api 映像沒有 stg 報告，都只印警告。
 - 動到 Apporo 檔案（路徑含 `apporo`）的 PR 嚴格檢查：Apporo 決定過的值、AI 條款寫給顧客的事（保留 180 天、備份 7 天、Cloudflare、未修改的 New API），以及和 WOOW 正式站一致。
-- 目前沒有東西會自動同步 values：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_checks.py --strict`。細節見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈CI 與檢查〉。
+- 目前沒有東西會自動同步 values（每日同步工具合併後只會告警）：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_checks.py --strict`。細節見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈CI 與檢查〉。
 
 ## 架構
 

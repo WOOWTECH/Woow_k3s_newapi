@@ -6,12 +6,12 @@ WOOW pull request. CI runs this with --strict as the "parity" check of
 scripts/apporo_checks.py, which fails only a change that touches an Apporo file
 and turns the result into a warning for any other change. Nothing closes the
 gap a WOOW change leaves automatically yet: the daily sync tool
-(scripts/apporo_sync.py, Woow_k3s_newapi PR #45) covers the New API database
-content and the image pins, not these values. Bring deploy/apporo-k3s.yaml up
-to date in a PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉), and before
-every Apporo install or helm upgrade run scripts/apporo_checks.py --strict,
-which runs this with --strict and checks Apporo's own values
-(scripts/tests/test_apporo_values.py) as well.
+(scripts/apporo_sync.py, Woow_k3s_newapi PR #45) runs this with --strict and
+alerts, but opens no PR. Bring deploy/apporo-k3s.yaml up to date in a PR of
+its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉), and before every Apporo install
+or helm upgrade run scripts/apporo_checks.py --strict, which runs this with
+--strict and checks Apporo's own values (scripts/tests/test_apporo_values.py)
+as well.
 
 Offline: helm template only, no cluster, credentials or network.
 
