@@ -18,7 +18,8 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與每小時加額度上限；proxy 先休眠，等 Apporo 自己的 Secret 與 PAT 齊了再用啟用 PR 打開（同時填 PAT 到期日）。
 
 - CI 對 Apporo 自己的值會擋（`scripts/tests/test_apporo_values.py`、lint、render）。
-- 其他差異只警告（`scripts/apporo_parity.py`）：改 WOOW 的 PR 不會因為 Apporo 沒跟上而變紅，差距由每天的同步補上。
+- 其他差異只警告（`scripts/apporo_parity.py`）：改 WOOW 的 PR 不會因為 Apporo 沒跟上而變紅。目前沒有東西會自動同步 values：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_parity.py --strict`。
+- 例外：共用的 chart 與 new-api 映像要對每一份提交的 values 都成立（含 Apporo，和 stg 一樣），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈跟著 WOOW 改〉。
 
 ## 架構
 

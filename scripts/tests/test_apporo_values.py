@@ -2,22 +2,27 @@
 
 Offline: helm template only; no cluster, credentials or network.
 
-Blocking (ApporoValuesTests): deploy/apporo-k3s.yaml renders in new-api-apporo,
-as committed and with the proxy switched on (the chart checks the proxy
-settings only when it renders the proxy); the documented Apporo differences
-hold the decided values (docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉):
-publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and
-proxy.addQuotaHourlyCapPoints 20000, which still lets the largest conversion
-through; proxy.enabled is a literal boolean and the AP/OP expiries match it;
-the proxy pin lags WOOW prod but never leads it and has a green stg report;
-per-instance evidence is never copied from WOOW; the two manual
-NetworkPolicies match Apporo's own values.
+Blocking (ApporoValuesTests): deploy/apporo-k3s.yaml renders in new-api-apporo
+as committed; the documented Apporo differences hold the decided values
+(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉): publicUrl,
+newapi.env.DEFAULT_LANGUAGE, proxy.clients and proxy.addQuotaHourlyCapPoints
+20000, which still lets the largest conversion through; the backup and
+retention periods Apporo's AI terms promise; proxy.enabled is a literal
+boolean and the AP/OP expiries match it; the proxy pin is one WOOW prod has or
+had and has a green stg report; per-instance evidence is never copied from
+WOOW; the two manual NetworkPolicies match Apporo's own values. These read
+Apporo's own file (with chart defaults only where it says so), so a WOOW values
+change cannot turn them red.
 
-Not blocking: whether everything else still equals WOOW prod. That is
-scripts/apporo_parity.py, which CI runs warn-only (owner decision 2026-11-17:
-it never blocks a WOOW PR; the daily sync closes the gap). ParityCheckTests pin
-that behaviour: a WOOW-only change warns and exits 0, --strict exits non-zero,
-and an Apporo file that does not render fails in every mode.
+Not blocking: whether everything else still equals WOOW prod, including
+whether the dormant proxy settings would render switched on and whether the
+pin equals WOOW prod's current one. That is scripts/apporo_parity.py, which CI
+runs warn-only (owner decision 2026-11-17: it never blocks a WOOW PR; nothing
+syncs the values automatically yet, docs/APPORO-K3S.md 〈跟著 WOOW 改〉).
+ParityCheckTests pin that behaviour on fixtures: a WOOW-only change, a new
+proxy value the chart requires for WOOW, and a WOOW pin change warn and exit 0;
+--strict exits non-zero; an Apporo file that does not render as committed fails
+in every mode.
 """
 import contextlib
 import importlib.util
@@ -25,6 +30,7 @@ import io
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,6 +54,10 @@ RELAY_LABELS = {'app.kubernetes.io/name': 'newapi', 'app.kubernetes.io/instance'
 EVIDENCE_HINT = ('per-instance evidence (encryptedBackup.capacityVerification, restoreVerification, '
                  'ageRecipient) must be Apporo\'s own: its own capacity review and restore drill, bound '
                  'to namespace new-api-apporo; never copy WOOW\'s (docs/APPORO-K3S.md)')
+TERMS_HINT = ('Apporo\'s AI terms promise these periods to customers (usage records and audit logs in the AI '
+              'gateway kept 180 days and cleared by daily jobs; gateway backups rotate over 7 days). Change the '
+              'terms first (owner decision), then this file and this test (docs/APPORO-K3S.md '
+              '〈和 WOOW 正式站的差異〉)')
 
 
 def prod_pins():
@@ -90,22 +100,20 @@ class ApporoValuesTests(unittest.TestCase):
         self.values = parity.values(APPORO)
         self.proxy = self.values.get('proxy') or {}
 
-    def render(self, enabled):
+    def test_renders_as_committed(self):
+        # What helm would deploy: the shared chart must render it, like every
+        # committed values file. While the proxy is dormant, whether it would
+        # also render switched on is scripts/apporo_parity.py (warn-only: a new
+        # proxy value the chart requires for WOOW must not block the WOOW PR).
+        enabled = self.proxy.get('enabled')
         try:
-            return parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}})
+            out = parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}})
         except parity.RenderError as err:
-            self.fail(f'deploy/apporo-k3s.yaml does not render in {parity.APPORO_NAMESPACE} with '
-                      f'proxy.enabled={enabled}: {err}\n{EVIDENCE_HINT}')
-
-    def test_renders_as_committed_and_with_the_proxy_switched_on(self):
-        # While dormant, the chart's proxy guards (client selectors, digest,
-        # regex) only run when the proxy is on: check them before activation.
-        for enabled in dict.fromkeys([self.proxy.get('enabled'), True]):
-            with self.subTest(proxy_enabled=enabled):
-                out = self.render(enabled)
-                if enabled:
-                    self.assertIn(f'PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: "{parity.HOURLY_CAP_POINTS}"', out)
-        self.assertIn('newapi.woowtech.io/serves-relay: "true"', self.render(self.proxy.get('enabled')))
+            self.fail(f'deploy/apporo-k3s.yaml does not render in {parity.APPORO_NAMESPACE} as committed '
+                      f'(proxy.enabled={enabled}): {err}\n{EVIDENCE_HINT}')
+        self.assertIn('newapi.woowtech.io/serves-relay: "true"', out)
+        if enabled:
+            self.assertIn(f'PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: "{parity.HOURLY_CAP_POINTS}"', out)
 
     def test_documented_differences_hold_the_decided_values(self):
         env = (self.values.get('newapi') or {}).get('env') or {}
@@ -125,6 +133,21 @@ class ApporoValuesTests(unittest.TestCase):
                                 f'with {proxy["replicas"]} replicas the cap must be at least '
                                 f'{proxy["replicas"] * parity.LARGEST_CONVERSION_POINTS} points: '
                                 'ask the owner for a new value')
+
+    def test_values_promised_in_the_ai_terms(self):
+        # Written out in deploy/apporo-k3s.yaml itself, not inherited from the
+        # chart defaults: neither a WOOW values change nor a new chart default
+        # can move them, and a WOOW change to them only warns (apporo_parity.py).
+        retention = self.values.get('retention') or {}
+        backup = self.values.get('backup') or {}
+        encrypted = self.values.get('encryptedBackup') or {}
+        self.assertEqual({k: retention.get(k) for k in ('enabled', 'suspend', 'days')},
+                         {'enabled': True, 'suspend': False, 'days': 180}, TERMS_HINT)
+        self.assertEqual({k: backup.get(k) for k in ('keepDays', 'suspend')},
+                         {'keepDays': 7, 'suspend': False}, TERMS_HINT)
+        self.assertIsNot(backup.get('enabled'), False, TERMS_HINT)
+        if encrypted.get('enabled'):
+            self.assertEqual(encrypted.get('keepDays'), 7, TERMS_HINT)
 
     def test_per_instance_evidence_is_not_copied_from_prod(self):
         prod = parity.values(PROD).get('encryptedBackup') or {}
@@ -215,8 +238,10 @@ class ApporoValuesTests(unittest.TestCase):
 class ParityCheckTests(unittest.TestCase):
     """scripts/apporo_parity.py: warn-only for WOOW changes, never for a broken Apporo file.
 
-    Fixtures are the committed files' values plus one change, written as JSON
-    (valid YAML), so these hold whether or not the committed pair is in sync.
+    Fixtures are the committed files' values plus the change under test, with
+    Apporo's proxy state set explicitly, written as JSON (valid YAML): these
+    hold whether or not the committed pair is in sync, and whether or not the
+    committed Apporo proxy settings would render switched on.
     """
 
     def setUp(self):
@@ -233,21 +258,31 @@ class ParityCheckTests(unittest.TestCase):
         proc = subprocess.run([sys.executable, str(TOOL), *map(str, args)], cwd=ROOT, text=True, capture_output=True)
         return proc.returncode, proc.stdout + proc.stderr
 
+    def woow(self, change, name='woow.json'):
+        return self.fixture(name, parity.merge(parity.values(PROD), change))
+
+    def apporo(self, enabled=False, change=None, name='apporo.json'):
+        proxy = {'enabled': enabled}
+        if enabled:  # an activation PR sets both expiries (ApporoValuesTests)
+            proxy.update(apExpiresAt='1808450171', opExpiresAt='1808450171')
+        return self.fixture(name, parity.merge(parity.values(APPORO), {'proxy': proxy}, change or {}))
+
     def woow_only_change(self):
-        return self.fixture('woow.json', parity.merge(parity.values(PROD),
-                                                      {'newapi': {'env': {'PARITY_SELFTEST': 'woow-only'}}}))
+        return self.woow({'newapi': {'env': {'PARITY_SELFTEST': 'woow-only'}}})
 
     def test_woow_only_change_warns_and_exits_0(self):
-        rc, out = self.run_tool('--woow', self.woow_only_change())
+        rc, out = self.run_tool('--woow', self.woow_only_change(), '--apporo', self.apporo())
         self.assertEqual(rc, 0, out)
-        self.assertIn('::warning file=deploy/apporo-k3s.yaml', out)
+        self.assertIn('::warning file=', out)
         self.assertIn('WARNING (not blocking)', out)
+        self.assertNotIn('::error', out)
         if 'cannot compare' not in out:
             self.assertIn('newapi.env.PARITY_SELFTEST', out)
 
     def test_strict_mode_fails_when_apporo_differs(self):
-        rc, out = self.run_tool('--strict', '--woow', self.woow_only_change())
+        rc, out = self.run_tool('--strict', '--woow', self.woow_only_change(), '--apporo', self.apporo())
         self.assertNotEqual(rc, 0, out)
+        self.assertIn('FAILED', out)
         self.assertNotIn('::warning', out)
 
     def test_apporo_file_that_does_not_parse_fails_in_every_mode(self):
@@ -258,19 +293,69 @@ class ParityCheckTests(unittest.TestCase):
                 self.assertEqual(rc, 2, out)
                 self.assertIn('::error file=', out)
 
-    def test_apporo_proxy_settings_that_do_not_render_fail_while_dormant(self):
-        # Dormant renders fine; switched on, the chart refuses a client without
-        # a component selector. That is Apporo's own validity: an error.
-        wide = [dict(parity.APUN_CLIENTS[0], podSelector={'matchLabels': {'app.kubernetes.io/name': 'apun'}})]
-        apporo = self.fixture('apporo.json', parity.merge(parity.values(APPORO),
-                                                          {'proxy': {'enabled': False, 'clients': wide}}))
+    def wide_clients(self):
+        # The chart refuses a client without a component selector, but only
+        # when it renders the proxy.
+        return {'proxy': {'clients': [dict(parity.APUN_CLIENTS[0],
+                                           podSelector={'matchLabels': {'app.kubernetes.io/name': 'apun'}})]}}
+
+    def test_dormant_settings_that_fail_only_switched_on_warn_and_strict_fails(self):
+        apporo = self.apporo(change=self.wide_clients())
         rc, out = self.run_tool('--apporo', apporo)
-        self.assertEqual(rc, 2, out)
+        self.assertEqual(rc, 0, out)
         self.assertIn('proxy switched on', out)
+        self.assertIn('::warning', out)
+        self.assertNotIn('::error', out)
+        rc, out = self.run_tool('--strict', '--apporo', apporo)
+        self.assertEqual(rc, 2, out)
+        self.assertIn('ERROR', out)
+
+    def test_active_apporo_that_does_not_render_fails_in_every_mode(self):
+        apporo = self.apporo(enabled=True, change=self.wide_clients())
+        for args in ((), ('--strict',)):
+            with self.subTest(args=args):
+                rc, out = self.run_tool(*args, '--apporo', apporo)
+                self.assertEqual(rc, 2, out)
+                self.assertIn('::error file=', out)
+
+    def test_new_proxy_value_the_chart_requires_for_woow_only_warns_while_dormant(self):
+        # A WOOW chart PR: the chart now refuses a proxy without a new value,
+        # and the PR sets it for WOOW only. Reproduced on a copy of the chart.
+        chart = self.tmp / 'chart'
+        shutil.copytree(ROOT / 'chart', chart)
+        (chart / 'templates/zz-parity-selftest.yaml').write_text(
+            '{{- if and .Values.proxy.enabled (not .Values.proxy.paritySelftest) }}\n'
+            '{{- fail "proxy.paritySelftest is required when proxy.enabled" }}\n'
+            '{{- end }}\n')
+        woow = self.woow({'proxy': {'paritySelftest': 'woow'}})
+        rc, out = self.run_tool('--chart', chart, '--woow', woow, '--apporo', self.apporo())
+        self.assertEqual(rc, 0, out)
+        self.assertIn('proxy.paritySelftest is required', out)
+        self.assertIn('proxy.paritySelftest', out.split('values that differ', 1)[-1])
+        self.assertIn('::warning', out)
+        self.assertNotIn('::error', out)
+        rc, out = self.run_tool('--strict', '--chart', chart, '--woow', woow, '--apporo', self.apporo())
+        self.assertEqual(rc, 2, out)
+        # Once Apporo is active, its committed render is what helm deploys:
+        # the chart PR has to set the value for Apporo too (as for WOOW stg).
+        rc, out = self.run_tool('--chart', chart, '--woow', woow, '--apporo', self.apporo(enabled=True))
+        self.assertEqual(rc, 2, out)
+        self.assertIn('::error file=', out)
+
+    def test_proxy_pin_that_differs_from_woow_prod_warns_and_strict_fails(self):
+        # WOOW prod moved on (or rolled back); Apporo keeps its pin.
+        woow = self.woow({'proxy': {'image': {'tag': 'a' * 40, 'digest': 'sha256:' + 'b' * 64}}})
+        rc, out = self.run_tool('--woow', woow, '--apporo', self.apporo())
+        self.assertEqual(rc, 0, out)
+        self.assertIn('DIFFERS proxy pin', out)
+        self.assertIn('::warning', out)
+        rc, out = self.run_tool('--strict', '--woow', woow, '--apporo', self.apporo())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn('proxy pin', out.rsplit('FAILED', 1)[-1])
 
     def test_litellm_copy_that_falls_behind_only_warns(self):
         woow_np = self.fixture('litellm-woow.yaml', LITELLM_PROD.read_text() + 'selftest: woow-only\n')
-        rc, out = self.run_tool('--litellm-woow', woow_np)
+        rc, out = self.run_tool('--litellm-woow', woow_np, '--apporo', self.apporo())
         self.assertEqual(rc, 0, out)
         self.assertIn('no longer mirrors', out)
         self.assertIn('::warning', out)

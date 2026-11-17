@@ -50,11 +50,14 @@ jobs:
 
       # Does deploy/apporo-k3s.yaml still equal WOOW prod plus the documented
       # Apporo differences (docs/APPORO-K3S.md)? Warn-only by owner decision
-      # (2026-11-17): a WOOW change that leaves Apporo behind prints a
-      # ::warning:: and the job stays green; the daily sync closes the gap with
-      # a follow-up PR (scripts/apporo_parity.py --strict). An Apporo file that
-      # does not render, as committed or with its proxy switched on, still
-      # fails here (exit 2).
+      # (2026-11-17): a WOOW change that leaves Apporo behind (values, the
+      # LiteLLM ingress copy, the proxy pin, or a proxy value the chart now
+      # requires while Apporo's proxy is dormant) prints a ::warning:: and the
+      # job stays green. Nothing syncs these values automatically yet: Apporo
+      # follows in a PR of its own, checked with --strict before its install or
+      # helm upgrade. An Apporo file that does not render as committed still
+      # fails here (exit 2): the shared chart must render every committed values
+      # file, like WOOW stg.
       - name: Apporo follows WOOW prod (warn-only)
         run: python3 scripts/apporo_parity.py
 
@@ -69,8 +72,8 @@ jobs:
       # newapi-proxy must be active with a real pinned image in every WOOW
       # environment. Apporo stays dormant (proxy.enabled: false) until its own
       # activation PR (docs/APPORO-K3S.md 〈打開 proxy〉); from then on it is
-      # checked like the others. While dormant, scripts/tests/test_apporo_values.py
-      # renders it with the proxy switched on (the chart's proxy guards).
+      # checked like the others. While dormant, scripts/apporo_parity.py also
+      # renders it with the proxy switched on (the chart's proxy guards; warn-only).
       - name: newapi-proxy component
         run: |
           set -euo pipefail
@@ -155,8 +158,10 @@ jobs:
       # green stg report for exactly those digests
       # (tests/contract/reports/<tag>_<sha>.json; docs/OPERATIONS.md 〈升版〉).
       # deploy/apporo-k3s.yaml's proxy pin needs the same green report and must
-      # be a pin deploy/woow-k3s.yaml has or had (Apporo never leads WOOW prod);
-      # the admin tool unit tests check it (scripts/tests/test_apporo_values.py).
+      # be a pin deploy/woow-k3s.yaml has or had; the admin tool unit tests
+      # check it (scripts/tests/test_apporo_values.py). Whether it is WOOW prod's
+      # current pin is scripts/apporo_parity.py (warn-only; it also catches a
+      # WOOW rollback that leaves Apporo ahead).
       - name: Contract gate (image bump needs a green stg report)
         run: |
           set -euo pipefail

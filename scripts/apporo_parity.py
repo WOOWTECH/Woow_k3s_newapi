@@ -3,11 +3,13 @@
 
 Owner decision 2026-11-17: Apporo follows WOOW prod, but this comparison never
 blocks a WOOW pull request. CI runs it warn-only: when Apporo is behind it
-prints a warning and exits 0, and the daily sync on cluster1 closes the gap
-(it runs this with --strict and opens the follow-up PR for
-deploy/apporo-k3s.yaml; docs/APPORO-K3S.md 〈跟著 WOOW 改〉). Apporo's own
-values are checked separately, and those checks do block:
-scripts/tests/test_apporo_values.py.
+prints a warning and exits 0. Nothing closes that gap automatically yet: the
+daily sync tool (scripts/apporo_sync.py, Woow_k3s_newapi PR #45) covers the
+New API database content and the image pins, not these values. Until it runs
+this with --strict, run --strict yourself before every Apporo install or helm
+upgrade, and bring deploy/apporo-k3s.yaml up to date in a PR of its own
+(docs/APPORO-K3S.md 〈跟著 WOOW 改〉). Apporo's own values are checked
+separately, and those checks do block: scripts/tests/test_apporo_values.py.
 
 Offline: helm template only, no cluster, credentials or network.
 
@@ -16,6 +18,9 @@ Offline: helm template only, no cluster, credentials or network.
   differences (below; docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉) layered on
   top. While Apporo's proxy is dormant, both are compared again with the proxy
   switched on, so its settings do not fall behind before the activation PR.
+- The proxy pin: the render comparison takes Apporo's own pin (it may lag),
+  so the pin is compared on its own with WOOW prod's current pin. A different
+  pin means Apporo is behind, or WOOW prod rolled back and Apporo now leads.
 - Per-instance evidence is never compared (nor copied): encryptedBackup
   capacityVerification and restoreVerification, which the chart binds to the
   release namespace, and ageRecipient.
@@ -26,10 +31,16 @@ Offline: helm template only, no cluster, credentials or network.
   scripts/apporo_parity.py [--strict]
 
 Exit: 0 in sync, or behind without --strict (warning printed); 1 behind with
---strict; 2 error. An Apporo file that does not render (as committed, or with
-the proxy switched on) or cannot be read is Apporo's own validity, so it is an
-error in both modes. A WOOW side that cannot be rendered is a warning without
---strict: the WOOW lint/render step reports a broken WOOW file on its own.
+--strict; 2 error.
+- An Apporo file that cannot be read, or does not render as committed, is an
+  error in both modes: that is what helm would deploy, and the shared chart
+  must render every committed values file (WOOW stg likewise).
+- While Apporo's proxy is dormant, a render that fails only with the proxy
+  switched on is a warning without --strict: a chart change made for WOOW, such
+  as a new required proxy value, must not block the WOOW PR. With --strict it
+  is an error (Apporo cannot be activated like that).
+- A WOOW side that cannot be rendered is a warning without --strict: the WOOW
+  lint/render step reports a broken WOOW file on its own.
 """
 import argparse
 import difflib
@@ -111,12 +122,12 @@ def values(path):
     return json.loads(out.split('# Source: values-dump/templates/values.json\n', 1)[1])
 
 
-def render(path, namespace, extra=None):
+def render(path, namespace, extra=None, chart=CHART):
     """``helm template`` of ``path`` (plus ``extra`` values) in ``namespace``."""
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tmp:
         json.dump(extra or {}, tmp)
         tmp.flush()
-        out = helm('template', 'newapi', str(CHART), '-n', namespace, '-f', str(path), '-f', tmp.name)
+        out = helm('template', 'newapi', str(chart), '-n', namespace, '-f', str(path), '-f', tmp.name)
     # Offline Helm generates random Secret bytes (templates/secret.yaml): keep
     # the key names, drop the values.
     out = re.sub(rf'(?m)^(  (?:{SECRET_KEYS}):).*$', r'\1 <redacted>', out)
@@ -181,6 +192,17 @@ def value_differences(chart_values, woow_values, apporo_values):
     return out
 
 
+def proxy_pin(tree):
+    """(tag, digest) of proxy.image in effective values."""
+    image = (tree.get('proxy') or {}).get('image') or {}
+    return image.get('tag') or '', image.get('digest') or ''
+
+
+def pin_text(pin):
+    tag, digest = pin
+    return f'{tag[:12] or "<no tag>"}@{digest.split(":")[-1][:12] or "<no digest>"}'
+
+
 def manifest_lines(path):
     return [line.rstrip() for line in Path(path).read_text().splitlines()
             if line.strip() and not line.lstrip().startswith('#')]
@@ -203,7 +225,8 @@ def one_line(text):
     return text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 
 
-def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, litellm_apporo=LITELLM_APPORO):
+def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, litellm_apporo=LITELLM_APPORO,
+          chart=CHART):
     """Print the comparison and return the exit code."""
     print(f'Apporo follows WOOW prod: {rel(apporo)} vs {rel(woow)} + documented differences '
           f'({"strict" if strict else "warn-only"}; docs/APPORO-K3S.md 〈跟著 WOOW 改〉)')
@@ -222,24 +245,42 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
     enabled = (apporo_values.get('proxy') or {}).get('enabled')
     if enabled is not None and not isinstance(enabled, bool):
         return apporo_error(f'{rel(apporo)} proxy.enabled', 'must be a literal true or false')
-    # As committed, then (while dormant) with the proxy switched on: the chart
-    # checks the proxy settings only when it renders the proxy.
-    states = [enabled] if enabled is True else [enabled, True]
     label = {enabled: f'proxy as committed (enabled: {json.dumps(enabled)})'}
     label.setdefault(True, 'proxy switched on')
 
-    renders = {}
-    for state in states:
-        try:
-            renders[state] = render(apporo, APPORO_NAMESPACE, {'proxy': {'enabled': state}})
-        except RenderError as err:
-            return apporo_error(f'{rel(apporo)} does not render in {APPORO_NAMESPACE} with {label[state]}', err)
+    # As committed: what helm would deploy. The shared chart must render it in
+    # every mode, like every other committed values file.
+    try:
+        renders = {enabled: render(apporo, APPORO_NAMESPACE, {'proxy': {'enabled': enabled}}, chart)}
+    except RenderError as err:
+        return apporo_error(f'{rel(apporo)} does not render in {APPORO_NAMESPACE} with {label[enabled]}', err)
 
-    differs, cannot = [], []
+    differs, cannot, errors = [], [], []
+    # While dormant, also with the proxy switched on (the chart checks the proxy
+    # settings only when it renders the proxy). Not deployed yet, so a failure
+    # here only warns: a chart change for WOOW, such as a new required proxy
+    # value, must not block the WOOW PR. --strict, the check before an Apporo
+    # install or upgrade, treats it as an error.
+    switched_on = None
+    states = [enabled]
+    if enabled is not True:
+        try:
+            renders[True] = render(apporo, APPORO_NAMESPACE, {'proxy': {'enabled': True}}, chart)
+            states.append(True)
+        except RenderError as err:
+            first = str(err).splitlines()[0] if str(err) else repr(err)
+            switched_on = (f'{rel(apporo)} would not render in {APPORO_NAMESPACE} with the proxy switched on '
+                           f'(dormant now; the activation PR needs it): {first}')
+            if strict:
+                print(f'ERROR   {switched_on}')
+                errors.append(switched_on)
+            else:
+                print(f'WARN    {switched_on}')
+
     diffs = {}
     for state in states:
         try:
-            expected = render(woow, WOOW_NAMESPACE, documented(apporo_values, state))
+            expected = render(woow, WOOW_NAMESPACE, documented(apporo_values, state), chart)
         except RenderError as err:
             cannot.append(f'{rel(woow)} + documented differences does not render in {WOOW_NAMESPACE} '
                           f'({label[state]}): {str(err).splitlines()[0] if str(err) else err}')
@@ -256,21 +297,37 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
         differs.append(label[state])
 
     keys = []
-    if diffs:
-        try:
-            keys = value_differences(values(CHART / 'values.yaml'), values(woow), apporo_values)
-        except (RenderError, OSError) as err:
-            print(f'        (value-level comparison unavailable: {err})')
+    chart_values = woow_values = None
+    try:
+        chart_values, woow_values = values(Path(chart) / 'values.yaml'), values(woow)
+    except (RenderError, OSError) as err:
+        cannot.append(f'{rel(woow)} values cannot be read: {str(err).splitlines()[0] if str(err) else err}')
+        print(f'WARN    cannot compare the proxy pin or the values: {cannot[-1]}')
+    if (diffs or switched_on) and woow_values is not None:
+        keys = value_differences(chart_values, woow_values, apporo_values)
         if keys:
             print('        values that differ (WOOW prod + documented differences | Apporo):')
             for key, want, got in keys:
                 print(f'          {key}: {short(want)} | {short(got)}')
-        else:
+        elif diffs:
             print('        no value-level difference found; see the render diff')
+    if diffs:
         state, diff = next(iter(diffs.items()))
         print(f'        render diff ({label[state]}), first {DIFF_LINES} lines:')
         for line in diff[:DIFF_LINES]:
             print(f'          {line}')
+
+    # The render comparison above takes Apporo's own pin; compare it with WOOW
+    # prod's current one here.
+    if woow_values is not None:
+        mine, theirs = proxy_pin(merge(chart_values, apporo_values)), proxy_pin(merge(chart_values, woow_values))
+        if mine == theirs:
+            print(f'ok      proxy pin = WOOW prod\'s ({pin_text(theirs)})')
+        else:
+            print(f'DIFFERS proxy pin: Apporo {pin_text(mine)} | WOOW prod {pin_text(theirs)}. Apporo is behind '
+                  'WOOW prod, or WOOW prod rolled back and Apporo now leads: follow WOOW prod\'s pin in an Apporo '
+                  'PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉)')
+            differs.append('proxy pin')
 
     try:
         expected_np = [line.replace(line.strip(), LITELLM_SWAP[line.strip()]) if line.strip() in LITELLM_SWAP
@@ -292,21 +349,25 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
                 print(f'          {line}')
             differs.append(rel(litellm_apporo))
 
-    if not differs and not cannot:
+    if not differs and not cannot and not switched_on:
         print('in sync')
         return 0
-    what = ', '.join(k for k, _, _ in keys[:8]) + (f' (+{len(keys) - 8} more)' if len(keys) > 8 else '')
+    names = [k for k, _, _ in keys] + (['proxy pin'] if 'proxy pin' in differs else [])
+    what = ', '.join(names[:8]) + (f' (+{len(names) - 8} more)' if len(names) > 8 else '')
     summary = []
-    if differs:
+    if differs or names:
         summary.append(f'Apporo differs from WOOW prod + the documented differences ({what or "; ".join(differs)})')
+    if switched_on:
+        summary.append(switched_on)
     if cannot:
         summary.append('could not compare: ' + '; '.join(cannot))
     if strict:
         print('FAILED  ' + '. '.join(summary))
-        return 1 if not cannot else 2
-    note = ('. Warn-only (owner decision 2026-11-17): this does not block the PR; the daily sync opens the '
-            'follow-up for deploy/apporo-k3s.yaml. Before an Apporo helm upgrade run scripts/apporo_parity.py '
-            '--strict (docs/APPORO-K3S.md 〈跟著 WOOW 改〉)')
+        return 2 if (errors or cannot) else 1
+    note = ('. Warn-only (owner decision 2026-11-17): this does not block the PR. Nothing syncs these values '
+            'automatically yet: bring deploy/apporo-k3s.yaml up to date in a PR of its own, and run '
+            'scripts/apporo_parity.py --strict before any Apporo install or helm upgrade '
+            '(docs/APPORO-K3S.md 〈跟著 WOOW 改〉)')
     print('WARNING (not blocking) ' + '. '.join(summary) + note)
     print(f'::warning file={rel(apporo)},title=Apporo does not follow WOOW prod::' + one_line('. '.join(summary) + note))
     return 0
@@ -315,13 +376,14 @@ def check(strict=False, woow=WOOW, apporo=APPORO, litellm_woow=LITELLM_WOOW, lit
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--strict', action='store_true',
-                        help='exit 1 when Apporo is behind (the daily sync; before an Apporo helm upgrade)')
+                        help='exit 1 when Apporo is behind (before an Apporo install or helm upgrade)')
     parser.add_argument('--woow', type=Path, default=WOOW, help=argparse.SUPPRESS)
     parser.add_argument('--apporo', type=Path, default=APPORO, help=argparse.SUPPRESS)
     parser.add_argument('--litellm-woow', type=Path, default=LITELLM_WOOW, help=argparse.SUPPRESS)
     parser.add_argument('--litellm-apporo', type=Path, default=LITELLM_APPORO, help=argparse.SUPPRESS)
+    parser.add_argument('--chart', type=Path, default=CHART, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    return check(args.strict, args.woow, args.apporo, args.litellm_woow, args.litellm_apporo)
+    return check(args.strict, args.woow, args.apporo, args.litellm_woow, args.litellm_apporo, args.chart)
 
 
 if __name__ == '__main__':

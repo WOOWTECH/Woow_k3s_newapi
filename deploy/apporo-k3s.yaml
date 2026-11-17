@@ -6,10 +6,13 @@
 # activation PR (which also sets proxy.ap/opExpiresAt); proxy.image may lag WOOW
 # prod but never lead it; per-instance backup evidence (encryptedBackup
 # capacity/restore verification, ageRecipient) is Apporo's own.
+# The backup and retention periods below are also promised in Apporo's AI terms.
 # scripts/tests/test_apporo_values.py (blocking) holds these Apporo values;
 # scripts/apporo_parity.py compares the rest with WOOW prod. That comparison only
-# warns in CI (owner decision 2026-11-17): a WOOW prod change is mirrored here by
-# the daily sync's follow-up PR, not necessarily in the WOOW PR itself.
+# warns in CI (owner decision 2026-11-17): a WOOW PR does not have to change this
+# file, and nothing brings it up to date automatically yet (the daily sync tool
+# covers database content and image pins, not values): follow WOOW prod in a PR
+# of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉).
 # Install and upgrade with this file as is (never --set; docs/APPORO-K3S.md 〈安裝〉),
 # after scripts/apporo_parity.py --strict says "in sync":
 #   helm upgrade --install newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml --wait
@@ -35,6 +38,8 @@ networkPolicy:
         app.kubernetes.io/component: app
       port: 4000
 
+# Apporo's AI terms: "Backups of the AI gateway rotate over 7 days" (same as WOOW
+# prod; a change needs the terms changed first).
 backup:
   schedule: "45 3 * * *"
   keepDays: 7
@@ -48,9 +53,13 @@ encryptedBackup:
   suspend: true
   pruneEnabled: false
 
+# Apporo's AI terms: usage records and audit logs are "kept for 180 days" and
+# "cleared by daily jobs". days is the chart default, written out so a new chart
+# default cannot change it silently.
 retention:
   enabled: true
   suspend: false
+  days: 180
 
 # Same image, tuning and Secret names as WOOW prod; the Secrets themselves are new
 # values created by hand in new-api-apporo (docs/APPORO-K3S.md 〈Secret〉).
