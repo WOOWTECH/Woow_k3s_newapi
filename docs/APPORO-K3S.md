@@ -262,6 +262,8 @@ Apporo 的檢查全部在 CI 最後一個步驟「Apporo checks」（`scripts/ap
   - Apporo 的檔案＝路徑含 `apporo`（不分大小寫）：`deploy/apporo-k3s.yaml`、兩個 Apporo 的 NetworkPolicy 檔、`scripts/apporo_*`（含 `scripts/apporo_check_drift.sh`）、`scripts/tests/test_apporo_*.py`、`docs/APPORO-*.md`，以及 PR #45 的 `deploy/apporo-sync/`。
   - 這樣的 PR 也要讓 Apporo 和 WOOW 正式站一致（`parity`）：WOOW 之前留下的差距，要在這個 PR 一起補上，或寫成文件化的差異。
 - **怎麼判斷改了哪些檔**：和 contract gate（`tests/contract/gate_check.py`）判斷映像升版一樣，拿 base 已提交的檔案和工作目錄比，base 的取法也相同（PR 用 `origin/<base>`，push 到 main 用 `HEAD~1`）。不同的是從 PR 分支和 base 的 merge base 開始比：PR 開了之後才合進 main 的別人的改動，不算這個 PR 的。
+  - 檔名不是 UTF-8 也照常判斷（log 裡顯示成 `\xNN`），不會讓這一步出錯。
+  - 找不到 base（沒 fetch）時這一步失敗（exit 2），和 contract gate 一樣。其他讓 git 說不出改了哪些檔的情況（例如淺 clone 找不到 merge base），一律**只警告**：照跑全部檢查但只印警告，並用 `::warning::` 說明判斷不出來。這種結果不能拿來合併動到 Apporo 檔案的 PR，要另外跑 `scripts/apporo_checks.py --strict`。
 
 | 檢查 | 內容 |
 |---|---|

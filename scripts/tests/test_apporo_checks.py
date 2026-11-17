@@ -173,6 +173,34 @@ class ScopeTests(unittest.TestCase):
         self.repo.git('merge', '-q', '--no-ff', '--no-edit', 'pr2')
         self.assertTrue(self.repo.strict('HEAD~1')[0])
 
+    def test_file_names_that_are_not_utf8_are_paths_like_any_other(self):
+        # git prints file names as bytes. A Latin-1 name in a WOOW change stays
+        # warn-only; in an Apporo change it is strict, and the mode line prints.
+        def touch(name):
+            fd = os.open(os.fsencode(self.repo.path) + b'/' + name, os.O_WRONLY | os.O_CREAT, 0o644)
+            os.write(fd, b'notes\n')
+            os.close(fd)
+
+        touch(b'docs/rollout-notes-caf\xe9.md')
+        self.repo.commit('a WOOW note, Latin-1 name')
+        self.assertEqual(self.repo.changed('main'), [os.fsdecode(b'docs/rollout-notes-caf\xe9.md')])
+        strict, why = self.repo.strict('main')
+        self.assertFalse(strict)
+        self.assertIn('none of the 1 files', why)
+        touch(b'docs/APPORO-caf\xe9.md')
+        strict, why = self.repo.strict('main')
+        self.assertTrue(strict)
+        self.assertIn('docs/APPORO-caf\\xe9.md', why)
+        why.encode('utf-8')  # printable as it is: no surrogates left
+
+    def test_git_that_cannot_tell_the_scope_is_a_scope_error(self):
+        # An unrelated history (or a shallow clone) has no merge base with the base.
+        self.repo.git('checkout', '-q', '--orphan', 'unrelated')
+        self.repo.commit('no common history')
+        with self.assertRaises(checks.ScopeError) as caught:
+            self.repo.strict('main')
+        self.assertIn('git merge-base', str(caught.exception))
+
     def test_missing_base_ref_is_an_error_not_a_mode(self):
         with self.assertRaises(checks.UsageError) as caught:
             self.repo.strict('origin/main')
@@ -237,6 +265,20 @@ class ModeTests(unittest.TestCase):
             self.assertIn('::warning file=deploy/apporo-k3s.yaml,title=Apporo setup (not blocking)::', out)
             rc, out = self.main('--strict', which=(('a', 'A', fake('ok', 'fine')),))
             self.assertEqual(rc, 1, out)
+
+    def test_a_scope_git_cannot_tell_runs_warn_only_with_a_warning(self):
+        which = (('a', 'A', fake('ok', 'fine')), ('b', 'B', fake('fail', 'broken')))
+        for error in (checks.ScopeError('git merge-base origin/main HEAD: exit 1'), RuntimeError('a bug')):
+            with self.subTest(error=error), mock.patch.object(checks, 'changed_paths', side_effect=error):
+                rc, out = self.main('--base-ref', 'HEAD', which=which)
+                self.assertEqual(rc, 0, out)
+                self.assertIn('mode: warn-only: could not tell whether this change touches Apporo files', out)
+                self.assertRegex(out, r'(?m)^::warning title=Apporo checks \(not blocking\)::warn-only: could not tell')
+                self.assertIn('must not be merged on this result', out)
+                self.assertIn('WARNING (not blocking) Apporo checks failed: b.', out)
+                self.assertNotIn('::error', out)
+                if isinstance(error, RuntimeError):
+                    self.assertIn('RuntimeError: a bug', out)  # the traceback, quoted
 
     def test_all_passed_prints_no_annotation(self):
         rc, out = self.main('--strict', which=(('a', 'A', fake('ok', 'fine')), ('s', 'S', fake('skip', 'n/a'))))

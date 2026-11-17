@@ -27,7 +27,11 @@ Apporo test modules skip themselves in "Admin tool unit tests".
 What the change touches is found like tests/contract/gate_check.py finds an
 image bump, by comparing the base's committed files with the working tree,
 here from the merge base of --base-ref and HEAD: commits that reached the base
-branch after this branch started are not this change.
+branch after this branch started are not this change. File names are bytes to
+git: one that is not UTF-8 is classified like any other and logged as \\xNN.
+When git cannot tell what the change touches (no merge base, say), the checks
+run warn-only with a ::warning:: that says so: a change to Apporo files must
+not be merged on such a result.
 
   scripts/apporo_checks.py --base-ref origin/main   # CI: strict only for a change to Apporo files
   scripts/apporo_checks.py --strict                 # before an Apporo install or helm upgrade; the daily sync
@@ -47,7 +51,7 @@ The checks (docs/APPORO-K3S.md 〈CI 與檢查〉):
 
 Offline: git, helm template and python only; no cluster, credentials or network.
 Exit: 0 every check passed, or warn-only; 1 a check failed in strict mode;
-2 usage, git or base ref error.
+2 usage error, or --base-ref (or git) missing, as the contract gate fails then.
 """
 import argparse
 import os
@@ -80,20 +84,34 @@ STRICT_HINT = ('Fix them in this change: a gap WOOW left behind is closed here t
                'documented difference (docs/APPORO-K3S.md 〈CI 與檢查〉).')
 INSTALL_HINT = ('Do not install or helm upgrade Apporo until they pass: follow WOOW prod in an Apporo PR first '
                 '(docs/APPORO-K3S.md 〈跟著 WOOW 改〉).')
+SCOPE_HINT = ('The checks ran warn-only: a change to Apporo files must not be merged on this result; run '
+              'scripts/apporo_checks.py --strict for it (docs/APPORO-K3S.md 〈CI 與檢查〉).')
 
 
 class UsageError(Exception):
-    pass
+    """The base ref is missing: the step fails (exit 2), as the contract gate does then."""
 
 
-def run(cmd, env=None, cwd=None):
-    return subprocess.run(cmd, cwd=cwd or ROOT, text=True, capture_output=True, env=env)
+class ScopeError(Exception):
+    """git could not say what the change touches: the checks run warn-only (main)."""
+
+
+def run(cmd, env=None, cwd=None, errors='replace'):
+    # UTF-8 whatever the runner's locale, and a byte that is not UTF-8 never raises.
+    return subprocess.run(cmd, cwd=cwd or ROOT, capture_output=True, env=env, encoding='utf-8', errors=errors)
+
+
+def printable(text):
+    """Text for the log: bytes that are not UTF-8 (kept as surrogates) shown as \\xNN."""
+    return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'backslashreplace')
 
 
 def git(*args, cwd=None):
-    proc = run(['git', *args], cwd=cwd)
+    # File names keep bytes that are not UTF-8 as surrogates, like os.fsdecode: a
+    # Latin-1 name is still a path, classified like any other, never a crash.
+    proc = run(['git', *args], cwd=cwd, errors='surrogateescape')
     if proc.returncode:
-        raise UsageError(f'git {" ".join(args)}: {proc.stderr.strip() or "exit %d" % proc.returncode}')
+        raise ScopeError(printable(f'git {" ".join(args)}: {proc.stderr.strip() or "exit %d" % proc.returncode}'))
     return proc.stdout
 
 
@@ -102,7 +120,10 @@ def is_apporo(path):
 
 
 def changed_paths(base_ref, cwd=None):
-    """(merge base, paths added, edited or deleted since it), working tree included."""
+    """(merge base, paths added, edited or deleted since it), working tree included.
+
+    UsageError when base_ref is missing; ScopeError when git fails otherwise
+    (no merge base in a shallow clone, for one)."""
     if run(['git', 'rev-parse', '--verify', '-q', base_ref + '^{commit}'], cwd=cwd).returncode:
         raise UsageError(f'base ref {base_ref} not found (fetch it with full history, as the contract gate does)')
     base = git('merge-base', base_ref, 'HEAD', cwd=cwd).strip()
@@ -293,7 +314,7 @@ def mode_line(args, cwd=None):
     apporo = [path for path in paths if is_apporo(path)]
     where = f'against {args.base_ref}, merge base {base[:12]}'
     if apporo:
-        shown = ', '.join(apporo[:10]) + (f' (+{len(apporo) - 10} more)' if len(apporo) > 10 else '')
+        shown = ', '.join(map(printable, apporo[:10])) + (f' (+{len(apporo) - 10} more)' if len(apporo) > 10 else '')
         return True, (f'strict: this change touches Apporo files ({where}): {shown}. Apporo\'s own changes '
                       'are checked strictly (owner decision 2026-11-17)')
     return False, (f'warn-only: none of the {len(paths)} files this change touches ({where}) is an Apporo file '
@@ -314,14 +335,26 @@ def main(argv=None, checks=CHECKS):
     unknown = sorted(set(only or ()) - {name for name, _, _ in checks})
     if unknown:
         parser.error('unknown check(s): ' + ', '.join(unknown))
+    scope_unknown, trace = False, None
     try:
         strict, why = mode_line(args)
     except (UsageError, OSError) as err:
+        # The base ref (or git itself) is missing: the contract gate fails the same way.
         print(f'Apporo checks: {err}')
         print(f'::error title=Apporo checks::{one_line(str(err))}')
         return 2
+    except Exception as err:  # ScopeError, or a bug: never a reason to turn a WOOW change red
+        scope_unknown, strict = True, False
+        if not isinstance(err, ScopeError):
+            trace = quoted(traceback.format_exc())
+        why = (f'warn-only: could not tell whether this change touches Apporo files '
+               f'({str(err) if isinstance(err, ScopeError) else repr(err)}). {SCOPE_HINT}')
     print(f'Apporo checks ({"strict" if strict else "warn-only"}; docs/APPORO-K3S.md 〈CI 與檢查〉)')
     print(f'mode: {why}')
+    if trace:
+        print(trace)
+    if scope_unknown:
+        print(f'::warning title=Apporo checks (not blocking)::{one_line(why)}')
 
     try:
         state = Checks(strict)
