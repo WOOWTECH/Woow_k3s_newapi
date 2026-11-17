@@ -1,92 +1,53 @@
-"""Apporo new-api (deploy/apporo-k3s.yaml) stays a 1:1 copy of WOOW prod.
+"""Apporo new-api (deploy/apporo-k3s.yaml): Apporo's own values, blocking.
 
-Offline: helm template only; no cluster, credentials or network. WOOW prod
-renders in new-api and Apporo in new-api-apporo, each against its own
-namespace-bound evidence. The Apporo render must equal the WOOW prod render
-with only the documented Apporo differences layered on top
-(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉):
+Offline: helm template only; no cluster, credentials or network.
 
-- publicUrl, newapi.env.DEFAULT_LANGUAGE and proxy.clients;
-- proxy.enabled stays false (dormant) until Apporo's own activation PR, which
-  also sets proxy.apExpiresAt/opExpiresAt to the unix-seconds expiry of
-  Apporo's PATs. While dormant, the proxy settings are still compared with
-  proxy.enabled forced on, so they cannot fall behind WOOW before activation;
-- proxy.image may lag WOOW prod (owner decision D7) but never lead it: it must
-  be a pin deploy/woow-k3s.yaml has or had, with a green stg contract report;
-- per-instance evidence, which is never copied from WOOW:
-  encryptedBackup.capacityVerification and restoreVerification (the chart
-  binds both to the release namespace) and ageRecipient come from
-  deploy/apporo-k3s.yaml: Apporo's own capacity review, restore drill and age
-  key. The rendered recipient is the only output they change.
+Blocking (ApporoValuesTests): deploy/apporo-k3s.yaml renders in new-api-apporo,
+as committed and with the proxy switched on (the chart checks the proxy
+settings only when it renders the proxy); the documented Apporo differences
+hold the decided values (docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉):
+publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and
+proxy.addQuotaHourlyCapPoints 20000, which still lets the largest conversion
+through; proxy.enabled is a literal boolean and the AP/OP expiries match it;
+the proxy pin lags WOOW prod but never leads it and has a green stg report;
+per-instance evidence is never copied from WOOW; the two manual
+NetworkPolicies match Apporo's own values.
 
-Any other WOOW prod values change has to be mirrored into deploy/apporo-k3s.yaml
-in the same PR, or listed here and in the runbook as a new documented difference.
+Not blocking: whether everything else still equals WOOW prod. That is
+scripts/apporo_parity.py, which CI runs warn-only (owner decision 2026-11-17:
+it never blocks a WOOW PR; the daily sync closes the gap). ParityCheckTests pin
+that behaviour: a WOOW-only change warns and exits 0, --strict exits non-zero,
+and an Apporo file that does not render fails in every mode.
 """
+import contextlib
+import importlib.util
+import io
 import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tests.contract import gate_check, report
 
 ROOT = Path(__file__).resolve().parents[2]
 APPORO = ROOT / 'deploy/apporo-k3s.yaml'
 PROD = ROOT / 'deploy/woow-k3s.yaml'
-NAMESPACE = {APPORO: 'new-api-apporo', PROD: 'new-api'}
-# The apun Odoo web pod (component application, live) and its cron pod.
-APUN_POD_SELECTOR = {
-    'matchLabels': {'app.kubernetes.io/name': 'apun'},
-    'matchExpressions': [{'key': 'app.kubernetes.io/component', 'operator': 'In',
-                          'values': ['application', 'cron']}],
-}
-APUN_CLIENTS = [{
-    'name': 'apun-odoo',
-    'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'apun'}},
-    'podSelector': APUN_POD_SELECTOR,
-}]
-SECRET_KEYS = 'SESSION_SECRET|CRYPTO_SECRET|POSTGRES_PASSWORD|REDIS_PASSWORD|PROXY_VALKEY_PASSWORD'
+LITELLM_PROD = ROOT / 'deploy/litellm-from-newapi-ingress.yaml'
+LITELLM_APPORO = ROOT / 'deploy/litellm-from-newapi-apporo-ingress.yaml'
+TOOL = ROOT / 'scripts/apporo_parity.py'
+_spec = importlib.util.spec_from_file_location('apporo_parity', TOOL)
+parity = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(parity)
+# The labels of the new-api pods that serve /v1 (chart/templates/newapi.yaml).
+RELAY_LABELS = {'app.kubernetes.io/name': 'newapi', 'app.kubernetes.io/instance': 'newapi',
+                'newapi.woowtech.io/serves-relay': 'true'}
 EVIDENCE_HINT = ('per-instance evidence (encryptedBackup.capacityVerification, restoreVerification, '
                  'ageRecipient) must be Apporo\'s own: its own capacity review and restore drill, bound '
                  'to namespace new-api-apporo; never copy WOOW\'s (docs/APPORO-K3S.md)')
-
-
-def helm(*args):
-    proc = subprocess.run(['helm', *args], text=True, capture_output=True)
-    if proc.returncode:
-        raise AssertionError(proc.stderr)
-    return proc.stdout
-
-
-def values(path):
-    """The values a file sets, parsed by helm itself (no YAML library in CI)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        chart = Path(tmp)
-        (chart / 'templates').mkdir()
-        (chart / 'Chart.yaml').write_text('apiVersion: v2\nname: values-dump\nversion: 0.0.0\n')
-        (chart / 'templates/values.json').write_text('{{ toJson .Values }}\n')
-        out = helm('template', 'v', str(chart), '-f', str(path))
-    return json.loads(out.split('# Source: values-dump/templates/values.json\n', 1)[1])
-
-
-def render(path, extra):
-    """``helm template`` of ``path`` (plus ``extra``) in the file's own namespace."""
-    namespace = NAMESPACE[path]
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tmp:
-        json.dump(extra, tmp)
-        tmp.flush()
-        try:
-            out = helm('template', 'newapi', str(ROOT / 'chart'), '-n', namespace, '-f', str(path), '-f', tmp.name)
-        except AssertionError as err:
-            hint = f'\n{EVIDENCE_HINT}' if path == APPORO else ''
-            raise AssertionError(f'{path.relative_to(ROOT)} does not render in {namespace}: {err}{hint}') from None
-    # Offline Helm generates random Secret bytes (templates/secret.yaml): keep
-    # the key names, drop the values.
-    out = re.sub(rf'(?m)^(  (?:{SECRET_KEYS}):).*$', r'\1 <redacted>', out)
-    # Per-instance output: the age recipient and the namespace in PromQL.
-    out = re.sub(r'(?m)^(\s+- name: AGE_RECIPIENT\n\s+value: ).*$', r'\1<per-instance>', out)
-    return out.replace(f'namespace="{namespace}"', 'namespace="<release namespace>"')
 
 
 def prod_pins():
@@ -126,35 +87,47 @@ class ApporoValuesTests(unittest.TestCase):
 
     def setUp(self):
         self.text = APPORO.read_text()
-        self.values = values(APPORO)
+        self.values = parity.values(APPORO)
         self.proxy = self.values.get('proxy') or {}
 
-    def documented(self, enabled):
-        """The Apporo differences, layered on the WOOW prod values."""
-        image = self.proxy.get('image') or {}
-        return {
-            'publicUrl': 'https://newapi.apporo.ai',
-            'newapi': {'env': {'DEFAULT_LANGUAGE': 'en'}},
-            'proxy': {
-                'enabled': enabled,
-                'clients': APUN_CLIENTS,
-                'apExpiresAt': self.proxy.get('apExpiresAt', ''),
-                'opExpiresAt': self.proxy.get('opExpiresAt', ''),
-                'image': {'tag': image.get('tag', ''), 'digest': image.get('digest', '')},
-            },
-        }
+    def render(self, enabled):
+        try:
+            return parity.render(APPORO, parity.APPORO_NAMESPACE, {'proxy': {'enabled': enabled}})
+        except parity.RenderError as err:
+            self.fail(f'deploy/apporo-k3s.yaml does not render in {parity.APPORO_NAMESPACE} with '
+                      f'proxy.enabled={enabled}: {err}\n{EVIDENCE_HINT}')
 
-    def test_render_is_prod_plus_documented_differences(self):
-        # As committed, and (while dormant) with the proxy switched on.
+    def test_renders_as_committed_and_with_the_proxy_switched_on(self):
+        # While dormant, the chart's proxy guards (client selectors, digest,
+        # regex) only run when the proxy is on: check them before activation.
         for enabled in dict.fromkeys([self.proxy.get('enabled'), True]):
             with self.subTest(proxy_enabled=enabled):
-                self.assertEqual(
-                    render(APPORO, {'proxy': {'enabled': enabled}}), render(PROD, self.documented(enabled)),
-                    'deploy/apporo-k3s.yaml must equal deploy/woow-k3s.yaml plus the documented Apporo '
-                    'differences (docs/APPORO-K3S.md): mirror the WOOW prod change; ' + EVIDENCE_HINT)
+                out = self.render(enabled)
+                if enabled:
+                    self.assertIn(f'PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: "{parity.HOURLY_CAP_POINTS}"', out)
+        self.assertIn('newapi.woowtech.io/serves-relay: "true"', self.render(self.proxy.get('enabled')))
+
+    def test_documented_differences_hold_the_decided_values(self):
+        env = (self.values.get('newapi') or {}).get('env') or {}
+        self.assertEqual(self.values.get('publicUrl'), parity.PUBLIC_URL)
+        self.assertEqual(env.get('DEFAULT_LANGUAGE'), parity.DEFAULT_LANGUAGE)
+        self.assertEqual(self.proxy.get('clients'), parity.APUN_CLIENTS)
+        self.assertEqual(self.proxy.get('addQuotaHourlyCapPoints'), parity.HOURLY_CAP_POINTS,
+                         'proxy.addQuotaHourlyCapPoints is an owner decision (2026-11-17): 20000 for Apporo '
+                         '(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉)')
+
+    def test_hourly_cap_lets_the_largest_conversion_through(self):
+        # newapi-proxy gives every replica cap * 15,625 // replicas quota an
+        # hour; a smaller share answers the largest single conversion with 429.
+        proxy = parity.merge(parity.values(ROOT / 'chart/values.yaml'), self.values)['proxy']
+        share = proxy['addQuotaHourlyCapPoints'] * parity.QUOTA_PER_POINT // proxy['replicas']
+        self.assertGreaterEqual(share, parity.LARGEST_CONVERSION_POINTS * parity.QUOTA_PER_POINT,
+                                f'with {proxy["replicas"]} replicas the cap must be at least '
+                                f'{proxy["replicas"] * parity.LARGEST_CONVERSION_POINTS} points: '
+                                'ask the owner for a new value')
 
     def test_per_instance_evidence_is_not_copied_from_prod(self):
-        prod = values(PROD).get('encryptedBackup') or {}
+        prod = parity.values(PROD).get('encryptedBackup') or {}
         mine = self.values.get('encryptedBackup') or {}
         for section, key in (('capacityVerification', 'evidenceRef'), ('restoreVerification', 'evidenceRef'),
                              ('restoreVerification', 'archiveSha256')):
@@ -200,13 +173,26 @@ class ApporoValuesTests(unittest.TestCase):
         keys = re.findall(r'^([A-Za-z][A-Za-z0-9_]*):', self.text, re.M)
         self.assertEqual(len(keys), len(set(keys)), 'A later YAML key silently overrides an earlier one')
 
-    def test_litellm_ingress_mirrors_prod(self):
-        swap = {'name: litellm-from-newapi-ingress': 'name: litellm-from-newapi-apporo-ingress',
-                'kubernetes.io/metadata.name: new-api': 'kubernetes.io/metadata.name: new-api-apporo'}
-        prod = manifest(ROOT / 'deploy/litellm-from-newapi-ingress.yaml')
-        expected = [line.replace(line.strip(), swap[line.strip()]) if line.strip() in swap else line
-                    for line in prod]
-        self.assertEqual(expected, manifest(ROOT / 'deploy/litellm-from-newapi-apporo-ingress.yaml'))
+    def test_litellm_ingress_admits_exactly_the_apporo_relay(self):
+        # Matches Apporo's own upstream entry. Whether it still mirrors WOOW's
+        # deploy/litellm-from-newapi-ingress.yaml is scripts/apporo_parity.py.
+        upstream = next((u for u in (self.values.get('networkPolicy') or {}).get('upstreams') or []
+                         if u.get('name') == 'litellm-svc203'), None)
+        self.assertIsNotNone(upstream, 'networkPolicy.upstreams needs the litellm-svc203 entry')
+        policy = parity.values(LITELLM_APPORO)
+        self.assertEqual((policy.get('apiVersion'), policy.get('kind')), ('networking.k8s.io/v1', 'NetworkPolicy'))
+        self.assertEqual(policy.get('metadata'), {'name': 'litellm-from-newapi-apporo-ingress',
+                                                  'namespace': upstream['namespace'],
+                                                  'labels': {'app.kubernetes.io/part-of': 'woow-k3s-newapi'}})
+        self.assertEqual(policy.get('spec'), {
+            'podSelector': {'matchLabels': upstream['podLabels']},
+            'policyTypes': ['Ingress'],
+            'ingress': [{
+                'from': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': parity.APPORO_NAMESPACE}},
+                          'podSelector': {'matchLabels': RELAY_LABELS}}],
+                'ports': [{'protocol': 'TCP', 'port': upstream['port']}],
+            }],
+        })
 
     def test_apun_egress_selects_exactly_the_proxy_clients(self):
         egress = (ROOT / 'deploy/apun-odoo-to-newapi-apporo-egress.yaml').read_text()
@@ -224,6 +210,83 @@ class ApporoValuesTests(unittest.TestCase):
                      '          port: 8080', '          port: 8081'):
             self.assertIn(want, lines)
         self.assertEqual(sum(line.strip().startswith('port:') for line in lines), 2)
+
+
+class ParityCheckTests(unittest.TestCase):
+    """scripts/apporo_parity.py: warn-only for WOOW changes, never for a broken Apporo file.
+
+    Fixtures are the committed files' values plus one change, written as JSON
+    (valid YAML), so these hold whether or not the committed pair is in sync.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def fixture(self, name, data):
+        path = self.tmp / name
+        path.write_text(json.dumps(data) if not isinstance(data, str) else data)
+        return path
+
+    def run_tool(self, *args):
+        proc = subprocess.run([sys.executable, str(TOOL), *map(str, args)], cwd=ROOT, text=True, capture_output=True)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    def woow_only_change(self):
+        return self.fixture('woow.json', parity.merge(parity.values(PROD),
+                                                      {'newapi': {'env': {'PARITY_SELFTEST': 'woow-only'}}}))
+
+    def test_woow_only_change_warns_and_exits_0(self):
+        rc, out = self.run_tool('--woow', self.woow_only_change())
+        self.assertEqual(rc, 0, out)
+        self.assertIn('::warning file=deploy/apporo-k3s.yaml', out)
+        self.assertIn('WARNING (not blocking)', out)
+        if 'cannot compare' not in out:
+            self.assertIn('newapi.env.PARITY_SELFTEST', out)
+
+    def test_strict_mode_fails_when_apporo_differs(self):
+        rc, out = self.run_tool('--strict', '--woow', self.woow_only_change())
+        self.assertNotEqual(rc, 0, out)
+        self.assertNotIn('::warning', out)
+
+    def test_apporo_file_that_does_not_parse_fails_in_every_mode(self):
+        broken = self.fixture('apporo.yaml', 'publicUrl: [\n')
+        for args in ((), ('--strict',)):
+            with self.subTest(args=args):
+                rc, out = self.run_tool(*args, '--apporo', broken)
+                self.assertEqual(rc, 2, out)
+                self.assertIn('::error file=', out)
+
+    def test_apporo_proxy_settings_that_do_not_render_fail_while_dormant(self):
+        # Dormant renders fine; switched on, the chart refuses a client without
+        # a component selector. That is Apporo's own validity: an error.
+        wide = [dict(parity.APUN_CLIENTS[0], podSelector={'matchLabels': {'app.kubernetes.io/name': 'apun'}})]
+        apporo = self.fixture('apporo.json', parity.merge(parity.values(APPORO),
+                                                          {'proxy': {'enabled': False, 'clients': wide}}))
+        rc, out = self.run_tool('--apporo', apporo)
+        self.assertEqual(rc, 2, out)
+        self.assertIn('proxy switched on', out)
+
+    def test_litellm_copy_that_falls_behind_only_warns(self):
+        woow_np = self.fixture('litellm-woow.yaml', LITELLM_PROD.read_text() + 'selftest: woow-only\n')
+        rc, out = self.run_tool('--litellm-woow', woow_np)
+        self.assertEqual(rc, 0, out)
+        self.assertIn('no longer mirrors', out)
+        self.assertIn('::warning', out)
+
+    def test_in_sync_prints_ok_and_no_warning(self):
+        np = 'metadata:\n  name: {}\nfrom:\n  matchLabels:\n    kubernetes.io/metadata.name: {}\n'
+        woow_np = self.fixture('w.yaml', np.format('litellm-from-newapi-ingress', 'new-api'))
+        apporo_np = self.fixture('a.yaml', np.format('litellm-from-newapi-apporo-ingress', 'new-api-apporo'))
+        out = io.StringIO()
+        with mock.patch.object(parity, 'values', return_value={'proxy': {'enabled': False}}), \
+                mock.patch.object(parity, 'render', return_value='same render\n'), \
+                contextlib.redirect_stdout(out):
+            rc = parity.check(False, PROD, APPORO, woow_np, apporo_np)
+        self.assertEqual(rc, 0)
+        self.assertIn('in sync', out.getvalue())
+        self.assertNotIn('::warning', out.getvalue())
 
 
 if __name__ == '__main__':

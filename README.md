@@ -15,7 +15,10 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 | WOOW staging | `new-api-stg` | `deploy/woow-k3s-stg.yaml` | 未公開（tunnel 只回 404） | dev 沙盒 Odoo、`paas-stg-system` 平台 Odoo |
 | Apporo 正式 | `new-api-apporo` | `deploy/apporo-k3s.yaml` | <https://newapi.apporo.ai> | `apun` 官網 Odoo（web／cron），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md) |
 
-Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言與呼叫端；proxy 先休眠，等 Apporo 自己的 Secret 與 PAT 齊了再用啟用 PR 打開（同時填 PAT 到期日）。CI 的 `scripts/tests/test_apporo_values.py` 擋其他差異。
+Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與每小時加額度上限；proxy 先休眠，等 Apporo 自己的 Secret 與 PAT 齊了再用啟用 PR 打開（同時填 PAT 到期日）。
+
+- CI 對 Apporo 自己的值會擋（`scripts/tests/test_apporo_values.py`、lint、render）。
+- 其他差異只警告（`scripts/apporo_parity.py`）：改 WOOW 的 PR 不會因為 Apporo 沒跟上而變紅，差距由每天的同步補上。
 
 ## 架構
 

@@ -1,13 +1,17 @@
 # Apporo production values for woow-k3s (release newapi, namespace new-api-apporo).
 # Serves the Apporo AI PaaS (Odoo 18 at www.apporo.ai, namespace apun); runbook
 # docs/APPORO-K3S.md. A 1:1 copy of deploy/woow-k3s.yaml: the only differences are
-# publicUrl, newapi.env.DEFAULT_LANGUAGE and proxy.clients; proxy.enabled stays
-# false until Apporo's activation PR (which also sets proxy.ap/opExpiresAt);
-# proxy.image may lag WOOW prod but never lead it; per-instance backup evidence
-# (encryptedBackup capacity/restore verification, ageRecipient) is Apporo's own.
-# scripts/tests/test_apporo_values.py fails on any other change, so a WOOW prod
-# values change is mirrored here in the same PR.
-# Install and upgrade with this file as is (never --set; docs/APPORO-K3S.md 〈安裝〉):
+# publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and
+# proxy.addQuotaHourlyCapPoints; proxy.enabled stays false until Apporo's
+# activation PR (which also sets proxy.ap/opExpiresAt); proxy.image may lag WOOW
+# prod but never lead it; per-instance backup evidence (encryptedBackup
+# capacity/restore verification, ageRecipient) is Apporo's own.
+# scripts/tests/test_apporo_values.py (blocking) holds these Apporo values;
+# scripts/apporo_parity.py compares the rest with WOOW prod. That comparison only
+# warns in CI (owner decision 2026-11-17): a WOOW prod change is mirrored here by
+# the daily sync's follow-up PR, not necessarily in the WOOW PR itself.
+# Install and upgrade with this file as is (never --set; docs/APPORO-K3S.md 〈安裝〉),
+# after scripts/apporo_parity.py --strict says "in sync":
 #   helm upgrade --install newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml --wait
 publicUrl: https://newapi.apporo.ai
 
@@ -69,6 +73,13 @@ proxy:
   hmacSecret: newapi-proxy-hmac
   usernameRegex: '^wp\d{10}$'
   tenantIpRange: 198.18.1.0-198.19.255.255
+  # Platform-wide add_quota cap per sliding hour, in points (owner decision
+  # 2026-11-17; WOOW prod keeps the chart default 100000). An Apporo point is
+  # US$1 and its model ratios are WOOW's / 30, so 100000 would allow about
+  # US$93,750 of usage an hour. Every replica gets cap / replicas: 2 replicas x
+  # the 10,000-point largest single conversion = 20000, so that conversion still
+  # passes on either replica. Recompute with replicas or the conversion limit.
+  addQuotaHourlyCapPoints: 20000
   # Expiry of the Apporo AP / OP (unix seconds from the woowtech.io/ap-expires-at /
   # op-expires-at annotations of Secret new-api-apporo/newapi-proxy-pats; dates are
   # not secret). Empty only while dormant: the activation PR fills both and the

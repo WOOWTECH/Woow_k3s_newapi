@@ -9,7 +9,10 @@
 
 ## 和 WOOW 正式站的差異
 
-Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結果：WOOW 正式站在 `new-api`、Apporo 在 `new-api-apporo` 各自 render，除了這幾項，其他都要和 `deploy/woow-k3s.yaml` 相同）：
+Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相同。
+
+- `scripts/apporo_parity.py` 比對兩邊 render 的結果：WOOW 正式站在 `new-api`、Apporo 在 `new-api-apporo` 各自 render，Apporo 的 render 要等於「WOOW 正式站＋下表的差異」。CI 只警告、不擋（〈跟著 WOOW 改〉）。
+- 表裡 Apporo 這一欄的值由 `scripts/tests/test_apporo_values.py` 檢查，會擋：值不對、render 不出來（含 proxy 打開時）都是紅燈。
 
 | 項目 | WOOW 正式站 | Apporo |
 |---|---|---|
@@ -17,14 +20,23 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 | `publicUrl`（＝`SESSION_COOKIE_TRUSTED_URL`） | `https://newapi.woowtech.io` | `https://newapi.apporo.ai` |
 | `newapi.env.DEFAULT_LANGUAGE` | `zh-TW`（chart 預設） | `en`（顧客看得到的錯誤訊息用英文） |
 | `proxy.clients` | `paas-system` 的 `paas-odoo-platform`，component In (server, cron) | `apun` 的 `app.kubernetes.io/name=apun`，component In (application, cron)：網頁 pod（現有）＋排程 pod（拆 pod 後） |
-| `proxy.enabled` | `true` | 先 `false`（休眠：沒有 proxy 的 workload、NetworkPolicy、Valkey ACL），由 Apporo 自己的啟用 PR 打開（〈打開 proxy〉）。休眠期間測試會另外把 proxy 打開再比一次，所以 proxy 的其他設定一樣要跟 WOOW 同步 |
+| `proxy.enabled` | `true` | 先 `false`（休眠：沒有 proxy 的 workload、NetworkPolicy、Valkey ACL），由 Apporo 自己的啟用 PR 打開（〈打開 proxy〉）。休眠期間 `apporo_parity.py` 會另外把 proxy 打開再和 WOOW 比一次（只警告），測試也會把 proxy 打開確認 chart 收得下這些設定（會擋），所以 proxy 的其他設定一樣要跟 WOOW 同步 |
 | `proxy.apExpiresAt`／`opExpiresAt` | `1808450171` | 休眠時 `""`；啟用 PR 填 Apporo PAT 的到期時間（10 位數 unix 秒），`enabled: true` 時測試要求兩個都有 |
+| `proxy.addQuotaHourlyCapPoints`（每小時加額度上限） | 沒設，用 chart 預設 `100000` | `20000`（負責人 2026-11-17 決定，理由見表下） |
 | `proxy.image` | `3947d2b0…`@`sha256:0fdf5e12…` | 相同。可以落後 WOOW 正式站、不能超前：測試只接受 `deploy/woow-k3s.yaml` 現在或以前用過的 pin，而且要有綠色 stg 報告。WOOW 正式站升版之後，另開 PR 跟上 |
 | `encryptedBackup` 的 `capacityVerification`、`restoreVerification`、`ageRecipient` | 目前沒設（加密備份關） | 每套自己的證據，**不可抄 WOOW**：chart 把前兩項綁在 release namespace 上；Apporo 要有自己的容量檢查與還原演練（`evidenceRef`、`archiveSha256` 和 WOOW 的相同，測試會擋）。age 公鑰用同一把或另一把由負責人決定 |
 
-**WOOW 正式站的 values 有任何其他改動，要在同一個 PR 改 `deploy/apporo-k3s.yaml`**，否則上面那個測試會失敗。真的要讓兩邊不同，就把它加進測試的差異清單和這張表，給負責人審。
+**每小時加額度上限為什麼是 20000**：上限用點數算，兩套的一點不等值。
 
-- WOOW 正式站打開加密備份（NA-07）時，同一個 PR 也要把 Apporo 的 `encryptedBackup` 一起打開，並附上 Apporo 自己的容量檢查（`capacityVerification`，namespace `new-api-apporo`）。在那之前要先做 Apporo 的容量檢查。
+- WOOW：1 點＝NT$1。100000 點＝15.6 億 quota，照 WOOW 的模型倍率約是每小時 US$3,125 的模型用量。
+- Apporo：1 點＝US$1，模型倍率 ÷30。照抄 100000 點，約可用到每小時 US$93,750。
+- 每個 proxy 副本各分到「上限 ÷ 副本數」，單次轉換最多 10,000 點（照抄 WOOW）。2 副本 × 10,000＝20000：最大的一筆轉換在任一副本都還過得去，再小就會被 429 擋下。所以不能直接除以 30（3334）。
+- 20000 點＝每小時最多 US$20,000 的轉換（約 US$18,750 的模型用量）。
+- 改副本數或單次上限時要重算：測試要求「上限 ÷ 副本數」至少容得下一筆 10,000 點的轉換。
+
+**WOOW 正式站的 values 有其他改動時，同一個 PR 不必改 `deploy/apporo-k3s.yaml`。** CI 只印警告、job 仍是綠的，差距由每天的同步補上（〈跟著 WOOW 改〉）。真的要讓兩邊不同，就把它加進 `scripts/apporo_parity.py` 的差異清單、`scripts/tests/test_apporo_values.py` 的檢查和這張表，給負責人審。
+
+- WOOW 正式站打開加密備份（NA-07）時，CI 一樣只會警告。Apporo 要另開 PR 跟上，並附上 Apporo 自己的容量檢查（`capacityVerification`，namespace `new-api-apporo`）；這種證據同步工具不能代抄，只會寄告警。
 
 不在 values 裡的差異：
 
@@ -33,7 +45,10 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 - **叢集外的 NetworkPolicy**：見〈手動套用的物件〉。
 - **New API 資料庫內容**（用另外的重播工具寫入，不在 values）：
   - `ServerAddress`＝`https://newapi.apporo.ai`。
-  - 渠道只建 WOOW 的 1、3、4，不建 2（ChatGPT 訂閱內部測試）。金鑰換成 Apporo 專用的兩把 LiteLLM 金鑰：渠道 1、4 共用一把（終身 US$5），渠道 3 一把（不設上限）。
+  - 渠道只建 WOOW 的 1、3、4，不建 2（ChatGPT 訂閱內部測試）。金鑰換成 Apporo 專用的兩把 LiteLLM 金鑰（負責人 2026-11-17 決定）：
+    - 渠道 1、4 共用一把：**每月上限 US$50**，快到上限時告警。
+    - 渠道 3 一把：不設上限。
+  - 付費模型裡的 8 個 `chatgpt/*`：試點期間照 WOOW 保留；開放試點以外的客戶之前，要負責人另外決定（2026-11-17）。
   - `ModelRatio`、`ModelPrice` 全部 ÷30（Apporo 的 30:1 價格規則）。平台與 proxy 的換算（R＝32、1 點＝15,625 quota）不改。
   - 顯示貨幣符號改 `$`，顯示匯率維持 `32`（R 沒改）。
   - 其他設定照抄 WOOW。
@@ -44,23 +59,16 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 - chart（同一份 `chart/`，不分叉）、release 名稱 `newapi`：物件名稱相同，proxy 的上游自動是 `http://newapi:3000`。
 - 映像：new-api `v1.0.0-rc.44`、postgres、valkey、cloudflared、newapi-proxy，全部同一個 digest。
 - 儲存與備份：Postgres 20Gi＋備份 20Gi（Longhorn 2 份複本）；每天 03:45 明文 `pg_dump`、保留 7 天；180 天清理；加密備份與監控關；helm test 開。WOOW 沒有異地備份，這個缺口也一起照抄。
-- proxy：2 副本、`^wp\d{10}$`、`198.18.1.0-198.19.255.255`、in-flight 與連線上限、免費模型清單。
+- proxy：2 副本、`^wp\d{10}$`、`198.18.1.0-198.19.255.255`、in-flight 與連線上限、免費模型清單（每小時加額度上限除外，見上表）。
 - Secret 名稱：`newapi-secrets`、`newapi-cloudflared`、`newapi-proxy-hmac`、`newapi-proxy-pats`、`newapi-proxy-registry`。
 - 上游 NetworkPolicy 目標：`paas-ws-32e92be2` 的 LiteLLM svc203（`svc-a8389061`），port 4000。
 - `avoidNodes: [ubuntuserver-59mqj]`、`TRUSTED_PROXIES=10.42.0.0/16`（同一個叢集）。
 
-## 待負責人確認
-
-**每小時加額度上限 `proxy.addQuotaHourlyCapPoints`**，要在啟用 PR（〈打開 proxy〉）之前定。現在沒設，用 chart 預設 100000 點，和 WOOW 正式站相同。上限是用點數算的，但兩套的一點不等值：
-
-- WOOW：1 點＝NT$1。100000 點＝15.6 億 quota，照 WOOW 的模型倍率約是每小時 US$3,125 的模型用量。
-- Apporo：1 點＝US$1，模型倍率 ÷30。同樣 100000 點可以用到 30 倍的量，約每小時 US$93,750。
-- 不能直接除以 30（3334）：每個 proxy 副本各分一半，而單次轉換最多 10,000 點（已決定照抄）。2 副本時最少要 20000，否則大額轉換會被這個上限擋掉（429）。
-- 決定用別的數字時，在 `deploy/apporo-k3s.yaml` 設定這一項，並加進測試的差異清單和〈和 WOOW 正式站的差異〉的表。
-
 ## Secret
 
 只列名稱與 key。值一律不進 repo、不印在終端機或 log；用 `kubectl create`／`replace` 從 stdin 或 0600 暫存檔寫入，**不要 `kubectl apply`**（值會被複製進 `last-applied-configuration`）。WOOW 與 Apporo 的簽章金鑰、AP、OP、Valkey 密碼、Fernet 金鑰必須全部不同。
+
+名稱都已定案（負責人 2026-11-17：全部照預設）：叢集 Secret `newapi-root-credentials`、`newapi-svc-credentials`，服務帳號 `apporo-svc`，tunnel `woow-k3s-new-api-apporo`。
 
 `new-api-apporo`：
 
@@ -71,16 +79,16 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 | `newapi-proxy-registry` | `.dockerconfigjson` | 複製 `apun/jfrog-registry`（`jcr-prod.woowtech.io` 的拉取身分；負責人決定），type `kubernetes.io/dockerconfigjson` |
 | `newapi-proxy-hmac` | `web`、`cron` | 新產生的 `kid:secret`，寫法同 OPERATIONS〈newapi-proxy〉；同一份字串也放進 apun 的 Odoo 端 Secret |
 | `newapi-proxy-pats` | `ap`、`op`；annotation `woowtech.io/ap-expires-at`、`op-expires-at`、`ap-hint`、`op-hint` | 服務帳號的 AP（`log:read`、`user:read`、`user:write`）與 root 的 OP（`option:read`），180 天。由 `scripts/bootstrap_service_account.py` 在 root 綁 2FA **之前**寫入 |
-| `newapi-root-credentials`（提議名稱） | `url`、`username`、`password` | root 帳密只存在叢集（負責人決定）：`bootstrap-root.sh` 寫出的 0600 檔，用 `--from-env-file` 建 Secret 後 `shred` |
-| `newapi-svc-credentials`（提議名稱） | `url`、`username`、`password` | 服務帳號的密碼。負責人之後要用它登入綁 2FA，所以和 root 一樣只存在叢集 |
+| `newapi-root-credentials` | `url`、`username`、`password` | root 帳密只存在叢集（負責人決定）：`bootstrap-root.sh` 寫出的 0600 檔，用 `--from-env-file` 建 Secret 後 `shred` |
+| `newapi-svc-credentials` | `url`、`username`、`password` | 服務帳號 `apporo-svc` 的密碼。負責人之後要用它登入綁 2FA，所以和 root 一樣只存在叢集 |
 
 `apun`（Odoo 端；接到 pod 上是 odoo-tenant 那邊的變更）：
 
 | Secret | key | 內容 |
 |---|---|---|
-| `apun-newapi-llm`（提議名稱，以 odoo-tenant 的 PR 為準） | `proxy-auth-web`、`proxy-auth-cron`、`fernet-keys` | 前兩個是 `newapi-proxy-hmac` 的 `web`／`cron` 同一份字串（Odoo 用清單第一把簽；兩邊只比 sha256 前 12 碼）。`fernet-keys` 是新產生的 Fernet 金鑰（逗號分隔、第一把加密），兩份離線備份由負責人保管。key 名稱照 WOOW 正式站的 `paas-system/paas-odoo-platform-llm` |
+| `apun-newapi-llm`（Woow_k3s_odoo PR #4 用的名稱與 key） | `proxy-auth-web`、`proxy-auth-cron`、`fernet-keys` | 前兩個是 `newapi-proxy-hmac` 的 `web`／`cron` 同一份字串（Odoo 用清單第一把簽；兩邊只比 sha256 前 12 碼）。`fernet-keys` 是新產生的 Fernet 金鑰（逗號分隔、第一把加密），兩份離線備份由負責人保管。key 名稱照 WOOW 正式站的 `paas-system/paas-odoo-platform-llm` |
 
-環境變數：網頁 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_WEB`＋`WOOW_LLM_SECRET_KEYS`，排程 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_CRON`＋`WOOW_LLM_SECRET_KEYS`（和 WOOW 一樣把兩把簽章金鑰分在兩個 pod）。
+環境變數：網頁 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_WEB`＋`WOOW_LLM_SECRET_KEYS`，排程 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_CRON`＋`WOOW_LLM_SECRET_KEYS`（和 WOOW 一樣把兩把簽章金鑰分在兩個 pod）。兩個 pod 另外都帶四個 `WOOW_LLM_EXTRA_*` 變數（不是機密，見〈apun 那一側〉）。
 
 ## 手動套用的物件
 
@@ -88,10 +96,13 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 
 | 檔案 | namespace | 作用 |
 |---|---|---|
-| `deploy/litellm-from-newapi-apporo-ingress.yaml` | `paas-ws-32e92be2`（WOOW 的 LiteLLM，PaaS 工作區 37） | 放行 `new-api-apporo` 的 relay pod 連 LiteLLM 4000。和 `litellm-from-newapi-ingress.yaml` 只差名稱與來源 namespace（測試會比對） |
-| `deploy/apun-odoo-to-newapi-apporo-egress.yaml` | `apun` | apun 網頁＋排程 pod 出口到 proxy 8080／8081。`allow-odoo-to-mailcow`、`default-deny-external` 不動 |
+| `deploy/litellm-from-newapi-apporo-ingress.yaml` | `paas-ws-32e92be2`（WOOW 的 LiteLLM，PaaS 工作區 37） | 放行 `new-api-apporo` 的 relay pod 連 LiteLLM 4000。測試檢查它和 `deploy/apporo-k3s.yaml` 的上游設定一致（會擋）；和 `litellm-from-newapi-ingress.yaml` 是否仍只差名稱與來源 namespace，由 `apporo_parity.py` 比對（只警告） |
+| `deploy/apun-odoo-to-newapi-apporo-egress.yaml` | `apun` | apun 網頁＋排程 pod 出口到 proxy 8080／8081。`allow-odoo-to-mailcow`、`default-deny-external` 不動。apun 切換**之後**才套（兩個前提見下一點） |
 
-- **apun 那條的順序**：一個 pod 只要被任何一條 Egress policy 選到，就只能連這些 policy 允許的地方。所以它要和排程 pod 自己的出口規則（照抄 `allow-odoo-to-mailcow`、選 component `cron`，在 odoo-tenant 那邊）一起套或之後套。排程 pod 已經在跑、卻只有這一條時，它的 DNS、資料庫、寄信全部會斷。
+- **apun 那條有兩個前提，兩個都要滿足才套**：
+  1. 排程 pod 自己的出口規則 `allow-odoo-cron-to-mailcow`（照抄 `allow-odoo-to-mailcow`、選 component `cron`，odoo-tenant 那邊負責）已經套了。一個 pod 只要被任何一條 Egress policy 選到，就只能連這些 policy 允許的地方；排程 pod 在跑、卻只有這一條時，它的 DNS、資料庫、寄信全部會斷。
+  2. apun 已經切換完成，網頁和排程兩個 pod 都帶著四個 `WOOW_LLM_EXTRA_*` 變數在跑。這四個變數讓平台的 MCP 網址防護把 `new-api-apporo` 當成受保護的 namespace；沒有它們的 pod 一連得到 proxy，就只剩 proxy 自己的簽章檢查在擋。
+  - 回退 apun 切換時，**第一個刪這條**（回退後的網頁 pod 沒有那四個變數）。
 - `scripts/check-drift.sh --context woow-k3s --apporo` 比對這兩個檔（唯讀）。Apporo 上線（〈apun 那一側〉做完）之後才用：Apporo 的 AI 分頁進維護、或簽章呼叫逾時時，第一步先跑它。上線前這兩個物件本來就還沒建，會顯示 DRIFT；安裝中途只比對已經套用的那一個，例如 `scripts/check-drift.sh --context woow-k3s deploy/litellm-from-newapi-apporo-ingress.yaml`。
 - 不加 `--apporo` 的預設執行只比對 WOOW 的兩個檔，Apporo 裝到哪一步都不影響 WOOW 的結果。Apporo 的檔案出現 DRIFT 時，輸出不會叫你直接重新 apply：照本節的順序做，並先取得負責人同意。
 - 回程封包：WOOW 正式站的 Odoo namespace 也有 ingress default-deny，不需要額外規則。如果 apun 端對端測試時連得到 proxy、卻等不到回應，再加一條 apun 的 ingress：放行 `new-api-apporo` 的 proxy pod 到網頁／排程 pod 的 32768–60999（和 chart 裡 proxy NetworkPolicy 的鏡射是同一招），先給負責人看再套。
@@ -99,7 +110,10 @@ Helm values（`scripts/tests/test_apporo_values.py` 比對兩邊 render 的結�
 
 ## 安裝
 
-開始前重查一次 Longhorn 剩餘空間：這套是 40Gi，2 份複本＝80Gi。2026-11-17 時 31zix、59mqj 兩顆碟只剩 27–28%，下限是 25%。
+開始前：
+
+- `scripts/apporo_parity.py --strict` 要印 `in sync`。CI 對 Apporo 落後 WOOW 正式站只警告，所以安裝前（以及之後每次 `helm upgrade` 前）自己確認；不是 `in sync` 就先開 PR 讓 `deploy/apporo-k3s.yaml` 跟上。
+- 重查一次 Longhorn 剩餘空間：這套是 40Gi，2 份複本＝80Gi。2026-11-17 時 31zix、59mqj 兩顆碟只剩 27–28%，下限是 25%。
 
 ```bash
 NS=new-api-apporo
@@ -131,9 +145,11 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
   scripts/bootstrap-root.sh http://127.0.0.1:3302 ~/.config/newapi-apporo/root-credentials
 ```
 
-5. 〔同意：WOOW 的 LiteLLM〕在 LiteLLM 建 Apporo 專用的兩把金鑰（可用模型只開對應渠道的模型），再 `kubectl apply -f deploy/litellm-from-newapi-apporo-ingress.yaml`。
+5. 〔同意：WOOW 的 LiteLLM〕在 LiteLLM 建 Apporo 專用的兩把金鑰（可用模型只開對應渠道的模型），再 `kubectl apply -f deploy/litellm-from-newapi-apporo-ingress.yaml`：
+   - 渠道 1、4 那把：每月上限 US$50（LiteLLM `max_budget` 50、`budget_duration` 一個月），並設好快到上限時的告警。
+   - 渠道 3 那把：不設預算。
 6. 用重播工具寫入資料庫內容（〈和 WOOW 正式站的差異〉），每次寫入都讀回；再用唯讀 SQL 指紋比對 WOOW，只能出現預期的差異。每個渠道用 test_model 實際呼叫一次。
-7. 服務帳號與 AP／OP（root 綁 2FA 之前；名稱最多 12 字，例 `apporo-svc`）：
+7. 服務帳號 `apporo-svc`（負責人決定；`bootstrap_service_account.py` 限 12 字）與 AP／OP，在 root 綁 2FA 之前做：
 
    ```bash
    scripts/bootstrap_service_account.py --base http://127.0.0.1:3302 \
@@ -144,7 +160,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
    接著把兩個帳密檔建成 `newapi-root-credentials`、`newapi-svc-credentials`（`kubectl -n $NS create secret generic <名稱> --from-env-file=<檔>`），然後 `shred -u` 兩個檔。
 8. 簽章金鑰：照 OPERATIONS〈newapi-proxy〉〈第一次建立簽章金鑰〉，namespace 換成 `$NS`；Odoo 端的那一份等 apun 切換時再建（〈apun 那一側〉）。
-9. 開啟用 PR（〈打開 proxy〉），合併後套用（Valkey 會重啟一次，這時還沒有流量）：
+9. 開啟用 PR（〈打開 proxy〉），合併後先跑 `scripts/apporo_parity.py --strict`（要 `in sync`）再套用（Valkey 會重啟一次，這時還沒有流量）：
 
    ```bash
    helm upgrade newapi ./chart -n $NS -f deploy/apporo-k3s.yaml --wait
@@ -160,7 +176,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 - 前提：〈安裝〉第 1–8 步做完。`newapi-proxy-registry`、`newapi-proxy-hmac`、`newapi-proxy-pats` 都在，`newapi-secrets` 是 chart 第一次安裝時產生的那一份。
 - 啟用 PR 只改兩件事：`proxy.enabled: true`，以及 `proxy.apExpiresAt`／`opExpiresAt`（〈AP／OP 到期日〉）。測試要求兩個到期日都是 10 位數的 unix 秒；`""` 只在休眠時可以。
-- 每小時加額度上限要在這之前由負責人確認（〈待負責人確認〉）。
+- 每小時加額度上限已經定了（`20000`，〈和 WOOW 正式站的差異〉），啟用 PR 不用改它。
 - 合併後才做〈安裝〉第 9 步。打開之後，CI 對 Apporo 的 render 也會檢查 proxy 元件（和 WOOW 兩套一樣）。
 
 ## AP／OP 到期日
@@ -178,19 +194,36 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ## apun 那一側
 
-這些屬於 apun 切換（一次停機，台北 15:00–18:00，先通知）。odoo-tenant 那邊負責拆 pod、接環境變數、排程 pod 的出口規則；本 repo 只提供 `deploy/apun-odoo-to-newapi-apporo-egress.yaml`。
+這些屬於 apun 切換（一次停機，台北 15:00–18:00，先通知）。odoo-tenant 那邊負責拆 pod、接環境變數、排程 pod 的出口規則，步驟寫在 Woow_k3s_odoo PR #4 的 `deploy/woow-k3s/planned/apun/cron-split.yaml` 檔頭（下面的「步驟 N」指那裡）；本 repo 只提供 `deploy/apun-odoo-to-newapi-apporo-egress.yaml`。
 
-1. 建 `apun-newapi-llm`：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈輪替：簽章金鑰〉的 `cur()`），不印出；兩邊用 sha256 前 12 碼核對。
-2. 和排程 pod 的出口規則一起 `kubectl apply -f deploy/apun-odoo-to-newapi-apporo-egress.yaml`（〈手動套用的物件〉的順序）。
-3. 平台設定（odoo shell，要等上游新版）：`woow_paas_platform.newapi_proxy_url`＝`http://newapi-proxy.new-api-apporo.svc.cluster.local:8080`、`woow_paas_platform.llm_public_base_url`＝`https://newapi.apporo.ai/v1`、`llm_service_admin_id`＝新服務帳號的 id。
-4. 驗證：從 apun 的排程 pod 用簽章請求打 `/api/status`、proxy 的 `:8081/readyz`；後台 Test connection；價目更新成功。
+1. 窗口之前：建 `apun-newapi-llm`（步驟 1）：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈輪替：簽章金鑰〉的 `cur()`），不印出；兩邊用 sha256 前 12 碼核對。排程 pod 的出口規則 `allow-odoo-cron-to-mailcow` 也在窗口之前套（步驟 2）。
+2. 窗口內：切換後確認兩個 pod 都帶著四個 `WOOW_LLM_EXTRA_*` 變數在跑（步驟 8；只印變數名稱與這四個非機密的值）：
+
+   | 變數 | 值 |
+   |---|---|
+   | `WOOW_LLM_EXTRA_PROXY_URLS` | `http://newapi-proxy.new-api-apporo.svc.cluster.local:8080` |
+   | `WOOW_LLM_EXTRA_PUBLIC_BASE_URLS` | `https://newapi.apporo.ai/v1` |
+   | `WOOW_LLM_EXTRA_CANARY_PAIRS` | `<上面的 proxy 網址>=<上面的公開網址>` |
+   | `WOOW_LLM_EXTRA_PROTECTED_NAMESPACES` | `new-api-apporo` |
+
+3. 窗口之後（步驟 9）：`kubectl apply -f deploy/apun-odoo-to-newapi-apporo-egress.yaml`。前提是第 1、2 步都做完（〈手動套用的物件〉）。
+4. 平台設定（要等上游新版；在網頁 pod 裡 `odoo shell`，那個行程帶著四個變數；另開的一次性 Job 要自己帶上同樣四個，否則寫入會被擋）：`woow_paas_platform.newapi_proxy_url`＝`http://newapi-proxy.new-api-apporo.svc.cluster.local:8080`、`woow_paas_platform.llm_public_base_url`＝`https://newapi.apporo.ai/v1`、`llm_service_admin_id`＝`apporo-svc` 的 id。
+5. 驗證（要等啟用 PR 部署之後，proxy 才存在）：從 apun 的排程 pod 用簽章請求打 `/api/status`、proxy 的 `:8081/readyz`；後台 Test connection；價目更新成功。
+
+排程 pod 不接受其他 pod 的連線（Woow_k3s_odoo PR #4 的決定）：排程 pod 的 Odoo 只聽 `127.0.0.1`、健康檢查用 exec 探針，pod IP 上沒有在聽的 port。所以 apun 的 NetworkPolicy 不用為它新增或修改。
 
 ## 跟著 WOOW 改
 
-- **values**：WOOW 正式站改 values 的 PR，要同時改 `deploy/apporo-k3s.yaml`（`test_apporo_values.py` 會擋）。例外：
-  - proxy 映像：WOOW 正式站先升，Apporo 另開 PR 跟上（負責人合併後再 `helm upgrade`）。Apporo 不能比 WOOW 正式站先升。
-  - 每套自己的證據（〈和 WOOW 正式站的差異〉）：同步打開的功能要附 Apporo 自己的證據，不抄 WOOW 的。
+- **values**：WOOW 正式站改 values 的 PR **不必**同時改 `deploy/apporo-k3s.yaml`（負責人 2026-11-17 決定：一致性檢查只警告，絕不擋 WOOW 的 PR）。
+  - CI 的「Apporo follows WOOW prod (warn-only)」步驟跑 `scripts/apporo_parity.py`：Apporo 跟 WOOW 不一致時，印出不同的 key、render 差異和 `::warning::`，job 仍是綠的。
+  - 差距由每天的同步補上（Apporo 上線後在 cluster1 跑）：它跑 `scripts/apporo_parity.py --strict`，Apporo 落後時開 PR 讓 `deploy/apporo-k3s.yaml` 跟上，負責人合併後才 `helm upgrade`。
+  - 每天的同步上線前、以及任何一次 Apporo 的 `helm upgrade` 前，都自己跑一次 `--strict`，要 `in sync`。
+  - 會擋的只有 Apporo 自己的檢查（`scripts/tests/test_apporo_values.py`、lint、render）：Apporo 的檔案壞了，或上表的值不對，CI 是紅的。
+  - 例外：
+    - proxy 映像：WOOW 正式站先升，Apporo 另開 PR 跟上（負責人合併後再 `helm upgrade`）。Apporo 不能比 WOOW 正式站先升（測試會擋）。
+    - 每套自己的證據（〈和 WOOW 正式站的差異〉）：同步打開的功能要附 Apporo 自己的證據，不抄 WOOW 的。同步工具遇到這種差異不開 PR，寄告警給負責人。
 - **資料庫內容**（新模型、倍率、渠道模型清單）：由每天的同步工具比對 WOOW 指紋後重播，排除 Apporo 專用金鑰、渠道 2、英文化的選項，`ModelRatio`／`ModelPrice` 自動 ÷30。要連動 Apporo 平台設定的變更先不套，寄告警給負責人。
+  - 價格（負責人 2026-11-17 決定）：WOOW 降價，Apporo 立即跟著降。WOOW 漲價，Apporo 先**不套**：寄告警、代擬客戶通知，通知發出滿 7 天才套用（Apporo AI 條款的 7 天預告）。
 - 合併任何 PR 都不等於部署：Apporo 的 `helm upgrade` 要另外做。
 
 ## 回退
@@ -199,5 +232,5 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 - `helm uninstall newapi -n new-api-apporo`：`newapi-secrets` 與備份 PVC 有 `resource-policy: keep`，Postgres 的 PVC 是 Retain，都會留下。
 - 下線：刪 `newapi.apporo.ai` 的 DNS 記錄；Access app 可以留著。
-- 兩條手動的 NetworkPolicy 用 `kubectl delete -f <檔>` 拿掉。
+- 兩條手動的 NetworkPolicy 用 `kubectl delete -f <檔>` 拿掉。apun 那條在 apun 切換回退時要**第一個**刪（〈手動套用的物件〉）。
 - Odoo 那邊有問題時，先設 `llm_orders_enabled=False` 停新轉換、`show_llm=False` 隱藏。**不要清空 proxy 網址**，已扣點的訂單會卡住。

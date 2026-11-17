@@ -4,6 +4,8 @@
 
 同一個 chart 另有兩套：staging（`new-api-stg`，見〈staging〉），以及 Apporo 那套（`new-api-apporo`、<https://newapi.apporo.ai>、`deploy/apporo-k3s.yaml`），和正式站的差異與安裝順序見 [APPORO-K3S.md](APPORO-K3S.md)。下面的指令用在 Apporo 時，namespace 換成 `new-api-apporo`。
 
+改 `deploy/woow-k3s.yaml` 的 PR 不必同時改 Apporo 的 values：CI 的「Apporo follows WOOW prod (warn-only)」只印警告、不會讓 PR 變紅（負責人 2026-11-17 決定），差距由每天的同步補上（APPORO-K3S.md〈跟著 WOOW 改〉）。會擋的只有 Apporo 檔案自己的檢查。
+
 > **NA-04 正式一般寫入暫停中：** `newapi_admin.py --target prod` 的 `apply-settings`、`apply-pricing`、非 dry-run 的 `apply-channels` 及任何非 GET 的 `call` 一律在寫入前拒絕，原始 GET 也限 `/api/status`、`/api/option/`、`/api/pricing`、`/api/channel/` 四條已確認唯讀路徑，沒有覆寫參數。唯一限定例外是 `display-settings --apply`：只接受 PAT、已知目標與 rc.44，固定修正 `CUSTOM`／`32` 兩項顯示值，無法帶入任何價格設定，預設不加 `--apply` 只預覽；見 [NA04-DISPLAY-SETTINGS.md](NA04-DISPLAY-SETTINGS.md)。正式站即使尚未開 2FA 也禁止 `--creds`，以免登入產生 session。下方正式套用與回滾命令是尚未開放的流程紀錄，不能照抄執行。須先有負責人／法務定稿、AI 分頁公告、全體受影響者可信寄信回執、七天成熟、現價與受眾重核，以及覆蓋 console／直接 API／其他腳本的全寫入者互鎖，再另行審核受信任的調價流程。這支 CLI 的拒絕只保護它自己，不代表服務端已有互鎖；staging 寫入與正式唯讀對帳仍可使用。
 
 ## 機密資料放哪裡
@@ -606,7 +608,7 @@ $B apply-channels --dry-run
 |---|---|---|
 | `newapi-proxy-pats` | `ap`、`op` | 服務帳號 AP 與 root 的 `option:read` OP（stg 由 `scripts/bootstrap_service_account.py` 寫入，到期日與 token hint 在 annotation） |
 | `newapi-proxy-hmac` | `web`、`cron` | 代理端簽章金鑰，各自是 `kid:secret[,kid:secret]`（代理接受清單內任一把；kid `[A-Za-z0-9_-]{1,64}`、secret `[A-Za-z0-9_-]{32,256}`；兩組的 kid 與 secret 都不能重複） |
-| Odoo 端複本 | `web`、`cron` | 同樣的金鑰，**Odoo 用清單的第一把簽**：stg `paas-stg-system/paas-stg-newapi-proxy-client`，prod `fleet-local/paas-odoo-fleet-secrets`（key 名由 LLM-17 定） |
+| Odoo 端複本 | stg `web`、`cron`；prod `proxy-auth-web`、`proxy-auth-cron` | 同樣的金鑰，**Odoo 用清單的第一把簽**：stg `paas-stg-system/paas-stg-newapi-proxy-client`，prod `paas-system/paas-odoo-platform-llm`（`kubectl create` 建的，同一個 Secret 還有 Odoo 的 Fernet 金鑰 `fernet-keys`；網頁 pod 只讀 `proxy-auth-web`，排程 pod 只讀 `proxy-auth-cron`；2026-11-17 唯讀核對） |
 | `newapi-proxy-registry` | `.dockerconfigjson` | 拉 `jcr-prod.woowtech.io/woow-paas-docker-local/newapi-proxy` 的唯讀憑證（`proxy.imagePullSecrets`） |
 | `newapi-secrets` | `PROXY_VALKEY_PASSWORD` | chart 產生、永久保留（同一個 Secret 的其他 key 見〈機密資料放哪裡〉） |
 
@@ -690,7 +692,7 @@ kubectl -n paas-stg-system create secret generic paas-stg-newapi-proxy-client --
 shred -u "$f" 2>/dev/null || rm -f "$f"; unset nw nc
 ```
 
-3. 重啟所有讀這份金鑰的 Odoo（env 只在啟動時讀）：prod `kubectl -n paas-system rollout restart deploy/paas-odoo-platform deploy/paas-odoo-platform-cron`（`fleet-local/paas-odoo-fleet-secrets` 改完要先讓 Fleet 重新部署，細節在 LLM-17）；stg 是每個開了 LLM 的沙盒 Odoo（LLM-01b 的 `WOOW_LLM_SANDBOX` 沙盒）——rollout restart 它的 Odoo deployment，或重建沙盒。
+3. 重啟所有讀這份金鑰的 Odoo（env 只在啟動時讀）：prod `kubectl -n paas-system rollout restart deploy/paas-odoo-platform deploy/paas-odoo-platform-cron`（Odoo 端是 `paas-system/paas-odoo-platform-llm` 的 `proxy-auth-web`／`proxy-auth-cron`，不是 stg 的 `web`／`cron`）；stg 是每個開了 LLM 的沙盒 Odoo（LLM-01b 的 `WOOW_LLM_SANDBOX` 沙盒）——rollout restart 它的 Odoo deployment，或重建沙盒。
 4. 等舊 kid 不再出現（access log 每行都有 `kid`）：`kubectl -n new-api-stg logs -l app.kubernetes.io/component=proxy --since=10m --prefix | grep -c '"kid":"<舊 kid>"'` 連續幾分鐘都是 0。
 5. 代理端拿掉舊的（新的那把就是 Odoo 端清單的第一把），再重啟一次：
 

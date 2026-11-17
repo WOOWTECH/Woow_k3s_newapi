@@ -5,10 +5,19 @@
 # unreachable). Egress policies add up: allow-odoo-to-mailcow and
 # default-deny-external stay untouched. The other half is proxy.clients in
 # deploy/apporo-k3s.yaml (same pod selector; both sides must allow).
-# Order: a pod selected by any egress policy may only use what the selecting
-# policies allow. Apply this together with, never before, the cron pod's own egress
-# policy (the allow-odoo-to-mailcow copy that selects component cron, owned by the
-# odoo-tenant change): alone it would leave a cron pod without DNS, DB and mail.
+#
+# Apply only when BOTH hold (docs/APPORO-K3S.md 〈手動套用的物件〉):
+# 1. The cron pod's own egress policy, allow-odoo-cron-to-mailcow (the copy of
+#    allow-odoo-to-mailcow that selects component cron, owned by the odoo-tenant
+#    change), is already applied. A pod selected by any egress policy may only use
+#    what the selecting policies allow: this one alone would leave a running cron
+#    pod without DNS, DB and mail.
+# 2. The apun switch is done and BOTH apun Odoo pods, web and cron, run with the
+#    four WOOW_LLM_EXTRA_* variables (step 9 of Woow_k3s_odoo
+#    deploy/woow-k3s/planned/apun/cron-split.yaml, after its step 8 checks).
+#    Those make the platform's MCP URL guard treat new-api-apporo as protected:
+#    no apun pod without them may reach the proxy.
+# On rollback of the apun switch, delete this policy first.
 #   kubectl apply -f deploy/apun-odoo-to-newapi-apporo-egress.yaml
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

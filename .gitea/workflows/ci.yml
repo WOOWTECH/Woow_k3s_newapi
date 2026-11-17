@@ -42,9 +42,21 @@ jobs:
           helm lint ./chart -f deploy/apporo-k3s.yaml
           helm template newapi ./chart -n new-api -f deploy/woow-k3s.yaml > /tmp/rendered.yaml
           helm template newapi ./chart -n new-api-stg -f deploy/woow-k3s-stg.yaml > /tmp/rendered-stg.yaml
-          # Apporo instance (docs/APPORO-K3S.md); parity with prod: scripts/tests/test_apporo_values.py
+          # Apporo instance (docs/APPORO-K3S.md): its own values are checked by
+          # scripts/tests/test_apporo_values.py (blocking); whether it still
+          # follows WOOW prod by the warn-only step below.
           helm template newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml > /tmp/rendered-apporo.yaml
           grep -c '^kind:' /tmp/rendered.yaml /tmp/rendered-stg.yaml /tmp/rendered-apporo.yaml
+
+      # Does deploy/apporo-k3s.yaml still equal WOOW prod plus the documented
+      # Apporo differences (docs/APPORO-K3S.md)? Warn-only by owner decision
+      # (2026-11-17): a WOOW change that leaves Apporo behind prints a
+      # ::warning:: and the job stays green; the daily sync closes the gap with
+      # a follow-up PR (scripts/apporo_parity.py --strict). An Apporo file that
+      # does not render, as committed or with its proxy switched on, still
+      # fails here (exit 2).
+      - name: Apporo follows WOOW prod (warn-only)
+        run: python3 scripts/apporo_parity.py
 
       - name: Images are pinned by digest
         run: |
@@ -57,8 +69,8 @@ jobs:
       # newapi-proxy must be active with a real pinned image in every WOOW
       # environment. Apporo stays dormant (proxy.enabled: false) until its own
       # activation PR (docs/APPORO-K3S.md 〈打開 proxy〉); from then on it is
-      # checked like the others. scripts/tests/test_apporo_values.py compares
-      # its proxy settings with WOOW prod in both states.
+      # checked like the others. While dormant, scripts/tests/test_apporo_values.py
+      # renders it with the proxy switched on (the chart's proxy guards).
       - name: newapi-proxy component
         run: |
           set -euo pipefail
