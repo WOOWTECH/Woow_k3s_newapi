@@ -221,8 +221,8 @@ class FakePsql:
     def __init__(self, db):
         self.db, self.queries = db, []
 
-    def query_json(self, sql):
-        nc.check_read_only_sql(sql)
+    def query_json(self, sql, secret_like_allowed=()):
+        nc.check_read_only_sql(sql, secret_like_allowed)
         self.queries.append(sql)
         db = self.db
         if "'keys'" in sql:
@@ -1410,6 +1410,35 @@ class SQLGuardBypassTest(unittest.TestCase):
         for keys in (["ModelRatio"], ["tool_price_setting.prices", "grok.violation_deduction_amount"],
                      ["passkey.rp_id", "A-b:c_d.e"], ["--x"], ["users"]):    # quoted: data, never SQL
             nc.check_read_only_sql(nc.sql_content(keys, True))
+
+    def test_the_guard_itself_never_lets_a_secret_looking_option_be_read(self):
+        # "A secret-looking key is never read": not only read_snapshot's filter, the guard too, whoever
+        # builds the key list (rc.44 names: SMTPToken, GitHubClientSecret, ... oidc.client_secret).
+        secrets = ("SMTPToken", "GitHubClientSecret", "StripeApiSecret", "TurnstileSecretKey", "oidc.client_secret",
+                   "WaffoPrivateKey", "TelegramBotToken", "StripeWebhookSecret", "EpayKey", "CreemApiKey")
+        for name in secrets:
+            self.assertEqual(nc.option_key_class(name), "secret", name)
+            for key_hashes in (False, True):
+                head, tail = nc.sql_templates()["content+key-hashes" if key_hashes else "content"]
+                for keys in (f"'{name}'", f"'ModelRatio','{name}'", f"'{name}','RetryTimes'"):
+                    with self.assertRaises(nc.ContentError, msg=keys):
+                        nc.check_read_only_sql(head + keys + tail)
+                with self.assertRaises(nc.ContentError, msg=name):
+                    nc.sql_content(["ModelRatio", name], key_hashes)
+            head, tail = nc.sql_templates()["content"]
+            psql = nc.Psql(["kubectl"], "dev-sandbox-x", run=lambda *a, **k: self.fail("psql ran"))
+            with self.assertRaisesRegex(nc.ContentError, "secret-looking option", msg=name):
+                psql.query_json(head + f"'{name}'" + tail)        # refused before anything runs
+        # the profile's whitelist (secret_like_allowed) is the only way to read one
+        allowed = load_json(PROFILE)["secret_like_allowed"]
+        self.assertEqual(allowed, ["PasswordLoginEnabled", "PasswordRegisterEnabled"])
+        with self.assertRaises(nc.ContentError):
+            nc.sql_content(["PasswordLoginEnabled"])
+        sql = nc.sql_content(["PasswordLoginEnabled", "ModelRatio"], False, allowed)
+        self.assertEqual(nc.check_read_only_sql(sql, allowed), sql)
+        with self.assertRaises(nc.ContentError):
+            nc.check_read_only_sql(sql)                          # the whitelist is the caller's, never implied
+        self.assertEqual(nc.check_read_only_sql(nc.sql_content([], True)), nc.sql_content([], True))   # NULL
 
     def test_pinned_sql(self):
         sql = nc.READ_ONLY_PREAMBLE + "SELECT 1;"

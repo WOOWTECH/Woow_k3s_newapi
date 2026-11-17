@@ -27,7 +27,7 @@
 | 渠道狀態（啟用／停用） | 不同步 | 兩邊用不同金鑰，各自被上游錯誤自動停用 |
 | abilities | 由渠道產生 | 渠道 1、3、4 的列與 WOOW 逐 byte 相同（見下） |
 
-不讀也不碰：使用者、token、PAT、2FA、passkey、session、logs、quota、audit 等所有客戶與身分資料表。名稱像機密的設定（`SMTPToken`、`*Secret`、`*Key`……）連值都不讀，除非列在 `secret_like_allowed`；值長得像金鑰的設定讀到就丟掉，只告警。渠道欄位的處理見〈機密與輸出〉。
+不讀也不碰：使用者、token、PAT、2FA、passkey、session、logs、quota、audit 等所有客戶與身分資料表。名稱像機密的設定（`SMTPToken`、`*Secret`、`*Key`……）連值都不讀，除非列在 `secret_like_allowed`（唯讀 SQL 守衛本身也擋：內容查詢的 key 清單有這種名稱就整句拒絕）；值長得像金鑰的設定讀到就丟掉，只告警。渠道欄位的處理見〈機密與輸出〉。
 
 ### 30:1 規則：每一筆用量扣費都是 WOOW 的 ÷30
 
@@ -157,7 +157,7 @@ Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試�
 
 - **渠道欄位**：除了 `key` 以外的欄位都會讀，但讀到時就檢查。`header_override`、`param_override`、`setting`、`settings`、`other`、`model_mapping`… 這類 JSON 欄位，只要成員名稱像憑證（`Authorization`、`Cookie`、`x-api-key`、`*_token`、`*_key`、`CF-Access-*`、`secret`、`password`…；`max_tokens` 這種不算），或值是 `Bearer …` 這類驗證值、32 字以上的十六進位、24 字以上大小寫數字混雜的隨機字串、網址帳密或像金鑰的查詢參數，整個欄位立刻換成 `[redacted]`：這個渠道不複製、不印、不匯出，只告警。
 - **印出的值**：渠道欄位只印 `name`、`models`、`group`、`test_model`、`type`、`status`、`priority`、`weight`、`auto_ban`、`tag`；其他欄位（含 `base_url`、`remark`）在 `plan`、`plan --json`、`verify`、告警裡都只顯示 sha256 前 12 碼與長度。值像金鑰的字串（`sk-` 加 16 字以上、`nap_…`、JWT、PEM）一律遮成 `[redacted]`。
-- **唯讀 SQL**：工具只送兩種查詢（option 名稱清單、內容），守衛**逐字**比對這兩個樣板，三個樣板文字（內容查詢分來源用與目標用兩種）以 sha256 釘在 `apporo_newapi_content.SQL_TEMPLATE_SHA256`。唯一能變的是內容查詢 `WHERE key IN (…)` 裡的 option 名稱常值，每個都必須是 `'[A-Za-z0-9_.:-]{1,128}'`（引號、反斜線、空白都不可能出現）。所以 `key` 只會在樣板讀它的位置出現：options 的 key 欄、以及只在目標端算的 `sha256(convert_to(channels.key))` 前 16 碼與長度。任何其他 SQL（包括把 options 用的 `key` 片段套在 channels 上、巢狀子查詢、`UNION`、多一個空白）一律拒絕。改了樣板（例如 `CHANNEL_COLUMNS`）時，所有讀取都會被拒，直到審過新文字並更新 pin。沙盒測試腳本的兩句固定 SQL 另以 sha256 釘住。
+- **唯讀 SQL**：工具只送兩種查詢（option 名稱清單、內容），守衛**逐字**比對這兩個樣板，三個樣板文字（內容查詢分來源用與目標用兩種）以 sha256 釘在 `apporo_newapi_content.SQL_TEMPLATE_SHA256`。唯一能變的是內容查詢 `WHERE key IN (…)` 裡的 option 名稱常值，每個都必須是 `'[A-Za-z0-9_.:-]{1,128}'`（引號、反斜線、空白都不可能出現），而且不能是名稱像機密的設定（`SMTPToken`、`GitHubClientSecret`、`oidc.client_secret`……；設定檔 `secret_like_allowed` 列出的除外），不論 key 清單是誰組的。所以 `key` 只會在樣板讀它的位置出現：options 的 key 欄、以及只在目標端算的 `sha256(convert_to(channels.key))` 前 16 碼與長度。任何其他 SQL（包括把 options 用的 `key` 片段套在 channels 上、巢狀子查詢、`UNION`、多一個空白）一律拒絕。改了樣板（例如 `CHANNEL_COLUMNS`）時，所有讀取都會被拒，直到審過新文字並更新 pin。沙盒測試腳本的兩句固定 SQL 另以 sha256 釘住。
 - `export --out` 用實際路徑比對，拒絕寫進本 repo（main 會鏡像到公開的 GitHub）。
 
 ## Secret（全部在 `new-api-apporo`，只列名稱）

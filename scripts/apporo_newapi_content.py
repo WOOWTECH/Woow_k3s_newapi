@@ -367,9 +367,23 @@ def template_sha256(head, tail):
     return sha256_text(head if tail is None else head + "{KEYS}" + tail)
 
 
-def check_read_only_sql(sql):
+def _check_key_literals(text, secret_like_allowed):
+    """The key list of a content query names no secret-looking option (option_key_class 'secret',
+    unless the profile's secret_like_allowed lists it) and no invalid one: their values are never read."""
+    if text == "NULL":
+        return
+    profile = {"secret_like_allowed": list(secret_like_allowed or ())}
+    for literal in text.split(","):
+        name = literal[1:-1]
+        if option_key_class(name, profile) in ("secret", "invalid"):
+            raise ContentError(f"the content query asks for the value of {name!r}, a secret-looking option the "
+                               "profile does not allow (secret_like_allowed): refused")
+
+
+def check_read_only_sql(sql, secret_like_allowed=()):
     """Accept only the tool's own two queries (see SQL_TEMPLATE_SHA256), with option-key literals
-    as the only variable part. Everything else is refused, harmless or not."""
+    as the only variable part, none of them a secret-looking option name (unless secret_like_allowed
+    lists it). Everything else is refused, harmless or not."""
     if not isinstance(sql, str) or "\x00" in sql:
         raise ContentError("SQL must be text without NUL")
     templates = sql_templates()
@@ -383,6 +397,7 @@ def check_read_only_sql(sql):
                 return sql
         elif len(sql) > len(head) + len(tail) and sql.startswith(head) and sql.endswith(tail) and \
                 _KEY_LIST_RE.fullmatch(sql[len(head):len(sql) - len(tail)]):
+            _check_key_literals(sql[len(head):len(sql) - len(tail)], secret_like_allowed)
             return sql
     raise ContentError("SQL is not one of this tool's two read-only queries (only the list of option key names "
                        "may vary): refused")
@@ -401,10 +416,11 @@ def sql_option_keys():
     return check_read_only_sql(_option_keys_text())
 
 
-def sql_content(option_keys, key_hashes=False):
-    """The content query for these option keys (each must be a valid option key name)."""
+def sql_content(option_keys, key_hashes=False, secret_like_allowed=()):
+    """The content query for these option keys (each a valid option key name, none secret-looking
+    unless secret_like_allowed lists it)."""
     keys = ",".join(sql_literal(k) for k in option_keys) or "NULL"
-    return check_read_only_sql(_content_text(keys, key_hashes))
+    return check_read_only_sql(_content_text(keys, key_hashes), secret_like_allowed)
 
 
 class Psql:
@@ -420,8 +436,8 @@ class Psql:
                                "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                                "-U", self.user, "-d", self.db, "-f", "-"]
 
-    def query_json(self, sql):
-        check_read_only_sql(sql)
+    def query_json(self, sql, secret_like_allowed=()):
+        check_read_only_sql(sql, secret_like_allowed)
         try:
             r = self.run(self.argv(), input=sql.encode("utf-8"), capture_output=True, timeout=self.timeout)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -452,7 +468,8 @@ def read_snapshot(psql, profile=None, key_hashes=False):
             skipped[k if cls == "secret" else repr(k)[:80]] = cls
         else:
             readable.append(k)
-    body = psql.query_json(sql_content(readable, key_hashes))
+    allowed = tuple((profile or {}).get("secret_like_allowed", ()))
+    body = psql.query_json(sql_content(readable, key_hashes, allowed), allowed)
     options, hashes = {}, {}
     for row in body.get("options") or []:
         if not (isinstance(row, list) and len(row) == 3 and all(isinstance(x, str) for x in row)):
