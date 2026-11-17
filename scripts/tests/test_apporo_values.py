@@ -331,7 +331,8 @@ class ParityCheckTests(unittest.TestCase):
         rc, out = self.run_tool('--chart', chart, '--woow', woow, '--apporo', self.apporo())
         self.assertEqual(rc, 0, out)
         self.assertIn('proxy.paritySelftest is required', out)
-        self.assertIn('proxy.paritySelftest', out.split('values that differ', 1)[-1])
+        self.assertIn('values that differ', out)
+        self.assertRegex(out, r'\n\s+proxy\.paritySelftest: "woow" \| <unset>\n')
         self.assertIn('::warning', out)
         self.assertNotIn('::error', out)
         rc, out = self.run_tool('--strict', '--chart', chart, '--woow', woow, '--apporo', self.apporo())
@@ -351,7 +352,8 @@ class ParityCheckTests(unittest.TestCase):
         self.assertIn('::warning', out)
         rc, out = self.run_tool('--strict', '--woow', woow, '--apporo', self.apporo())
         self.assertNotEqual(rc, 0, out)
-        self.assertIn('proxy pin', out.rsplit('FAILED', 1)[-1])
+        self.assertIn('FAILED', out)
+        self.assertIn('proxy pin', out.rsplit('FAILED', 1)[1])
 
     def test_litellm_copy_that_falls_behind_only_warns(self):
         woow_np = self.fixture('litellm-woow.yaml', LITELLM_PROD.read_text() + 'selftest: woow-only\n')
