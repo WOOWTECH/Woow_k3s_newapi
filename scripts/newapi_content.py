@@ -288,9 +288,6 @@ def option_key_class(key, profile=None):
 # ------------------------------------------------------------------- SQL
 
 READ_ONLY_PREAMBLE = "SET default_transaction_read_only = on;\n"
-_WRITE_WORDS = re.compile(r"\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|copy|vacuum|"
-                          r"reindex|cluster|lock|call|do|comment|security|refresh|import|nextval|setval|"
-                          r"pg_terminate_backend|pg_cancel_backend|set\s+session\s+authorization)\b", re.IGNORECASE)
 
 
 def sql_literal(text):
@@ -299,88 +296,87 @@ def sql_literal(text):
     return "'" + text.replace("'", "''") + "'"
 
 
-# The read-only SQL the tool sends is built from these parts only (a whitelist:
-# anything else, even if harmless, is refused). Whole-row references
-# (to_jsonb(c), row_to_json(channels), c.*), aliases, comma joins,
-# schema-qualified or quoted table names, psql meta-commands (backslash) and
-# variables, comments, dollar quoting and escape strings are all refused.
-_SQL_TABLES = ("options", "channels", "abilities", "setups", "channels_id_seq")
-_SQL_FUNCTIONS = frozenset(("jsonb_build_object", "jsonb_agg", "jsonb_build_array", "coalesce", "encode", "sha256",
-                            "convert_to", "left", "length"))
-_SQL_KEYWORDS_BEFORE_PAREN = frozenset(("in",))
-_SQL_QUOTED = frozenset(('"group"', '"C"'))
-_SQL_FROM_RE = re.compile(r"\b(from|join)\b")
-_SQL_FROM_TARGET_RE = re.compile(r"\s+(" + "|".join(_SQL_TABLES) + r")\b\s*(\)|;|where\b|order\b|limit\b|$)")
-_SQL_TABLE_RE = re.compile(r"\b(" + "|".join(_SQL_TABLES + FORBIDDEN_TABLES) + r")\b")
-_SQL_CALL_RE = re.compile(r"\b([a-z_][a-z0-9_$]*)\s*\(")
-_KEY_CONTEXTS = (
-    "jsonb_agg(key order by key collate",      # option key names
-    "jsonb_build_array(key, value,",           # option rows
-    "order by key collate",
-    "where key in (",
-    "sha256(convert_to(key, ''))",             # channel key fingerprint (literal stripped)
-    "length(key)",
-)
+# The tool sends exactly two read-only queries, and the guard accepts nothing
+# else: the text must equal one of the templates below byte for byte, and the
+# only part that may vary is the list of option keys in the content query
+# (`WHERE key IN (...)`), each a plain literal of an option key name
+# (OPTION_KEY_RE: letters, digits and _.:-; no quote, backslash or space can
+# appear). So `key` is read only where the templates read it: the options
+# table's key column, and, for the target only, sha256() and length() of
+# channels.key (never the key itself). The templates themselves are pinned
+# by sha256 (SQL_TEMPLATE_SHA256): an edit of the SQL, of CHANNEL_COLUMNS or
+# of the ability columns refuses every read until the new text has been
+# reviewed and its pin updated.
+_KEY_LIST_RE = re.compile(r"'[A-Za-z0-9_.:-]{1,128}'(?:,'[A-Za-z0-9_.:-]{1,128}')*|NULL")
+_KEYS_SLOT = "\x00"          # where the key list goes; NUL never appears in a statement the guard accepts
+SQL_TEMPLATE_SHA256 = {
+    "option-keys": "96fa314b47ac6e74fcf47ef25dee92be2ffc54fe78a7441f1c7403e7554141e2",
+    "content": "6b5a9a047fdd620838ec58f34eaad23066d24735e3c8b22a8e403d997e7588ee",
+    "content+key-hashes": "9628f4f1202abbf2aa8f984b7c316957e603e956aefca806efe20f3f081df9b3",
+}
+
+
+def _option_keys_text():
+    return READ_ONLY_PREAMBLE + (
+        "SELECT jsonb_build_object("
+        "'version', (SELECT version FROM setups ORDER BY id LIMIT 1), "
+        "'keys', (SELECT coalesce(jsonb_agg(key ORDER BY key COLLATE \"C\"), '[]'::jsonb) FROM options)"
+        ")::text;")
+
+
+def _content_text(keys, key_hashes):
+    channel_fields = ", ".join(f"'{api}', {col}" for api, col in CHANNEL_COLUMNS)
+    if key_hashes:
+        channel_fields += ", 'key_sha256_16', left(encode(sha256(convert_to(key, 'UTF8')), 'hex'), 16), 'key_length', length(key)"
+    ability_fields = "'group', \"group\", 'model', model, 'channel_id', channel_id, 'enabled', enabled, " \
+                     "'priority', priority, 'weight', weight, 'tag', tag"
+    return READ_ONLY_PREAMBLE + (
+        "SELECT jsonb_build_object("
+        "'version', (SELECT version FROM setups ORDER BY id LIMIT 1), "
+        "'options', (SELECT coalesce(jsonb_agg(jsonb_build_array(key, value, "
+        "encode(sha256(convert_to(value, 'UTF8')), 'hex')) ORDER BY key COLLATE \"C\"), '[]'::jsonb) "
+        f"FROM options WHERE key IN ({keys})), "
+        f"'channels', (SELECT coalesce(jsonb_agg(jsonb_build_object({channel_fields}) ORDER BY id), '[]'::jsonb) "
+        "FROM channels), "
+        f"'abilities', (SELECT coalesce(jsonb_agg(jsonb_build_object({ability_fields}) "
+        "ORDER BY \"group\" COLLATE \"C\", model COLLATE \"C\", channel_id), '[]'::jsonb) FROM abilities), "
+        "'seq', (SELECT jsonb_build_object('last_value', last_value, 'is_called', is_called) FROM channels_id_seq)"
+        ")::text;")
+
+
+def sql_templates():
+    """{name: (head, tail)}: the option-keys query has no variable part (tail None); a content
+    query is head + key list + tail."""
+    out = {"option-keys": (_option_keys_text(), None)}
+    for name, key_hashes in (("content", False), ("content+key-hashes", True)):
+        head, tail = _content_text(_KEYS_SLOT, key_hashes).split(_KEYS_SLOT)
+        out[name] = (head, tail)
+    return out
+
+
+def template_sha256(head, tail):
+    return sha256_text(head if tail is None else head + "{KEYS}" + tail)
 
 
 def check_read_only_sql(sql):
-    """The only SQL this module sends: the read-only preamble, then one SELECT built from a whitelist."""
-    if not isinstance(sql, str) or not sql.startswith(READ_ONLY_PREAMBLE):
-        raise ContentError("SQL must start with SET default_transaction_read_only = on")
-    body = sql[len(READ_ONLY_PREAMBLE):]
-    if "\x00" in body:
-        raise ContentError("NUL in SQL")
-    # Literals (option keys) may contain anything; check the statement shape without them.
-    # Only plain '...' literals (quotes doubled) exist in the generated SQL: E'..', U&'..'
-    # and $$..$$ are refused below, so a literal cannot hide a quote.
-    bare = re.sub(r"'(?:[^']|'')*'", "''", body)
-    lowered = bare.lower()
-    if not lowered.lstrip().startswith("select ") or bare.count(";") != 1 or not bare.rstrip().endswith(";"):
-        raise ContentError("SQL must be exactly one SELECT statement")
-    if "\\" in bare:
-        raise ContentError("SQL contains a backslash outside a literal (psql meta-command)")
-    if "$" in bare or "--" in bare or "/*" in bare:
-        raise ContentError("SQL contains dollar quoting or a comment")
-    if re.search(r"(?<![a-z0-9_])[eub]&?''", lowered) or "u&" in lowered:
-        raise ContentError("SQL contains an escape, bit or unicode string literal")
-    if re.search(r"(?<!:):(?!:)", bare):
-        raise ContentError("SQL contains a psql variable (a single colon)")
-    if "*" in bare:
-        raise ContentError("SQL contains * (whole rows are never read)")
-    for quoted in re.findall(r'"[^"]*"', bare):
-        if quoted not in _SQL_QUOTED:
-            raise ContentError(f"SQL contains the quoted identifier {quoted}")
-    found = _WRITE_WORDS.search(bare)
-    if found:
-        raise ContentError(f"SQL contains {found.group(0)!r}")
-    if "pg_" in lowered or "information_schema" in lowered:
-        raise ContentError("SQL reads a system catalogue or calls a server function")
-    for table in FORBIDDEN_TABLES:
-        if re.search(r"\b(from|join)\s+" + re.escape(table) + r"\b", lowered):
-            raise ContentError(f"SQL reads forbidden table {table}")
-    sources = 0
-    for m in _SQL_FROM_RE.finditer(lowered):
-        if m.group(1) == "join":
-            raise ContentError("SQL contains a join")
-        if not _SQL_FROM_TARGET_RE.match(lowered, m.end()):
-            raise ContentError("SQL reads something other than one whitelisted table per FROM "
-                               "(alias, comma join, schema or quoted name)")
-        sources += 1
-    names = len(_SQL_TABLE_RE.findall(lowered))
-    if names != sources:
-        raise ContentError("SQL names a table outside FROM (whole-row reference)")
-    for m in _SQL_CALL_RE.finditer(lowered):
-        if m.group(1) not in _SQL_FUNCTIONS and m.group(1) not in _SQL_KEYWORDS_BEFORE_PAREN:
-            raise ContentError(f"SQL calls {m.group(1)}(), which is not on the whitelist")
-    # The bare identifier `key` may appear only in these places: the options
-    # table's key column, and channels.key inside sha256()/length() (target
-    # key fingerprint). Anything else could return a channel key.
-    rest = lowered
-    for allowed in _KEY_CONTEXTS:
-        rest = rest.replace(allowed, "")
-    if re.search(r"\bkey\b", rest):
-        raise ContentError("SQL uses the column `key` outside the allowed read-only contexts")
-    return sql
+    """Accept only the tool's own two queries (see SQL_TEMPLATE_SHA256), with option-key literals
+    as the only variable part. Everything else is refused, harmless or not."""
+    if not isinstance(sql, str) or "\x00" in sql:
+        raise ContentError("SQL must be text without NUL")
+    templates = sql_templates()
+    for name, (head, tail) in templates.items():
+        if template_sha256(head, tail) != SQL_TEMPLATE_SHA256[name]:
+            raise ContentError(f"the {name} SQL template changed: review it (read-only, no channel key, no "
+                               "customer table), then update newapi_content.SQL_TEMPLATE_SHA256")
+    for name, (head, tail) in templates.items():
+        if tail is None:
+            if sql == head:
+                return sql
+        elif len(sql) > len(head) + len(tail) and sql.startswith(head) and sql.endswith(tail) and \
+                _KEY_LIST_RE.fullmatch(sql[len(head):len(sql) - len(tail)]):
+            return sql
+    raise ContentError("SQL is not one of this tool's two read-only queries (only the list of option key names "
+                       "may vary): refused")
 
 
 def check_pinned_sql(sql, sha256_hex):
@@ -393,32 +389,13 @@ def check_pinned_sql(sql, sha256_hex):
 
 
 def sql_option_keys():
-    return check_read_only_sql(READ_ONLY_PREAMBLE + (
-        "SELECT jsonb_build_object("
-        "'version', (SELECT version FROM setups ORDER BY id LIMIT 1), "
-        "'keys', (SELECT coalesce(jsonb_agg(key ORDER BY key COLLATE \"C\"), '[]'::jsonb) FROM options)"
-        ")::text;"))
+    return check_read_only_sql(_option_keys_text())
 
 
 def sql_content(option_keys, key_hashes=False):
+    """The content query for these option keys (each must be a valid option key name)."""
     keys = ",".join(sql_literal(k) for k in option_keys) or "NULL"
-    channel_fields = ", ".join(f"'{api}', {col}" for api, col in CHANNEL_COLUMNS)
-    if key_hashes:
-        channel_fields += ", 'key_sha256_16', left(encode(sha256(convert_to(key, 'UTF8')), 'hex'), 16), 'key_length', length(key)"
-    ability_fields = "'group', \"group\", 'model', model, 'channel_id', channel_id, 'enabled', enabled, " \
-                     "'priority', priority, 'weight', weight, 'tag', tag"
-    return check_read_only_sql(READ_ONLY_PREAMBLE + (
-        "SELECT jsonb_build_object("
-        "'version', (SELECT version FROM setups ORDER BY id LIMIT 1), "
-        "'options', (SELECT coalesce(jsonb_agg(jsonb_build_array(key, value, "
-        "encode(sha256(convert_to(value, 'UTF8')), 'hex')) ORDER BY key COLLATE \"C\"), '[]'::jsonb) "
-        f"FROM options WHERE key IN ({keys})), "
-        f"'channels', (SELECT coalesce(jsonb_agg(jsonb_build_object({channel_fields}) ORDER BY id), '[]'::jsonb) "
-        "FROM channels), "
-        f"'abilities', (SELECT coalesce(jsonb_agg(jsonb_build_object({ability_fields}) "
-        "ORDER BY \"group\" COLLATE \"C\", model COLLATE \"C\", channel_id), '[]'::jsonb) FROM abilities), "
-        "'seq', (SELECT jsonb_build_object('last_value', last_value, 'is_called', is_called) FROM channels_id_seq)"
-        ")::text;"))
+    return check_read_only_sql(_content_text(keys, key_hashes))
 
 
 class Psql:
@@ -550,12 +527,20 @@ def validate_profile(p):
     days = p.get("price_increase_notice_days", MIN_NOTICE_DAYS)
     need(type(days) is int and days >= MIN_NOTICE_DAYS,
          f"price_increase_notice_days must be an integer >= {MIN_NOTICE_DAYS} (AI Models Terms, Section 3)")
+    # A model taken off keeps its price protection this long; shorter would let a
+    # brief delisting skip the notice.
     hist = p.get("served_history_days", DEFAULT_HISTORY_DAYS)
-    need(type(hist) is int and 1 <= hist <= 3650, "served_history_days must be an integer from 1 to 3650")
+    need(type(hist) is int and MIN_HISTORY_DAYS <= hist <= 3650,
+         f"served_history_days must be an integer from {MIN_HISTORY_DAYS} to 3650")
+    need(type(p.get("divide_tool_prices", False)) is bool, "divide_tool_prices must be true or false")
+    scalars = p.get("divided_scalar_prices", [])
+    need(isinstance(scalars, list) and set(scalars) <= set(SCALAR_PRICE_DEFAULTS),
+         f"divided_scalar_prices must be a list of {sorted(SCALAR_PRICE_DEFAULTS)}")
     return p
 
 
 MIN_NOTICE_DAYS = 7
+MIN_HISTORY_DAYS = 30
 DEFAULT_HISTORY_DAYS = 30
 
 # rc.44 setting/billing_setting/builtin_billing.go: models billed by a built-in
@@ -588,6 +573,253 @@ def billing_entries(options):
     return {k: len(_option_object(options, k)) for k in BILLING_MAPS if _option_object(options, k)}
 
 
+# ------------------------------------------------------- tool call prices
+
+# rc.44 setting/operation_setting/tools.go: tool calls (web_search, file_search,
+# image_generation, ...) are billed per call at
+#   price / 1000 * GroupRatio * QuotaPerUnit   quota   (service/text_quota.go)
+# with `price` an absolute amount per 1,000 calls, never a ModelRatio multiple.
+# The effective price of a key is WOOW's operator value (option
+# tool_price_setting.prices, a JSON object) or else this built-in seed
+# (seedHardcodedToolPrices, "US$ or the vendor's list currency per 1K calls").
+TOOL_PRICE_KEY = "tool_price_setting.prices"
+RC44_TOOL_PRICE_SEED = {
+    "web_search": 10.0, "web_search_preview": 10.0, "file_search": 2.5, "google_search": 14.0,
+    "image_generation": 150.0,
+    "web_search_preview:gpt-4o*": 25.0, "web_search_preview:gpt-4.1*": 25.0,
+    "web_search_preview:gpt-4o-mini*": 25.0, "web_search_preview:gpt-4.1-mini*": 25.0,
+    "google_search:gemini-2.5*": 0.0, "google_search:gemini-2.0*": 0.0, "google_search:gemini-1.5*": 0.0,
+    "google_search_grounded_prompt:gemini-2.5*": 35.0, "google_search_grounded_prompt:gemini-2.0*": 35.0,
+    "google_search_grounded_prompt:gemini-1.5*": 35.0,
+    "search_std": 10.0, "search_pro": 30.0, "search_pro_sogou": 50.0, "search_pro_quark": 50.0,
+    "search_strategy_turbo": 3.0, "search_strategy_max": 4.0, "search_strategy_agent": 4.0,
+    "search_strategy_agent_max": 4.0, "bing_web_search": 14.0, "web_search:grok*": 5.0,
+    "x_search_posts": 5.0, "x_search_profiles": 10.0,
+}
+# The built-in seed of each New API version the tool knows, and the image it was
+# read from (chart/values.yaml newapi.image). A new version may change the seed:
+# read its tools.go, add it here, and the sync recomputes Apporo's prices.
+TOOL_PRICE_SEEDS = {"v1.0.0-rc.44": RC44_TOOL_PRICE_SEED}
+SEED_IMAGES = {"v1.0.0-rc.44": "sha256:67bf271602177ff31bbb4b34f20d5f33003d3108514bd23412cff66498c05a84"}
+# sha256 of go_json(RC44_TOOL_PRICE_SEED): an edit of the table must be a deliberate one.
+RC44_TOOL_PRICE_SEED_SHA256 = "69dc49fddbea1f79c82a85b62043a46191ff9028f26e187b6956d378579a8493"
+
+
+class _Pairs(list):
+    """A JSON object as its member list (keeps duplicate members, like the raw text)."""
+
+
+def _no_constant(name):
+    raise ValueError(name)
+
+
+def tool_price_overrides(text):
+    """rc.44 LoadToolPricesFromJSONString(text): ({name: price} that rc.44 loads, [names it ignores]).
+    No row, or text that is not one JSON object, loads nothing (the seed applies everywhere); an
+    entry that is not a finite number >= 0 is ignored on its own; a repeated member: the last wins."""
+    if text is None:
+        return {}, []
+    try:
+        value = json.loads(text, object_pairs_hook=_Pairs, parse_constant=_no_constant)
+    except (ValueError, RecursionError):
+        return {}, ["(the value is not JSON)"]
+    if not isinstance(value, _Pairs):
+        return {}, ["(the value is not a JSON object)"]
+    raw = {}
+    for name, v in value:
+        raw[name] = v
+    prices, ignored = {}, []
+    for name, v in raw.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            ignored.append(name)
+            continue
+        try:
+            f = float(v)
+        except OverflowError:
+            ignored.append(name)
+            continue
+        if math.isnan(f) or math.isinf(f) or f < 0:
+            ignored.append(name)
+            continue
+        prices[name] = f
+    return prices, sorted(ignored)
+
+
+def tool_price_seed(version):
+    seed = TOOL_PRICE_SEEDS.get(version)
+    if seed is None:
+        raise ContentError(f"no built-in tool price table for New API {version!r}: read its "
+                           "setting/operation_setting/tools.go and add it to TOOL_PRICE_SEEDS")
+    return seed
+
+
+def effective_tool_prices(version, text):
+    """(seed + the operator prices rc.44 loads, ignored entry names): every key rc.44 can bill."""
+    merged = dict(tool_price_seed(version))
+    over, ignored = tool_price_overrides(text)
+    merged.update(over)
+    return merged, ignored
+
+
+def tool_price_index(merged):
+    """rc.44 RebuildToolPriceIndex: {tool: (default (price, key) or None, [(prefix bytes, price, key)])}
+    with the prefixes longest first, then bytewise. Also returns the keys that share a prefix
+    (rc.44's order between them is not defined)."""
+    out, seen, clashes = {}, {}, []
+    for key, price in merged.items():
+        tool, colon, part = key.partition(":")
+        entry = out.setdefault(tool, [None, []])
+        if not colon:
+            entry[0] = (price, key)
+            continue
+        prefix = part[:-1] if part.endswith("*") else part
+        pb = prefix.encode("utf-8")
+        other = seen.get((tool, pb))
+        if other is not None and merged[other] != price:
+            clashes.append(sorted((other, key)))
+        seen[(tool, pb)] = key
+        entry[1].append((pb, price, key))
+    for entry in out.values():
+        entry[1].sort(key=lambda e: (-len(e[0]), e[0], e[2]))
+    return out, clashes
+
+
+def tool_price(index, tool, model):
+    """rc.44 GetToolPriceForModel: (price per 1,000 calls, the key that set it, or None)."""
+    entry = index.get(tool)
+    if entry is None:
+        return 0.0, None
+    if model:
+        mb = model.encode("utf-8")
+        for pb, price, key in entry[1]:
+            if mb.startswith(pb):
+                return price, key
+    if entry[0] is not None:
+        return entry[0]
+    return 0.0, None
+
+
+def tool_probes(*indexes):
+    """Model names that reach every distinct price of these indexes: each key's prefix (it is
+    governed by the longest key it starts with, in every index) and "" (the defaults)."""
+    names = {""}
+    for index in indexes:
+        for _, (_, prefixes) in index.items():
+            names.update(pb.decode("utf-8") for pb, _, _ in prefixes)
+    return names
+
+
+def divided_tool_prices(version, text, divisor):
+    """(Apporo's tool_price_setting.prices text, ignored WOOW entries, prefix clashes): every key
+    WOOW's rc.44 can bill (seed + WOOW's operator prices) at price / divisor, as rc.44 itself
+    serializes this map (encoding/json of map[string]float64: keys sorted, Go floats). Writing
+    every key, not only WOOW's overrides, is what makes each lookup WOOW's / divisor."""
+    merged, ignored = effective_tool_prices(version, text)
+    out = {}
+    for key, price in merged.items():
+        q = price / divisor
+        if price > 0 and not q > 0:
+            raise ContentError(f"{TOOL_PRICE_KEY}[{key}]: {price} / {divisor} underflows to 0")
+        out[key] = q
+    _, clashes = tool_price_index(merged)
+    return go_json(out), ignored, clashes
+
+
+# ------------------------------------------------- the violation fee (rc.44)
+
+# rc.44 setting/model_setting/grok.go + service/violation_fee.go: an upstream error
+# carrying a content-safety marker ("Content violates usage guidelines", "Failed
+# check: SAFETY_CHECK_TYPE"), from any channel, is charged
+#   amount * QuotaPerUnit * GroupRatio   quota
+# with `amount` an absolute US$ value (default 0.05, enabled by default). Stored as
+# plain text like rc.44's own export (strconv.FormatFloat 'f', -1).
+VIOLATION_FEE_KEY = "grok.violation_deduction_amount"
+VIOLATION_SWITCH_KEY = "grok.violation_deduction_enabled"
+RC44_VIOLATION_FEE = 0.05
+SCALAR_PRICE_DEFAULTS = {VIOLATION_FEE_KEY: RC44_VIOLATION_FEE}
+PRICE_SWITCHES = {VIOLATION_SWITCH_KEY: True}
+_GO_DECIMAL_RE = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+_GO_OTHER_FLOAT_RE = re.compile(r"(?i)[+-]?(?:inf|infinity|nan|0x[0-9a-f_.p+-]*)")
+
+
+def go_parse_float(text):
+    """strconv.ParseFloat for rc.44 config text: (float, None); (None, None) when rc.44 skips the
+    row (keeps its default); (None, why) for forms Go accepts that this tool does not model."""
+    if _GO_DECIMAL_RE.fullmatch(text):
+        try:
+            v = float(text)
+        except (OverflowError, ValueError):
+            return None, None
+        return (None, None) if math.isinf(v) or math.isnan(v) else (v, None)   # ErrRange: rc.44 skips it
+    if _GO_OTHER_FLOAT_RE.fullmatch(text):
+        return None, "infinite, NaN or hexadecimal"
+    return None, None
+
+
+def go_parse_bool(text):
+    """strconv.ParseBool (None when rc.44 skips the row)."""
+    if text in ("1", "t", "T", "TRUE", "true", "True"):
+        return True
+    if text in ("0", "f", "F", "FALSE", "false", "False"):
+        return False
+    return None
+
+
+def scalar_price(options, key):
+    """(the US$ amount rc.44 uses for this option, or None, and why not)."""
+    text = options.get(key)
+    if text is None:
+        return SCALAR_PRICE_DEFAULTS[key], None
+    v, why = go_parse_float(text)
+    if why:
+        return None, why
+    return (SCALAR_PRICE_DEFAULTS[key] if v is None else v), None
+
+
+def violation_fee(options):
+    """(US$ rc.44 charges per flagged request, 0 when switched off, or None, and why not)."""
+    text = options.get(VIOLATION_SWITCH_KEY)
+    enabled = PRICE_SWITCHES[VIOLATION_SWITCH_KEY] if text is None else go_parse_bool(text)
+    if enabled is None:
+        enabled = PRICE_SWITCHES[VIOLATION_SWITCH_KEY]     # rc.44 skips an unreadable switch
+    amount, why = scalar_price(options, VIOLATION_FEE_KEY)
+    if amount is None:
+        return None, why
+    return (amount if enabled and amount > 0 else 0.0), None
+
+
+def go_format_f(value):
+    """strconv.FormatFloat(value, 'f', -1, 64): the shortest digits, never an exponent."""
+    f = float(value)
+    if math.isnan(f) or math.isinf(f):
+        raise ContentError("non-finite number")
+    if f == 0:
+        return "-0" if math.copysign(1.0, f) < 0 else "0"
+    mantissa, _, exp = repr(abs(f)).lower().partition("e")
+    whole, _, frac = mantissa.partition(".")
+    raw = whole + frac
+    stripped = raw.lstrip("0")
+    point = len(whole) + (int(exp) if exp else 0) - (len(raw) - len(stripped))
+    digits = stripped.rstrip("0") or "0"
+    if point <= 0:
+        text = "0." + "0" * -point + digits
+    elif point >= len(digits):
+        text = digits + "0" * (point - len(digits))
+    else:
+        text = digits[:point] + "." + digits[point:]
+    return ("-" if f < 0 else "") + text
+
+
+# rc.44 setting/operation_setting/tools.go GetGeminiInputAudioPricePerMillionTokens:
+# audio input of models whose (billing) name starts with one of these is billed at
+# fixed US$ prices per 1M tokens that no option can change.
+GEMINI_AUDIO_PREFIXES = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-robotics-er-1.5")
+
+
+def fixed_audio_price(model):
+    return model.startswith(GEMINI_AUDIO_PREFIXES)
+
+
 # ------------------------------------------------------------- transform
 
 def transform(src, profile):
@@ -617,6 +849,25 @@ def transform(src, profile):
                 notes.append(("label-missing", key, f"no target label for group(s) {missing}"))
             value = json.dumps({g: labels.get(g, groups[g]) for g in groups}, ensure_ascii=False)
         opts[key] = value
+    if profile.get("divide_tool_prices"):
+        # Absolute prices per 1,000 tool calls: WOOW's effective price of every key / divisor.
+        text, ignored, clashes = divided_tool_prices(src.get("version"), src["options"].get(TOOL_PRICE_KEY), divisor)
+        opts[TOOL_PRICE_KEY] = text
+        if ignored:
+            notes.append(("tool-price-ignored", TOOL_PRICE_KEY,
+                          f"WOOW's rc.44 ignores these entries (not a number >= 0), so Apporo leaves them out: "
+                          f"{ignored[:10]}"))
+        for pair in clashes:
+            notes.append(("tool-price-ambiguous", TOOL_PRICE_KEY,
+                          f"keys {pair} name the same model prefix at different prices: rc.44's choice between "
+                          "them is not defined, so Apporo may not charge exactly WOOW's / 30; fix it at WOOW"))
+    for key in profile.get("divided_scalar_prices", ()):
+        amount, why = scalar_price(src["options"], key)
+        if amount is None:
+            opts.pop(key, None)
+            notes.append(("scalar-price-unreadable", key, f"WOOW's value cannot be read ({why}): not copied"))
+            continue
+        opts[key] = go_format_f(amount / divisor)
     for key, value in (profile.get("target_options") or {}).items():
         opts[key] = value
     opts["ServerAddress"] = profile["target"]["server_address"]

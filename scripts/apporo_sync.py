@@ -126,6 +126,9 @@ NEEDS_CONFIG_RE = re.compile(r"(OAuth|^oidc\.|^discord\.|^telegram\.|WeChat|Tele
 # vendor prices the 30:1 rule never reaches): a person decides.
 OPAQUE_PRICE_RE = re.compile(r"^(tool_price_setting\..*|task_pricing_setting\..*|Price|USDExchangeRate|PreConsumedQuota|"
                              r"QuotaRemindThreshold)$")
+# Absolute US$ prices stored as one plain option (and the switch that turns one on):
+# judged like a price, never copied as a plain setting.
+PRICE_OPTIONS = frozenset(nc.SCALAR_PRICE_DEFAULTS) | frozenset(nc.PRICE_SWITCHES)
 # Security-relevant switches (docs/OPERATIONS.md: JS task plugins can read channel keys).
 SECURITY_KEYS = frozenset(("TaskPluginEnabled", "TaskEnabled", "MjForwardUrlEnabled"))
 # Channel fields the sync copies by itself; any other field change is an alert.
@@ -196,7 +199,7 @@ def notice_days(profile):
 
 
 def history_days(profile):
-    return profile.get("served_history_days", nc.DEFAULT_HISTORY_DAYS)
+    return max(nc.MIN_HISTORY_DAYS, profile.get("served_history_days", nc.DEFAULT_HISTORY_DAYS))
 
 
 class Secret:
@@ -515,6 +518,9 @@ def build_items(src, tgt, desired, notes, profile, keys=None, bootstrap=False):
                               subject_text=f"pricing-row-missing: {key}"))
         elif key in nc.GROUP_PRICE_MAPS and t is not None and not bootstrap and _is_object(t) and _is_object(d):
             items += map_items(key, t, d, go=False)
+        elif key == nc.TOOL_PRICE_KEY and profile.get("divide_tool_prices") and not bootstrap and _is_object(d):
+            # entry by entry; no row (or no object) at the target = rc.44's seed everywhere
+            items += map_items(key, t if _is_object(t) else "{}", d, go=False)
         else:
             items.append(item("opt", key=key, old=t, new=d))
     managed = set(desired["channels"])
@@ -550,7 +556,7 @@ BOOT_KEYS = frozenset(("theme.frontend", "SelfUseModeEnabled", "DemoSiteEnabled"
 def _is_object(text):
     try:
         return isinstance(json.loads(text), dict)
-    except ValueError:
+    except (TypeError, ValueError, RecursionError):
         return False
 
 
@@ -660,7 +666,9 @@ def classify(items, tgt, profile, bootstrap=False, desired=None, history=None):
             it["class"], it["reason"] = "auto", it["reason"] or "bootstrap replay"
             continue
         k = it["kind"]
-        if k == "opt":
+        if k == "opt" and it["key"] in PRICE_OPTIONS:
+            continue  # second pass: an absolute price, judged by who is offered
+        elif k == "opt":
             classify_option(it, profile)
         elif k == "map":
             continue  # second pass: needs what the channel changes leave offered
@@ -703,12 +711,15 @@ def classify(items, tgt, profile, bootstrap=False, desired=None, history=None):
                                                                              "chan-model-remove", "chan-field")]
     after = routed_models(simulate(tgt, routes, profile, desired))
     hist = history or {}
-    ctx = {"before": before, "after": after, "hist": hist, "days": history_days(profile)}
+    ctx = {"before": before, "after": after, "hist": hist, "days": history_days(profile), "target": tgt}
     for name in ("before", "after", "hist"):
         ctx["groups_" + name] = {g for gs in ctx[name].values() for g in gs}
     for it in items:
         if it["kind"] == "map":
             classify_map(it, ctx)
+        elif it["kind"] == "opt" and it["key"] in PRICE_OPTIONS:
+            classify_price_option(it, ctx)
+    tool_price_gate(items, tgt, history)
     expression_gate(items, tgt, profile, desired)
     platform_gate(items, tgt, profile, desired)
     return items
@@ -771,8 +782,140 @@ def _direction(key, o, n):
     return "increase" if new_v > old_v else "decrease" if new_v < old_v else "same"
 
 
+def offered_sets(ctx):
+    """(models whose customers paid the current prices: offered now or recently, models offered after this run)."""
+    return set(ctx["before"]) | set(ctx["hist"]), set(ctx["after"])
+
+
+def price_outcome(it, ctx, ups, downs, what):
+    """Classify one absolute-price change from the offered models whose price goes up or down:
+    like a ModelRatio entry, an increase is held when a model customers paid for stays offered,
+    kept while such models are only taken off, and automatic when it reaches new models only."""
+    old_models, after = offered_sets(ctx)
+    days = ctx["days"]
+    if not ups and not downs:
+        it["class"], it["reason"] = "auto", f"no offered model's {what} changes (now, after this run or in the last " \
+                                            f"{days} days)"
+        return
+    if not ups:
+        it["class"], it["reason"] = "auto", f"{what} decrease"
+        return
+    if ups & old_models & after:
+        sample = ", ".join(sorted(ups & old_models & after, key=str.encode)[:3])
+        it["class"], it["reason"] = "hold", f"{what} increase (offered models such as {sample})"
+        return
+    if ups & old_models:
+        it["class"], it["severity"], it["deferred"] = "alert", "info", True
+        it["reason"] = f"kept: the {what} would rise only for models taken off now or in the last {days} days; a " \
+                       "re-listing must not skip the price notice (applied once the window has passed)"
+        return
+    it["class"], it["reason"] = "auto", f"{what}: first listing of the models it raises (no customer paid the old price)"
+
+
+def tool_state(state):
+    """(the target's operator tool prices as stored, rc.44's seed for the target's version)."""
+    text = state["options"].get(nc.TOOL_PRICE_KEY)
+    cur = nc.parse_object(text, nc.TOOL_PRICE_KEY) if _is_object(text) else {}
+    return cur, nc.tool_price_seed(state.get("version") or nc.NEWAPI_VERSION)
+
+
+def tool_index(seed, operator):
+    """rc.44's index for a seed and an operator map as stored (entries rc.44 ignores dropped)."""
+    loaded, _ = nc.tool_price_overrides(json.dumps(operator, ensure_ascii=False))
+    merged = dict(seed)
+    merged.update(loaded)
+    return nc.tool_price_index(merged)[0]
+
+
+def classify_tool_price(it, ctx):
+    """One entry of tool_price_setting.prices: its effect on every offered model's price of that tool."""
+    cur, seed = tool_state(ctx["target"])
+    alt = dict(cur)
+    if it["new"] is None:
+        alt.pop(it["entry"], None)
+    else:
+        alt[it["entry"]] = it["new"]
+    tool = it["entry"].partition(":")[0]
+    old_idx, new_idx = tool_index(seed, cur), tool_index(seed, alt)
+    old_models, after = offered_sets(ctx)
+    ups, downs = set(), set()
+    for m in old_models | after:
+        p0, p1 = nc.tool_price(old_idx, tool, m)[0], nc.tool_price(new_idx, tool, m)[0]
+        if p1 > p0:
+            ups.add(m)
+        elif p1 < p0:
+            downs.add(m)
+    price_outcome(it, ctx, ups, downs, f"tool price ({tool}, per 1,000 calls)")
+
+
+def classify_price_option(it, ctx):
+    """grok.violation_deduction_*: the US$ fee rc.44 charges a flagged request on any model."""
+    tgt = ctx["target"]["options"]
+    alt = dict(tgt)
+    if it["new"] is None:
+        alt.pop(it["key"], None)
+    else:
+        alt[it["key"]] = it["new"]
+    (old, why_old), (new, why_new) = nc.violation_fee(tgt), nc.violation_fee(alt)
+    if old is None or new is None:
+        it["class"], it["reason"] = "alert", f"the violation fee cannot be read ({why_old or why_new}): decide by hand"
+        return
+    old_models, after = offered_sets(ctx)
+    everyone = old_models | after
+    ups = everyone if new > old else set()
+    downs = everyone if new < old else set()
+    price_outcome(it, ctx, ups, downs, "content-safety violation fee")
+
+
+def tool_price_gate(items, tgt, history):
+    """The tool price entries this run writes, together, must not raise any price that customers
+    paid (a model offered now or recently), except by an increase whose notice has matured. Each
+    entry was judged alone; together they could (a first listing raised for a new model plus the
+    removal of a longer key that governed an old one), so check the combination too."""
+    tool_items = [it for it in items if it["kind"] == "map" and it["key"] == nc.TOOL_PRICE_KEY]
+    if not tool_items:
+        return
+    cur, seed = tool_state(tgt)
+    old_models = set(routed_models(tgt)) | set(history or {})
+    old_idx = tool_index(seed, cur)
+
+    def unexplained(chosen):
+        alt = dict(cur)
+        for it in chosen:
+            if it["new"] is None:
+                alt.pop(it["entry"], None)
+            else:
+                alt[it["entry"]] = it["new"]
+        new_idx = tool_index(seed, alt)
+        for tool in sorted(set(old_idx) | set(new_idx)):
+            for m in sorted(old_models, key=str.encode):
+                (p0, _), (p1, k1) = nc.tool_price(old_idx, tool, m), nc.tool_price(new_idx, tool, m)
+                if p1 > p0 and not any(it["class"] == "hold" and it["apply"] and it["entry"] == k1 and it["new"] == p1
+                                       for it in chosen):
+                    return f"{tool} for {m}: {p0} -> {p1}"
+        return None
+
+    autos = [it for it in tool_items if it["class"] == "auto"]
+    matured = [it for it in tool_items if it["class"] == "hold" and it["apply"]]
+    why = unexplained(autos + matured)
+    if why and autos:
+        for it in autos:
+            it["class"], it["apply"] = "alert", False
+            it["reason"] = f"together this run's tool price changes would raise a price without a notice ({why}): " \
+                           "decide by hand"
+        why = unexplained(matured)
+    if why and matured:
+        for it in matured:
+            it["apply"] = False
+            it["reason"] += f"; not applied: together with the other tool prices it would raise more than the " \
+                            f"notice said ({why})"
+
+
 def classify_map(it, ctx):
     key, entry, o, n = it["key"], it["entry"], it["old"], it["new"]
+    if key == nc.TOOL_PRICE_KEY:
+        classify_tool_price(it, ctx)
+        return
     if key in nc.BILLING_MAPS:
         it["class"], it["reason"] = "alert", "billing expressions are real US$ prices (rc.44: no ratio conversion), " \
                                              "so the 30:1 rule cannot be applied to them: decide by hand"
@@ -847,6 +990,16 @@ def expression_gate(items, tgt, profile, desired):
                 it["class"], it["reason"] = "alert", reason
         elif here:
             items.append(item("alert", "alert", reason, subject_text=f"billing-expression: model {m}"))
+    items += audio_price_alerts(routed_models(final))
+
+
+def audio_price_alerts(models):
+    """rc.44 bills the audio input of some Gemini model names at fixed US$ prices per 1M tokens
+    (GetGeminiInputAudioPricePerMillionTokens) that no option can change: about 30x the rule."""
+    return [item("alert", "alert", f"rc.44 bills the audio input of {m} at a fixed US$ price per 1M tokens that no "
+                 "option can divide by 30 (about 30x the rule for audio requests; text is priced normally): accept it, "
+                 "or take the model off Apporo's channels by hand", subject_text=f"fixed-audio-price: model {m}")
+            for m in sorted(models, key=str.encode) if nc.fixed_audio_price(m)]
 
 
 def bootstrap_blockers(desired):
@@ -1103,6 +1256,13 @@ def combined_gate(chosen, tgt, profile, desired=None):
     return False
 
 
+def gate_chosen(items, tgt, profile, desired, history):
+    """After process_holds marked the matured holds: what this run writes, together, must keep the
+    platform's pricing validation passing and raise no paid-for tool price without a notice."""
+    combined_gate(chosen_items(items), tgt, profile, desired)
+    tool_price_gate(items, tgt, history)
+
+
 # -------------------------------------------------------- effective state
 
 def simulate(tgt, chosen, profile, desired=None):
@@ -1117,13 +1277,17 @@ def simulate(tgt, chosen, profile, desired=None):
             opts[it["key"]] = it["new"]
     for key, its in by_key.items():
         go = key in nc.PRICING_KEYS
-        cur = nc.canonical_map(opts[key], key) if go else nc.parse_object(opts[key], key)
+        if key == nc.TOOL_PRICE_KEY:
+            # written as rc.44 serializes it (Go JSON); no row (or no object) = no operator price
+            cur = nc.parse_object(opts[key], key) if _is_object(opts.get(key)) else {}
+        else:
+            cur = nc.canonical_map(opts[key], key) if go else nc.parse_object(opts[key], key)
         for it in its:
             if it["new"] is None:
                 cur.pop(it["entry"], None)
             else:
                 cur[it["entry"]] = it["new"]
-        if go:
+        if go or key == nc.TOOL_PRICE_KEY:
             opts[key] = nc.go_json(cur)
         else:
             want = desired["options"].get(key) if desired else None
@@ -1298,6 +1462,42 @@ def model_prices(state, model, profile, group="default"):
     return out
 
 
+def absolute_price_rows(holds_items, base, final, profile):
+    """Notice rows for held tool prices (US$ per 1,000 calls) and the violation fee (per flagged request):
+    price x GroupRatio(default) x points per US$, as rc.44 bills them (1 point = US$1 at Apporo)."""
+    def group_factor(state):
+        try:
+            gr = json.loads(state["options"].get("GroupRatio") or "{}").get("default")
+        except ValueError:
+            gr = None
+        return None if gr is None else decimal.Decimal(str(gr)) * decimal.Decimal(str(profile.get("points_per_usd", 32)))
+
+    def row(label, unit, b, a, fb, fa):
+        if fb is None or fa is None:
+            return f"| {label} | {unit} | (by hand) | (by hand) | |"
+        b, a = decimal.Decimal(str(b)) * fb, decimal.Decimal(str(a)) * fa
+        change = "" if not b else f"{(a - b) / b * 100:+.1f}%"
+        return f"| {label} | {unit} | {usd(b)} | {usd(a)} | {change} |"
+
+    rows = []
+    fb, fa = group_factor(base), group_factor(final)
+    tools = [it for it in holds_items if it["kind"] == "map" and it["key"] == nc.TOOL_PRICE_KEY]
+    if tools:
+        (cur_b, seed_b), (cur_a, seed_a) = tool_state(base), tool_state(final)
+        idx_b, idx_a = tool_index(seed_b, cur_b), tool_index(seed_a, cur_a)
+        for it in sorted(tools, key=lambda i: i["entry"].encode()):
+            tool, colon, part = it["entry"].partition(":")
+            prefix = part[:-1] if part.endswith("*") else part
+            label = f"tool `{tool}`" + (f" (models starting with `{prefix}`)" if colon else "")
+            rows.append(row(label, "per 1,000 calls", nc.tool_price(idx_b, tool, prefix)[0],
+                            nc.tool_price(idx_a, tool, prefix)[0], fb, fa))
+    if any(it["kind"] == "opt" and it["key"] in PRICE_OPTIONS for it in holds_items):
+        (b, _), (a, _) = nc.violation_fee(base["options"]), nc.violation_fee(final["options"])
+        rows.append(row("content-safety violation fee", "per flagged request", b, a, fb, fa) if b is not None and
+                    a is not None else "| content-safety violation fee | per flagged request | (by hand) | (by hand) | |")
+    return rows
+
+
 def draft_notice(nid, holds_items, base, profile, now, days, offered):
     """English customer notice for the held increases: US$ prices before and after, per model.
     `base` is the target after this run's automatic writes; `offered` maps models to groups
@@ -1307,7 +1507,7 @@ def draft_notice(nid, holds_items, base, profile, now, days, offered):
     for it in holds_items:
         if it["kind"] == "map" and it["key"] == "GroupRatio":
             models |= {m for m, gs in offered.items() if it["entry"] in gs}
-        elif it["kind"] == "map":
+        elif it["kind"] == "map" and it["key"] != nc.TOOL_PRICE_KEY:
             models.add(it["entry"])
     rows, by_hand = [], []
     for m in sorted(models, key=str.encode):
@@ -1327,6 +1527,7 @@ def draft_notice(nid, holds_items, base, profile, now, days, offered):
             if b is None or a != b:
                 change = "" if not b else f"{(a - b) / b * 100:+.1f}%"
                 rows.append(f"| `{m}` | {comp} | {usd(b) if b is not None else 'n/a'} | {usd(a)} | {change} |")
+    rows += absolute_price_rows(holds_items, base, final, profile)
     if not rows:
         subjects = ", ".join(it["subject"] for it in holds_items)
         rows = [f"| (BY HAND: the held change(s) {subjects} do not map to a per-model price in the default "
@@ -1347,10 +1548,10 @@ def draft_notice(nid, holds_items, base, profile, now, days, offered):
         "",
         f"We are writing to let you know that the prices of the AI models listed below will increase on "
         f"{{EFFECTIVE_DATE}}, at least {days} days after this email, as described in Section 3 of the AI Models "
-        "Terms of Service. Prices are in points per million tokens (or per call), and 1 point = US$1. "
-        "Prices of other models do not change.",
+        "Terms of Service. Prices are in points per million tokens (or per call, or per 1,000 tool calls), and "
+        "1 point = US$1. Prices of other models do not change.",
         "",
-        "| Model | Price | Current (US$) | New (US$) | Change |",
+        "| Model or tool | Price | Current (US$) | New (US$) | Change |",
         "|---|---|---:|---:|---:|",
         *rows,
         "",
@@ -1664,6 +1865,29 @@ def create_channel(client, a, profile, cid, desired, keys, journal, out):
 
 # ------------------------------------------------------------- verify
 
+def tool_price_row(src, tgt, profile, allowed):
+    """Every price rc.44 can bill a tool call at: Apporo's = WOOW's / divisor, for each tool and each
+    model name that reaches a distinct price (every key prefix, the defaults, every routed model)."""
+    div = profile["price_divisor"]
+    name = f"every tool call price = WOOW's / {div:g} (each tool x key prefix and routed model)"
+    try:
+        s_idx = nc.tool_price_index(nc.effective_tool_prices(src.get("version"), src["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
+        t_idx = nc.tool_price_index(nc.effective_tool_prices(tgt.get("version"), tgt["options"].get(nc.TOOL_PRICE_KEY))[0])[0]
+    except nc.ContentError as e:
+        return ("prices", name, False, str(e))
+    probes = nc.tool_probes(s_idx, t_idx) | set(routed_models(src)) | set(routed_models(tgt))
+    bad = []
+    for tool in sorted(set(s_idx) | set(t_idx)):
+        for m in sorted(probes, key=str.encode):
+            ps, pt = nc.tool_price(s_idx, tool, m)[0], nc.tool_price(t_idx, tool, m)[0]
+            if pt != ps / div:
+                bad.append(f"{tool} for {m or '(any other model)'}: {pt} != {ps} / {div:g}")
+    if not bad:
+        return ("prices", name, True, None)
+    return ("prices", name, allowed, "expected difference (held/alert)" if allowed else
+            "; ".join(bad[:3]) + f" ({len(bad)} differ)")
+
+
 def verify_report(src, tgt, desired, profile, keys, expected_items=()):
     """Checks of the target against the desired content. `expected_items`: held or
     alert-only differences that are allowed to remain (daily mode)."""
@@ -1682,6 +1906,15 @@ def verify_report(src, tgt, desired, profile, keys, expected_items=()):
         ok = exp == got
         rows.append(("option", key, ok or key in allowed_opts, None if ok else
                      ("expected difference (held/alert)" if key in allowed_opts else f"sha256 {got} != {exp}")))
+    if profile.get("divide_tool_prices"):
+        rows.append(tool_price_row(src, tgt, profile, nc.TOOL_PRICE_KEY in allowed_opts))
+    if nc.VIOLATION_FEE_KEY in profile.get("divided_scalar_prices", ()):
+        div = profile["price_divisor"]
+        (ws, _), (ap, _) = nc.violation_fee(src["options"]), nc.violation_fee(have)
+        ok = ws is not None and ap is not None and ap == ws / div
+        allowed = bool(allowed_opts & set(PRICE_OPTIONS))
+        rows.append(("prices", f"violation fee = WOOW's / {div:g}", ok or allowed, None if ok else
+                     ("expected difference (held/alert)" if allowed else f"US$ {ap} != {ws} / {div:g}")))
     sa = profile["target"]["server_address"]
     origins = (have.get("passkey.origins") or "").split(",")
     rows.append(("derived", "passkey.origins", sa in origins, None if sa in origins else f"{origins}"))
@@ -1766,8 +1999,34 @@ def yaml_images(path):
     return out
 
 
+PRICE_TABLE_DETAILS = [
+    "rc.44 bills tool calls from a built-in price table (setting/operation_setting/tools.go) and the content-safety "
+    "violation fee from a built-in default (setting/model_setting/grok.go); a new New API image may change them",
+    "before WOOW or Apporo runs it: check its source with tests/apporo_sync/rc44_price_tables.py, add its table to "
+    "newapi_content.TOOL_PRICE_SEEDS and SEED_IMAGES (and re-check the other rc.44 rules, NEWAPI_VERSION); the daily "
+    "sync then recomputes Apporo's tool prices (WOOW's effective prices / 30: decreases written, increases held for "
+    "a notice)",
+    "until then the sync stops at its version check; do not upgrade Apporo to the new image first: tools it adds "
+    "would be billed at WOOW's price, about 30x the rule",
+]
+
+
+def seed_image_alerts(repo):
+    """The New API image pinned in this checkout (chart/values.yaml) vs the images whose built-in
+    price tables the tool knows (newapi_content.SEED_IMAGES)."""
+    chart = os.path.join(repo, "chart", "values.yaml")
+    if not os.path.exists(chart):
+        return []
+    pins = yaml_images(chart)
+    tag, digest = pins.get("newapi.image.tag"), pins.get("newapi.image.digest")
+    if digest and nc.SEED_IMAGES.get(tag) == digest:
+        return []
+    return [{"severity": "action", "title": f"images: chart/values.yaml pins New API {tag} ({(digest or '-')[:19]}...), "
+             "not an image whose built-in prices this tool knows", "details": list(PRICE_TABLE_DETAILS)}]
+
+
 def image_alerts(repo, kube=None, live=False, profile=None):
-    out = []
+    out = seed_image_alerts(repo)
     woow, app = os.path.join(repo, "deploy", "woow-k3s.yaml"), os.path.join(repo, "deploy", "apporo-k3s.yaml")
     if not os.path.exists(app):
         out.append({"severity": "info", "title": "images: deploy/apporo-k3s.yaml is not in this checkout",
@@ -1804,7 +2063,81 @@ def image_alerts(repo, kube=None, live=False, profile=None):
                 if w[k] != p[k]:
                     out.append({"severity": "action", "title": f"images (live): {k} differs",
                                 "details": [f"WOOW {w[k]}", f"Apporo {p[k]}"]})
+            known = set(nc.SEED_IMAGES.values())
+            for side, got in (("WOOW", w), ("Apporo", p)):
+                for k, image in sorted(got.items()):
+                    if NEWAPI_IMAGE_RE.search(image or "") and (image or "").rpartition("@")[2] not in known:
+                        out.append({"severity": "action", "title": f"images (live): {side} {k} runs {image}, not an "
+                                    "image whose built-in prices this tool knows", "details": list(PRICE_TABLE_DETAILS)})
     return out
+
+
+NEWAPI_IMAGE_RE = re.compile(r"(^|/)calciumion/new-api[:@]")
+
+
+PARITY_SCRIPT = os.path.join("scripts", "apporo_parity.py")
+PARITY_TIMEOUT = 300
+PARITY_STATUS_RE = re.compile(r"^(DIFFERS|ERROR|WARN|FAILED)\b")
+
+
+def parity_lines(text):
+    """The status lines of apporo_parity.py and its "values that differ" block (not the render diff)."""
+    out, in_block = [], False
+    for ln in text.splitlines():
+        if re.match(r"^\s+values that differ", ln):
+            in_block = True
+            out.append(ln.strip())
+        elif in_block and re.match(r"^\s{10}\S", ln):
+            out.append(ln.strip())
+        else:
+            in_block = False
+            if PARITY_STATUS_RE.match(ln):
+                out.append(ln.rstrip())
+    return [nc.redact(ln)[:300] for ln in out]
+
+
+def values_alerts(repo, run=subprocess.run):
+    """Helm values drift: scripts/apporo_parity.py --strict (offline helm template; it arrives with the
+    Apporo values PR). exit 1 = Apporo's values (or NP copy, or proxy pin) are behind WOOW prod,
+    exit 2 = Apporo's file does not render or the comparison failed: both are action alerts."""
+    path = os.path.join(repo, PARITY_SCRIPT)
+    if not os.path.exists(path):
+        return [{"severity": "info", "title": "values: scripts/apporo_parity.py is not in this checkout",
+                 "details": ["the Helm values comparison with WOOW prod comes with the Apporo values PR; update the "
+                             "checkout to main after it is merged"]}]
+    try:
+        r = run([sys.executable, path, "--strict"], cwd=repo, capture_output=True, timeout=PARITY_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return [{"severity": "action", "title": "values: scripts/apporo_parity.py --strict did not finish",
+                 "details": [f"{e.__class__.__name__} (helm template, timeout {PARITY_TIMEOUT}s)"]}]
+    if r.returncode == 0:
+        return []
+    text = ((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode("utf-8", "replace")
+    lines = parity_lines(text)
+    summary = next((ln for ln in lines if ln.startswith(("FAILED", "ERROR"))), f"exit {r.returncode}")
+    title = {1: "values: Apporo's Helm values are behind WOOW prod (apporo_parity.py --strict exit 1)",
+             2: "values: Apporo's values do not render, or the comparison failed (apporo_parity.py --strict exit 2)"
+             }.get(r.returncode, f"values: apporo_parity.py --strict exit {r.returncode}")
+    return [{"severity": "action", "title": title, "details": [summary] + [ln for ln in lines if ln != summary][:40] + [
+        "bring deploy/apporo-k3s.yaml up to WOOW prod in a PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉); the "
+        "owner merges it, then helm upgrade (scripts/apporo_parity.py --strict says in sync first)"]}]
+
+
+def price_table_alerts(state, version):
+    """The built-in price tables changed since the last run (a New API version the tool now knows):
+    this run recomputed Apporo's tool prices from them."""
+    try:
+        rec = {"version": version, "tool_seed_sha256": nc.sha256_text(nc.go_json(nc.tool_price_seed(version))),
+               "violation_fee": nc.RC44_VIOLATION_FEE}
+    except nc.ContentError:
+        return []
+    old = state.data.get("price_tables")
+    state.data["price_tables"] = rec
+    if old and old != rec:
+        return [{"severity": "action", "title": f"built-in prices changed: New API {old.get('version')} -> {version}",
+                 "details": ["this run recomputed Apporo's tool prices (and the violation fee) from the new built-in "
+                             "tables: see the price items of this run (decreases written, increases held for a notice)"]}]
+    return []
 
 
 # ------------------------------------------------------------- commands
@@ -1825,6 +2158,7 @@ def plan_all(a, profile, bootstrap, keys=None, history=None):
     classify(items, tgt, profile, bootstrap, desired, history)
     if bootstrap:
         items += bootstrap_blockers(desired)
+        items += audio_price_alerts(routed_models({"abilities": nc.expected_abilities(desired["channels"])}))
     return src, tgt, desired, items
 
 
@@ -1900,7 +2234,7 @@ def cmd_plan(a):
     src, tgt, desired, items = plan_all(a, profile, a.bootstrap, keys, hist)
     process_holds(items, state, now, notice_days(profile), persist=False)
     if not a.bootstrap:
-        combined_gate(chosen_items(items), tgt, profile, desired)
+        gate_chosen(items, tgt, profile, desired, hist)
     if a.json:
         print(json.dumps({"items": [public_item(it) for it in items]}, ensure_ascii=False, indent=1, default=str))
     else:
@@ -1954,7 +2288,7 @@ def run_apply(a, profile, bootstrap, out=None):
             if bootstrap else []
         new_holds = process_holds(items, state, now, days, persist=not bootstrap)
         if not bootstrap:
-            combined_gate(chosen_items(items), tgt, profile, desired)
+            gate_chosen(items, tgt, profile, desired, history)
         chosen = chosen_items(items)
         base = simulate(tgt, chosen, profile, desired)
         nid = None if bootstrap else open_notice(state, new_holds, base, profile, now, days,
@@ -1989,7 +2323,12 @@ def run_apply(a, profile, bootstrap, out=None):
         items2 = build_items(src, tgt2, desired, [], profile, keys, bootstrap)
         classify(items2, tgt2, profile, bootstrap, desired, history)
         process_holds(items2, state, now, days, persist=False)
-        leftover = chosen_items(items2)
+        if not bootstrap:
+            gate_chosen(items2, tgt2, profile, desired, history)
+        # Only what this run meant to write: the new state can turn a held or gated item into an
+        # automatic one (a model listed in this run now counts as offered); the next run judges it.
+        attempted = {it["subject"] for it in chosen}
+        leftover = [it for it in chosen_items(items2) if it["subject"] in attempted]
         for it in leftover:
             print(f"LEFT {it['subject']}: still differs after apply", file=out)
         record_offered(state, tgt, now, hdays)
@@ -2001,7 +2340,8 @@ def run_apply(a, profile, bootstrap, out=None):
                    left=[it["subject"] for it in leftover][:50], notice=nid)
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
         state.save()
-        return {"ok": run["ok"], "items": items, "run": run, "state": state, "tgt": tgt2, "alerts": alerts}
+        return {"ok": run["ok"], "items": items, "run": run, "state": state, "tgt": tgt2, "alerts": alerts,
+                "version": src.get("version")}
     except BaseException as e:
         run.update(ok=False, error=e.__class__.__name__)
         state.data["runs"] = (state.data.get("runs") or [])[-50:] + [run]
@@ -2090,11 +2430,12 @@ def _daily(a):
     profile = load(a)
     now = now_utc()
     extra = image_alerts(REPO, kubectl_argv(a), a.live_images, profile)
+    extra += values_alerts(REPO)
     extra += pat_expiry_alerts(a, profile, now)
     if a.apply:
         res = run_apply(a, profile, bootstrap=False)
         items, run, state, ok = res["items"], res["run"], res["state"], res["ok"]
-        extra += res["alerts"]
+        extra += res["alerts"] + price_table_alerts(state, res["version"])
         fail = apply_failure_alert(run)
         if fail:
             extra.append(fail)
@@ -2102,10 +2443,10 @@ def _daily(a):
         state = State(a.state_dir)
         days, hdays = notice_days(profile), history_days(profile)
         history = offered_history(state, now, hdays)
-        _, tgt, desired, items = plan_all(a, profile, False, None, history)
-        extra += history_alerts(state, tgt, desired)
+        src, tgt, desired, items = plan_all(a, profile, False, None, history)
+        extra += history_alerts(state, tgt, desired) + price_table_alerts(state, src.get("version"))
         new = process_holds(items, state, now, days, persist=True)
-        combined_gate(chosen_items(items), tgt, profile, desired)
+        gate_chosen(items, tgt, profile, desired, history)
         base = simulate(tgt, chosen_items(items), profile, desired)
         nid = open_notice(state, new, base, profile, now, days,
                           merge_offered(routed_models(tgt), routed_models(base), history))

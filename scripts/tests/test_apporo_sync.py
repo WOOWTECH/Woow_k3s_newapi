@@ -13,6 +13,7 @@ import base64
 import contextlib
 import copy
 import datetime
+import decimal
 import hashlib
 import http.client
 import io
@@ -59,6 +60,7 @@ def read_text(path):
 
 
 PILOT = load_json(PROFILE)["platform"]["paid_pilot_models"]
+REAL_VALUES_ALERTS = aps.values_alerts
 
 DEFAULTS = {
     "ModelRatio": {"gpt-4": 15, "tiny-model": 0.0000015, "openrouter/free": 0},
@@ -335,6 +337,12 @@ class FakeNewAPI:
                 self.db.put_pricing(key, value)
             except ValueError as e:
                 return {"success": False, "message": str(e)}
+        elif key == nc.TOOL_PRICE_KEY:
+            # rc.44 ValidateToolPricesJSON: one object of finite numbers >= 0; then stored as sent
+            prices, ignored = nc.tool_price_overrides(value)
+            if ignored or not value.strip().startswith("{"):
+                return {"success": False, "message": "Tool prices must be a JSON object of non-negative numbers"}
+            self.db.options[key] = value
         elif key == "ServerAddress":
             self.db.set_server_address(value)
         else:
@@ -399,6 +407,9 @@ class Harness(unittest.TestCase):
         aps.PSQL_FACTORY = lambda side, profile: FakePsql(self.src if side == "source" else self.tgt)
         aps.SECRET_READER = lambda ns, name, key: SECRETS.get((ns, name, key))
         aps.ANNOTATION_READER = lambda ns, name, annotation: None
+        # the Helm values check (scripts/apporo_parity.py + helm) has its own tests: keep daily runs hermetic
+        aps.values_alerts = lambda repo, run=None: []
+        self.addCleanup(setattr, aps, "values_alerts", REAL_VALUES_ALERTS)
         self.addCleanup(setattr, aps, "PSQL_FACTORY", None)
         self.addCleanup(setattr, aps, "SECRET_READER", None)
         self.addCleanup(setattr, aps, "ANNOTATION_READER", None)
@@ -476,14 +487,50 @@ class GoJSONTest(unittest.TestCase):
 
 class SQLGuardTest(unittest.TestCase):
     def test_generated_sql_is_read_only_and_never_reads_channel_keys_or_customer_tables(self):
-        for sql in (nc.sql_option_keys(), nc.sql_content(["ModelRatio", "it's"], False),
-                    nc.sql_content(["ModelRatio"], True)):
+        for sql in (nc.sql_option_keys(), nc.sql_content(["ModelRatio", "tool_price_setting.prices"], False),
+                    nc.sql_content(["ModelRatio"], True), nc.sql_content([], False)):
             self.assertTrue(sql.startswith("SET default_transaction_read_only = on;\n"))
             nc.check_read_only_sql(sql)
             for table in nc.FORBIDDEN_TABLES:
                 self.assertNotRegex(sql.lower(), r"\b(from|join)\s+" + table + r"\b")
         self.assertNotIn("'key', key", nc.sql_content(["x"], True))
         self.assertNotIn("key", [api for api, _ in nc.CHANNEL_COLUMNS])
+
+    def test_the_templates_are_the_reviewed_ones(self):
+        templates = nc.sql_templates()
+        self.assertEqual(sorted(templates), sorted(nc.SQL_TEMPLATE_SHA256))
+        for name, (head, tail) in templates.items():
+            self.assertEqual(nc.template_sha256(head, tail), nc.SQL_TEMPLATE_SHA256[name], name)
+            text = head + ("" if tail is None else "'K'" + tail)
+            self.assertTrue(text.startswith(nc.READ_ONLY_PREAMBLE), name)
+            body = text[len(nc.READ_ONLY_PREAMBLE):]
+            self.assertEqual(body.count(";"), 1, name)
+            self.assertTrue(body.endswith(")::text;"), name)
+            tables = re.findall(r"\bFROM\s+(\w+)", body)
+            self.assertLessEqual(set(tables), {"options", "channels", "abilities", "setups", "channels_id_seq"}, name)
+            # `key` of channels: never as a value; only inside sha256(...) / length(...) on the target query
+            chan = body.split("'channels', (SELECT", 1)[1].split("FROM channels)", 1)[0] if "FROM channels" in body else ""
+            self.assertEqual("FROM channels" in body, name != "option-keys")
+            outside = chan.replace("sha256(convert_to(key, 'UTF8'))", "").replace("length(key)", "")
+            self.assertNotRegex(outside, r"\bkey\b", name)
+            if name == "content":
+                self.assertNotRegex(chan, r"\bkey\b", "the source query never touches channels.key")
+
+    def test_a_changed_template_refuses_every_read(self):
+        orig = nc.CHANNEL_COLUMNS
+        self.addCleanup(setattr, nc, "CHANNEL_COLUMNS", orig)
+        nc.CHANNEL_COLUMNS = orig + (("key", "key"),)
+        with self.assertRaises(nc.ContentError) as cm:
+            nc.sql_content(["ModelRatio"], False)
+        self.assertIn("template changed", str(cm.exception))
+        with self.assertRaises(nc.ContentError):
+            nc.check_read_only_sql(nc._option_keys_text())
+
+    def test_key_names_that_need_quoting_are_never_sent(self):
+        self.assertEqual(nc.sql_literal("it's"), "'it''s'")
+        for keys in (["it's"], ["a b"], [""], ["x" * 129], ["a\\b"], ["ModelRatio", "x'y"]):
+            with self.assertRaises(nc.ContentError, msg=keys):
+                nc.sql_content(keys, False)
 
     def test_guard_refuses_writes_key_reads_and_customer_tables(self):
         pre = nc.READ_ONLY_PREAMBLE
@@ -1240,15 +1287,49 @@ class SQLGuardBypassTest(unittest.TestCase):
         "SELECT id FROM channels AS c;", "SELECT count(id) FROM channels;", 'SELECT "key" FROM channels;',
         "SELECT 1 FROM options UNION SELECT key FROM channels;", "SELECT lo_import('/x');",
         "SELECT id FROM channels WHERE id IN (SELECT id FROM tokens);",
+        # round 2: options-only `key` fragments reused on channels (each returns or leaks channel keys)
+        'SELECT jsonb_agg(key ORDER BY key COLLATE "C") FROM channels;',
+        "SELECT jsonb_build_object('k', (SELECT jsonb_agg(key ORDER BY key COLLATE \"C\") FROM channels))::text;",
+        'SELECT jsonb_agg(name ORDER BY key COLLATE "C") FROM channels;',
+        "SELECT jsonb_agg(name) FROM channels WHERE key IN ('x');",
+        "SELECT jsonb_agg(length(key)) FROM channels;",
+        "SELECT jsonb_agg(encode(sha256(convert_to(key, 'UTF8')), 'hex')) FROM channels;",
+        "SELECT jsonb_agg(jsonb_build_array(key, value, 'x')) FROM options UNION SELECT jsonb_agg(key) FROM channels;",
+        "SELECT jsonb_agg(name) FROM channels UNION SELECT jsonb_agg(id) FROM users;",
+        "SELECT jsonb_agg(name) FROM channels WHERE id IN (SELECT id FROM users);",
+        "SELECT jsonb_build_object('version', (SELECT version FROM setups ORDER BY id LIMIT 1), "
+        "'keys', (SELECT coalesce(jsonb_agg(key ORDER BY key COLLATE \"C\"), '[]'::jsonb) FROM channels))::text;",
     )
 
     def test_whole_rows_aliases_joins_meta_commands_and_functions_are_refused(self):
         for bad in self.BYPASSES:
             with self.assertRaises(nc.ContentError, msg=bad):
                 nc.check_read_only_sql(nc.READ_ONLY_PREAMBLE + bad)
+            with self.assertRaises(nc.ContentError, msg=bad):
+                nc.check_read_only_sql(bad)
+
+    def test_the_real_queries_cannot_be_bent(self):
+        good = nc.sql_content(["ModelRatio", "RetryTimes"], True)
+        head, tail = nc.sql_templates()["content+key-hashes"]
+        for bad_keys in ("'ModelRatio') UNION SELECT jsonb_agg(key) FROM channels --", "'a'||(SELECT key FROM channels)",
+                         "'a' ,'b'", "'a',", "", "NULL,'a'", "'it''s'", "(SELECT key FROM channels)", "'a';'b'",
+                         "'a'\n", "'x'::text", "'a' OR true"):
+            with self.assertRaises(nc.ContentError, msg=bad_keys):
+                nc.check_read_only_sql(head + bad_keys + tail)
+        for bad in (good + " ", " " + good, good.replace("length(key)", "left(key, 64)"),
+                    good.replace("FROM abilities", "FROM tokens"), good + "\\! id", good[:-1] + " UNION SELECT 1;",
+                    nc.sql_option_keys().replace("FROM options", "FROM channels"),
+                    nc.sql_option_keys() + "SELECT 1;", good.replace(nc.READ_ONLY_PREAMBLE, "")):
+            with self.assertRaises(nc.ContentError, msg=bad[-80:]):
+                nc.check_read_only_sql(bad)
+        self.assertEqual(nc.check_read_only_sql(good), good)
 
     def test_literals_cannot_smuggle_anything(self):
-        for keys in (["it's"], ["a;b"], ["--x"], ["$$"], ["\\\\! id"], ["*"], ["users"]):
+        for keys in (["it's"], ["a;b"], ["$$"], ["\\\\! id"], ["*"], ["users x"], ["a') UNION SELECT key"]):
+            with self.assertRaises(nc.ContentError, msg=keys):
+                nc.sql_content(keys, True)
+        for keys in (["ModelRatio"], ["tool_price_setting.prices", "grok.violation_deduction_amount"],
+                     ["passkey.rp_id", "A-b:c_d.e"], ["--x"], ["users"]):    # quoted: data, never SQL
             nc.check_read_only_sql(nc.sql_content(keys, True))
 
     def test_pinned_sql(self):
@@ -1295,6 +1376,425 @@ class MintPatTest(Harness):
         self.assertIn("was revoked", out)
         self.assertEqual(self.api.pats, {})
         self.assertIn(("DELETE", "/api/user/access_tokens/7", None), self.api.requests)
+
+
+# ------------------------------------------------- review round 3 (PR #45)
+
+APPORO_TOOL_TEXT = nc.go_json({k: v / 30 for k, v in nc.RC44_TOOL_PRICE_SEED.items()})
+
+
+def rc44_surcharge_quota(price, count=1, group_ratio=1, quota_per_unit=500000):
+    """rc.44 service/text_quota.go calculateTextToolCallSurcharge, in decimal."""
+    d = decimal.Decimal
+    return d(repr(float(price))) * d(count) / d(1000) * d(repr(float(group_ratio))) * d(quota_per_unit)
+
+
+class ToolPriceTableTest(unittest.TestCase):
+    """rc.44 tool price rules (setting/operation_setting/tools.go), and Apporo's map = WOOW's / 30."""
+
+    def test_the_seed_is_the_pinned_rc44_table(self):
+        self.assertEqual(nc.sha256_text(nc.go_json(nc.RC44_TOOL_PRICE_SEED)), nc.RC44_TOOL_PRICE_SEED_SHA256)
+        self.assertEqual(len(nc.RC44_TOOL_PRICE_SEED), 27)
+        self.assertEqual(nc.TOOL_PRICE_SEEDS[nc.NEWAPI_VERSION], nc.RC44_TOOL_PRICE_SEED)
+        chart = read_text(os.path.join(REPO, "chart", "values.yaml"))
+        self.assertIn(nc.SEED_IMAGES[nc.NEWAPI_VERSION], chart)
+
+    @unittest.skipUnless(os.environ.get("NEWAPI_RC44_SRC"), "set NEWAPI_RC44_SRC to a v1.0.0-rc.44 checkout")
+    def test_the_tables_match_the_rc44_source(self):
+        sys.path.insert(0, os.path.join(REPO, "tests", "apporo_sync"))
+        import rc44_price_tables
+        self.assertEqual(rc44_price_tables.check(os.environ["NEWAPI_RC44_SRC"])[3], [])
+
+    def test_operator_prices_load_like_rc44(self):
+        self.assertEqual(nc.tool_price_overrides(None), ({}, []))
+        self.assertEqual(nc.tool_price_overrides("[1]")[0], {})
+        self.assertEqual(nc.tool_price_overrides("not json")[0], {})
+        self.assertEqual(nc.tool_price_overrides('{"a": NaN}')[0], {})       # rc.44: the whole value is invalid
+        prices, ignored = nc.tool_price_overrides(
+            '{"web_search": 12, "neg": -1, "s": "3", "b": true, "o": {}, "big": 1e400, "z": 0, "d": 1, "d": 2}')
+        self.assertEqual(prices, {"web_search": 12.0, "z": 0.0, "d": 2.0})   # duplicate member: the last wins
+        self.assertEqual(ignored, ["b", "big", "neg", "o", "s"])
+
+    def test_lookup_like_rc44(self):
+        idx, clashes = nc.tool_price_index(dict(nc.RC44_TOOL_PRICE_SEED, **{"web_search:openai/gpt*": 7.0}))
+        self.assertEqual(clashes, [])
+        cases = {("web_search_preview", "gpt-4o-mini-search-preview"): (25.0, "web_search_preview:gpt-4o-mini*"),
+                 ("web_search_preview", "gpt-4o"): (25.0, "web_search_preview:gpt-4o*"),
+                 ("web_search_preview", "openai/gpt-4o"): (10.0, "web_search_preview"),
+                 ("web_search_preview", ""): (10.0, "web_search_preview"),
+                 ("google_search", "gemini-2.5-pro"): (0.0, "google_search:gemini-2.5*"),    # a matched 0 is final
+                 ("google_search", "gemini-3"): (14.0, "google_search"),
+                 ("google_search_grounded_prompt", "gemini-3"): (0.0, None),                 # prefixes only
+                 ("web_search", "openai/gpt-6-luna"): (7.0, "web_search:openai/gpt*"),
+                 ("web_search", "grok-4"): (5.0, "web_search:grok*"),
+                 ("no_such_tool", "x"): (0.0, None)}
+        for (tool, model), want in cases.items():
+            self.assertEqual(nc.tool_price(idx, tool, model), want, (tool, model))
+        _, clashes = nc.tool_price_index({"t:abc*": 1.0, "t:abc": 2.0})
+        self.assertEqual(clashes, [["t:abc", "t:abc*"]])
+
+    def test_apporo_map_is_woow_effective_prices_divided(self):
+        text, ignored, clashes = nc.divided_tool_prices(nc.NEWAPI_VERSION, None, 30)
+        self.assertEqual(text, APPORO_TOOL_TEXT)
+        self.assertEqual((ignored, clashes), ([], []))
+        self.assertIn('"web_search":0.3333333333333333', text)
+        self.assertIn('"image_generation":5', text)
+        self.assertIn('"google_search:gemini-2.5*":0', text)
+        over = '{"web_search": 12, "my_function": 3, "bad": -1}'
+        text, ignored, _ = nc.divided_tool_prices(nc.NEWAPI_VERSION, over, 30)
+        self.assertEqual(json.loads(text)["web_search"], 12 / 30)
+        self.assertEqual(json.loads(text)["my_function"], 3 / 30)
+        self.assertNotIn("bad", json.loads(text))
+        self.assertEqual(ignored, ["bad"])
+        with self.assertRaises(nc.ContentError):
+            nc.divided_tool_prices("v1.0.0-rc.45", None, 30)
+
+    def test_every_tool_call_costs_woow_over_30(self):
+        for woow_text in (None, '{"web_search": 12, "web_search:openai/*": 20, "my_function": 3}'):
+            woow, _ = nc.effective_tool_prices(nc.NEWAPI_VERSION, woow_text)
+            text, _, _ = nc.divided_tool_prices(nc.NEWAPI_VERSION, woow_text, 30)
+            app, _ = nc.effective_tool_prices(nc.NEWAPI_VERSION, text)      # Apporo's row loaded by rc.44
+            w_idx, a_idx = nc.tool_price_index(woow)[0], nc.tool_price_index(app)[0]
+            models = nc.tool_probes(w_idx, a_idx) | {"openai/gpt-6-luna", "gpt-4o-search-preview", "grok-4-fast",
+                                                    "gemini-2.0-flash", "x/y-search-preview", "anthropic/claude"}
+            for tool in set(w_idx) | set(a_idx):
+                for m in models:
+                    pw, pa = nc.tool_price(w_idx, tool, m)[0], nc.tool_price(a_idx, tool, m)[0]
+                    self.assertEqual(pa, pw / 30, (tool, m))
+                    qw, qa = rc44_surcharge_quota(pw, 3), rc44_surcharge_quota(pa, 3)
+                    self.assertLess(abs(qa - qw / 30), decimal.Decimal("0.000001"), (tool, m))
+        self.assertEqual(rc44_surcharge_quota(10), 5000)                   # web_search at WOOW: 5000 quota a call
+        self.assertEqual(round(rc44_surcharge_quota(10 / 30)), 167)        # Apporo: 5000 / 30
+
+    def test_formats_like_rc44(self):
+        cases = {0.05 / 30: "0.0016666666666666668", 1e-7: "0.0000001", 1e21: "1000000000000000000000",
+                 0.0: "0", 150.0: "150", 2.5: "2.5", -0.5: "-0.5", 123456789012345678.0: "123456789012345680"}
+        for v, want in cases.items():
+            self.assertEqual(nc.go_format_f(v), want, v)
+        self.assertEqual(nc.go_parse_float("0.05"), (0.05, None))
+        self.assertEqual(nc.go_parse_float("+.5e1"), (5.0, None))
+        self.assertEqual(nc.go_parse_float("1_000"), (None, None))          # rc.44 skips it: the default stays
+        self.assertEqual(nc.go_parse_float("1e400"), (None, None))
+        self.assertEqual(nc.go_parse_float("NaN")[0], None)
+        self.assertTrue(nc.go_parse_float("Inf")[1])
+        self.assertEqual([nc.go_parse_bool(x) for x in ("true", "T", "0", "no")], [True, True, False, None])
+        self.assertEqual(nc.violation_fee({}), (0.05, None))
+        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "false"}), (0.0, None))
+        self.assertEqual(nc.violation_fee({nc.VIOLATION_SWITCH_KEY: "maybe", nc.VIOLATION_FEE_KEY: "0.1"}), (0.1, None))
+        self.assertIsNone(nc.violation_fee({nc.VIOLATION_FEE_KEY: "Inf"})[0])
+
+
+class ProfileBoundsTest(unittest.TestCase):
+    def test_served_history_days_is_at_least_30(self):
+        p = load_json(PROFILE)
+        for bad in (0, 1, 7, 29, "30", 30.5, 3651):
+            p["served_history_days"] = bad
+            with self.assertRaises(nc.ContentError, msg=bad):
+                nc.validate_profile(p)
+        for good in (30, 45, 3650):
+            p["served_history_days"] = good
+            nc.validate_profile(p)
+        self.assertEqual(aps.history_days({"served_history_days": 7}), 30)   # defence in depth
+
+    def test_price_flags(self):
+        p = load_json(PROFILE)
+        self.assertIs(p["divide_tool_prices"], True)
+        self.assertEqual(p["divided_scalar_prices"], [nc.VIOLATION_FEE_KEY])
+        for key, bad in (("divide_tool_prices", "yes"), ("divided_scalar_prices", ["Price"]),
+                         ("divided_scalar_prices", "grok.violation_deduction_amount")):
+            q = load_json(PROFILE)
+            q[key] = bad
+            with self.assertRaises(nc.ContentError, msg=(key, bad)):
+                nc.validate_profile(q)
+
+
+class ToolPriceSyncTest(Harness):
+    """tool_price_setting.prices and the violation fee in replay, apply, holds, notices and verify."""
+
+    def setUp(self):
+        super().setUp()
+        self.src.set_map_entry("ModelRatio", "x/old-model", 0.2)
+        self.src.channels[1]["models"] += ",x/old-model"
+        self.replay()
+
+    def tool_map(self):
+        return json.loads(self.tgt.options.get(nc.TOOL_PRICE_KEY) or "{}")
+
+    def set_woow_tools(self, prices):
+        self.src.options[nc.TOOL_PRICE_KEY] = json.dumps(prices)
+
+    def test_replay_writes_the_divided_tables_byte_exactly(self):
+        self.assertEqual(self.tgt.options[nc.TOOL_PRICE_KEY], APPORO_TOOL_TEXT)
+        self.assertEqual(self.tgt.options[nc.VIOLATION_FEE_KEY], "0.0016666666666666668")
+        self.assertNotIn(nc.TOOL_PRICE_KEY, self.src.options)              # WOOW has no row: the seed applies
+        rc, out = self.run_cli("verify", "--strict", "--check-keys", "-v")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ok   prices every tool call price = WOOW's / 30", out)
+        self.assertIn("ok   prices violation fee = WOOW's / 30", out)
+        put = [r for r in self.api.requests if r[0] == "PUT" and r[2].get("key") == nc.TOOL_PRICE_KEY]
+        self.assertEqual([r[2]["value"] for r in put], [APPORO_TOOL_TEXT])
+
+    def test_a_target_replayed_without_the_row_gets_it_as_decreases(self):
+        del self.tgt.options[nc.TOOL_PRICE_KEY]
+        del self.tgt.options[nc.VIOLATION_FEE_KEY]
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tgt.options[nc.TOOL_PRICE_KEY], APPORO_TOOL_TEXT)
+        self.assertEqual(self.tgt.options[nc.VIOLATION_FEE_KEY], "0.0016666666666666668")
+        self.assertIn("AUTO  tool_price_setting.prices[web_search]: tool price (web_search, per 1,000 calls) decrease",
+                      out)
+        self.assertEqual(self.state_data()["holds"], {})
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+
+    def test_an_increase_is_held_until_the_notice_and_a_decrease_applies_at_once(self):
+        self.set_woow_tools({"web_search": 12, "web_search_preview:gpt-4o*": 20})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search"], 10 / 30)                    # held
+        self.assertEqual(self.tool_map()["web_search_preview:gpt-4o*"], 20 / 30)    # decrease (no model hit): written
+        self.assertIn("HOLD  tool_price_setting.prices[web_search]: tool price (web_search, per 1,000 calls) "
+                      "increase", out)
+        (h,) = self.state_data()["holds"].values()
+        self.assertEqual(h["subject"], ["map", nc.TOOL_PRICE_KEY, "web_search"])
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| tool `web_search` | per 1,000 calls | 10.666667 | 12.8 | +20.0% |", notice)
+        self.assertIn("per 1,000 tool calls", notice)
+        rc, out = self.run_cli("verify")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 1, out)
+        rc, out = self.send_notice(h["notice_id"])
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search"], 12 / 30)
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+        before = len(self.api.requests)
+        self.run_cli("apply")
+        self.assertEqual([r for r in self.api.requests[before:] if r[0] != "DELETE"], [])
+
+    def test_a_raise_only_for_unoffered_names_is_automatic_and_one_for_an_offered_model_is_held(self):
+        self.set_woow_tools({"web_search_preview:gpt-4o*": 40, "web_search:x/old*": 30})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search_preview:gpt-4o*"], 40 / 30)    # no offered model starts so
+        self.assertIn("no offered model's tool price (web_search_preview, per 1,000 calls) changes", out)
+        self.assertNotIn("web_search:x/old*", self.tool_map())                     # x/old-model pays it: held
+        self.assertIn("HOLD  tool_price_setting.prices[web_search:x/old*]", out)
+
+    def test_a_raise_that_reaches_only_a_new_model_is_its_first_price(self):
+        self.src.set_map_entry("ModelRatio", "y/new-model", 0.3)
+        self.src.channels[1]["models"] += ",y/new-model"
+        self.set_woow_tools({"web_search:y/*": 40})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search:y/*"], 40 / 30)
+        self.assertIn("first listing of the models it raises", out)
+
+    def test_a_raise_for_a_model_taken_off_is_kept(self):
+        ch1 = self.src.channels[1]
+        ch1["models"] = ch1["models"].replace(",x/old-model", "")
+        self.set_woow_tools({"web_search:x/old*": 30})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("web_search:x/old*", self.tool_map())
+        self.assertIn("ALERT [info] KEPT tool_price_setting.prices[web_search:x/old*]", out)
+
+    def test_changes_that_raise_a_paid_price_together_are_alert_only(self):
+        # Synced state: x/old-model is governed by "web_search:x/old*" 25, "web_search:x/*" 5 covers x/ else.
+        before = {"web_search:x/old*": 25, "web_search:x/*": 5}
+        self.set_woow_tools(before)
+        self.tgt.options[nc.TOOL_PRICE_KEY] = nc.divided_tool_prices(nc.NEWAPI_VERSION, json.dumps(before), 30)[0]
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertNotIn("tool_price_setting.prices[", out)                         # in sync
+        # One run: x/new-model (governed by "x/*") is listed and "x/*" rises (alone: its first price), and
+        # "x/old*" is removed (alone: x/old-model falls back to 5, a decrease). Together x/old-model would
+        # go 25 -> 40 with no notice.
+        self.src.set_map_entry("ModelRatio", "x/new-model", 0.3)
+        self.src.channels[1]["models"] += ",x/new-model"
+        self.set_woow_tools({"web_search:x/*": 40})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["web_search:x/old*"], 25 / 30)            # nothing of it written
+        self.assertEqual(self.tool_map()["web_search:x/*"], 5 / 30)
+        self.assertIn("together this run's tool price changes would raise a price without a notice "
+                      "(web_search for x/old-model", out)
+        self.assertIn("x/new-model", self.tgt.channels[1]["models"])                # the route itself is fine
+
+    def test_the_violation_fee_follows_woow_over_30(self):
+        self.src.options[nc.VIOLATION_FEE_KEY] = "0.02"                              # decrease
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.tgt.options[nc.VIOLATION_FEE_KEY], nc.go_format_f(0.02 / 30))
+        self.src.options[nc.VIOLATION_FEE_KEY] = "0.1"                               # increase: held
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.tgt.options[nc.VIOLATION_FEE_KEY], nc.go_format_f(0.02 / 30))
+        self.assertIn("HOLD  option grok.violation_deduction_amount: content-safety violation fee increase", out)
+        (h,) = [h for h in self.state_data()["holds"].values() if h["state"] == "pending-notice"]
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| content-safety violation fee | per flagged request | 0.021333 | 0.106667 | +400.0% |", notice)
+        self.src.options[nc.VIOLATION_FEE_KEY] = "0.02"                              # WOOW reverts: cancelled
+        self.src.options[nc.VIOLATION_SWITCH_KEY] = "false"                          # switched off: a decrease
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.tgt.options[nc.VIOLATION_SWITCH_KEY], "false")
+        self.src.options[nc.VIOLATION_SWITCH_KEY] = "true"                           # back on: an increase, held
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(self.tgt.options[nc.VIOLATION_SWITCH_KEY], "false")
+        self.assertIn("HOLD  option grok.violation_deduction_enabled", out)
+
+    def test_a_fixed_audio_price_model_is_an_alert(self):
+        self.src.set_map_entry("ModelRatio", "gemini-2.5-flash-lite", 0.05)
+        self.src.channels[1]["models"] += ",gemini-2.5-flash-lite"
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ALERT fixed-audio-price: model gemini-2.5-flash-lite", out)
+
+
+class PriceTableImageTest(unittest.TestCase):
+    def tmp_repo(self, chart_text):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        os.makedirs(os.path.join(tmp, "chart"))
+        with open(os.path.join(tmp, "chart", "values.yaml"), "w") as f:
+            f.write(chart_text)
+        return tmp
+
+    def test_the_pinned_new_api_image_is_the_known_one(self):
+        self.assertEqual(aps.seed_image_alerts(REPO), [])
+        chart = read_text(os.path.join(REPO, "chart", "values.yaml"))
+        tmp = self.tmp_repo(chart.replace("tag: v1.0.0-rc.44", "tag: v1.0.0-rc.45"))
+        (al,) = aps.seed_image_alerts(tmp)
+        self.assertEqual(al["severity"], "action")
+        self.assertIn("v1.0.0-rc.45", al["title"])
+        self.assertIn("rc44_price_tables.py", " ".join(al["details"]))
+        tmp = self.tmp_repo(chart.replace(nc.SEED_IMAGES[nc.NEWAPI_VERSION], "sha256:" + "2" * 64))
+        self.assertEqual(len(aps.seed_image_alerts(tmp)), 1)
+
+    def test_a_running_image_without_known_tables_is_an_alert(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        fake = os.path.join(tmp, "kubectl.py")
+        known = "docker.io/calciumion/new-api:v1.0.0-rc.44@" + nc.SEED_IMAGES[nc.NEWAPI_VERSION]
+        newer = "docker.io/calciumion/new-api:v1.0.0-rc.45@sha256:" + "3" * 64
+        with open(fake, "w") as f:
+            f.write("import json, sys\nns = sys.argv[sys.argv.index('-n') + 1]\n"
+                    f"img = {newer!r} if ns == 'new-api' else {known!r}\n"
+                    "print(json.dumps({'items': [{'kind': 'Deployment', 'metadata': {'name': 'newapi-master'}, "
+                    "'spec': {'template': {'spec': {'containers': [{'name': 'new-api', 'image': img}]}}}}]}))\n")
+        profile = nc.load_profile(PROFILE)
+        alerts = aps.image_alerts(tmp, [sys.executable, fake], True, profile)
+        titles = [al["title"] for al in alerts]
+        self.assertIn("images (live): Deployment/newapi-master/new-api differs", titles)
+        self.assertTrue(any(t.startswith("images (live): WOOW Deployment/newapi-master/new-api runs " + newer)
+                            for t in titles), titles)
+        self.assertFalse(any(t.startswith("images (live): Apporo") for t in titles), titles)
+
+    def test_a_changed_table_is_announced_once(self):
+        state = types_ns(data={})
+        self.assertEqual(aps.price_table_alerts(state, nc.NEWAPI_VERSION), [])
+        self.assertEqual(aps.price_table_alerts(state, nc.NEWAPI_VERSION), [])
+        self.addCleanup(nc.TOOL_PRICE_SEEDS.pop, "v1.0.0-rc.99", None)
+        nc.TOOL_PRICE_SEEDS["v1.0.0-rc.99"] = dict(nc.RC44_TOOL_PRICE_SEED, web_search=12.0)
+        (al,) = aps.price_table_alerts(state, "v1.0.0-rc.99")
+        self.assertIn("v1.0.0-rc.44 -> v1.0.0-rc.99", al["title"])
+        self.assertEqual(aps.price_table_alerts(state, "v1.0.0-rc.99"), [])
+
+
+def types_ns(**kw):
+    class NS:
+        pass
+    ns = NS()
+    ns.__dict__.update(kw)
+    return ns
+
+
+PARITY_STUB = """import os, sys
+code = int(os.environ.get("PARITY_STUB_EXIT", "0"))
+if os.environ.get("PARITY_STUB_SLEEP"):
+    import time; time.sleep(float(os.environ["PARITY_STUB_SLEEP"]))
+assert sys.argv[1:] == ["--strict"], sys.argv
+print("Apporo follows WOOW prod: deploy/apporo-k3s.yaml vs deploy/woow-k3s.yaml + documented differences (strict)")
+print("ok      values, proxy switched on")
+if code == 1:
+    print("DIFFERS values, proxy as committed (enabled: false): the renders differ in 4 line(s)")
+    print("        values that differ (WOOW prod + documented differences | Apporo):")
+    print("          newapi.resources.limits.memory: \\"2Gi\\" | \\"1Gi\\"")
+    print("        render diff (proxy as committed (enabled: false)), first 60 lines:")
+    print("          --- WOOW prod + documented differences")
+    print("          -          memory: 2Gi")
+    print("FAILED  Apporo differs from WOOW prod + the documented differences (newapi.resources.limits.memory)")
+if code == 2:
+    print("ERROR   deploy/apporo-k3s.yaml does not render in new-api-apporo with proxy as committed: boom")
+sys.exit(code)
+"""
+
+
+class ValuesDriftTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo)
+        os.makedirs(os.path.join(self.repo, "scripts"))
+        self.env = dict(os.environ)
+        self.addCleanup(os.environ.update, self.env)    # cleanups run last-first: clear, then restore
+        self.addCleanup(os.environ.clear)
+
+    def stub(self):
+        with open(os.path.join(self.repo, "scripts", "apporo_parity.py"), "w") as f:
+            f.write(PARITY_STUB)
+
+    def test_no_parity_tool_yet_is_info(self):
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertEqual(al["severity"], "info")
+        self.assertIn("apporo_parity.py is not in this checkout", al["title"])
+
+    def test_in_sync_is_quiet_and_drift_or_errors_are_action_alerts(self):
+        self.stub()
+        os.environ["PARITY_STUB_EXIT"] = "0"
+        self.assertEqual(REAL_VALUES_ALERTS(self.repo), [])
+        os.environ["PARITY_STUB_EXIT"] = "1"
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertEqual(al["severity"], "action")
+        self.assertIn("behind WOOW prod (apporo_parity.py --strict exit 1)", al["title"])
+        self.assertTrue(al["details"][0].startswith("FAILED  Apporo differs"))
+        self.assertIn('newapi.resources.limits.memory: "2Gi" | "1Gi"', al["details"])
+        self.assertFalse(any("memory: 2Gi" == d.strip("- ") for d in al["details"]), "no render diff lines")
+        os.environ["PARITY_STUB_EXIT"] = "2"
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertIn("do not render", al["title"])
+        self.assertIn("boom", al["details"][0])
+
+    def test_a_hanging_check_is_an_alert(self):
+        self.stub()
+        os.environ["PARITY_STUB_SLEEP"] = "5"
+        self.addCleanup(setattr, aps, "PARITY_TIMEOUT", aps.PARITY_TIMEOUT)
+        aps.PARITY_TIMEOUT = 1
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertIn("did not finish", al["title"])
+
+
+class DailyValuesTest(Harness):
+    def test_the_daily_run_reports_values_drift(self):
+        aps.values_alerts = REAL_VALUES_ALERTS
+        self.replay()
+        repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, repo)
+        os.makedirs(os.path.join(repo, "scripts"))
+        with open(os.path.join(repo, "scripts", "apporo_parity.py"), "w") as f:
+            f.write(PARITY_STUB)
+        self.addCleanup(setattr, aps, "REPO", aps.REPO)
+        aps.REPO = repo
+        old = os.environ.get("PARITY_STUB_EXIT")
+        os.environ["PARITY_STUB_EXIT"] = "1"
+        self.addCleanup(lambda: os.environ.pop("PARITY_STUB_EXIT") if old is None else
+                        os.environ.__setitem__("PARITY_STUB_EXIT", old))
+        rc, out = self.run_cli("daily")
+        self.assertEqual(rc, 0, out)
+        (al,) = [al for al in self.alerts() if al["title"].startswith("values:")]
+        self.assertEqual(al["severity"], "action")
+        rc, out = self.run_cli("daily")
+        als = [al for al in self.alerts() if al["title"].startswith("values:")]
+        self.assertEqual([al["new"] for al in als], [True, False])               # e-mail only the first time
 
 
 class TemplateTest(unittest.TestCase):

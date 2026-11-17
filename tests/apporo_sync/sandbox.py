@@ -13,6 +13,7 @@ by the tool's own read-only export. Run the phases in order:
   python3 tests/apporo_sync/sandbox.py seed-source   # replay it 1:1 (mirror profile) + fingerprints
   python3 tests/apporo_sync/sandbox.py replay-target # Apporo profile replay, verify, idempotency
   python3 tests/apporo_sync/sandbox.py quota         # WOOW charge / 30 through a mock upstream
+  python3 tests/apporo_sync/sandbox.py tool-quota    # tool call charges / 30; a WOOW tool price held, then applied
   python3 tests/apporo_sync/sandbox.py daily         # classification, holds, notice, maturity, write order
   python3 tests/apporo_sync/sandbox.py rbac          # daily as the deploy/apporo-sync/rbac.yaml identity
   python3 tests/apporo_sync/sandbox.py mint-revoke   # a failed Secret write revokes the new PAT
@@ -114,7 +115,8 @@ def profiles():
     apporo["source"]["namespace"], apporo["target"]["namespace"] = SRC, TGT
     mirror = json.loads(json.dumps(real))
     mirror["target"] = dict(real["target"], namespace=SRC, server_address="https://newapi-sandbox-source.invalid")
-    mirror.update(price_divisor=1, divided_maps=[], target_options={})
+    mirror.update(price_divisor=1, divided_maps=[], target_options={}, divide_tool_prices=False,
+                  divided_scalar_prices=[])
     mirror.pop("group_labels")
     mirror.pop("platform")
     mirror["channels"] = {"1": {"key_slot": "api"}, "2": {"key_slot": "internal"}, "3": {"key_slot": "paid"},
@@ -310,6 +312,111 @@ def phase_quota():
     tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap", "--force", "--why",
          "sandbox quota test: channel 1 back to LiteLLM")
     tool("--profile", p["apporo"], "verify", "--strict", "--check-keys")
+
+
+# Chat models whose names end in "search-preview": rc.44 bills one web_search_preview call per
+# request (service/text_quota.go). The second name hits the built-in "web_search_preview:gpt-4o*" key.
+TOOL_MODELS = {"sbx/tool-search-preview": 0.5, "gpt-4o-search-preview": 1.25}
+
+
+def tool_charges():
+    """{namespace: {model: (quota, tool_surcharges)}} for one chat request per model on both sides."""
+    out = {}
+    for ns in (SRC, TGT):
+        out[ns] = {}
+        with aps.PortForward(KUBECTL, ns) as base:
+            c = root_client(ns, base)
+            try:
+                tok = make_token(c)
+            finally:
+                c.close()
+            for m in sorted(TOOL_MODELS):
+                ans = chat(base, tok, m)
+                assert ans.get("choices"), ans
+                time.sleep(2)
+                log = last_log(ns)
+                other = json.loads(log["other"] or "{}")
+                out[ns][m] = (log["quota"], other.get("tool_surcharges"))
+    return out
+
+
+def check_tool_charges(label, charges, want_target_price, held=()):
+    """Apporo's logged tool price must be the wanted one; its charge WOOW's / 30 within rounding
+    (except for a model whose tool price increase is held: it still pays the old price)."""
+    ok = True
+    for m in sorted(TOOL_MODELS):
+        (qs, ts), (qt, tt) = charges[SRC][m], charges[TGT][m]
+        ps, pt = ts[0]["price"], tt[0]["price"]
+        good = (len(ts) == len(tt) == 1 and ts[0]["name"] == tt[0]["name"] == "web_search_preview"
+                and pt == want_target_price(m, ps) and (m in held or abs(qt - qs / 30) <= 1))
+        ok &= good
+        print(f"{'PASS' if good else 'FAIL'} {label} {m}: WOOW quota {qs} (tool {ps} per 1K calls), Apporo quota "
+              f"{qt} (tool {pt}); WOOW / 30 = {qs / 30:.4f}")
+    return ok
+
+
+def notice_matured(state_dir, nid):
+    """The owner sent the notice 10 days ago, effective 2 days ago (only the test edits created_at)."""
+    with open(os.path.join(state_dir, "holds.json")) as f:
+        st = json.load(f)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    st["notices"][nid]["created_at"] = (now - datetime.timedelta(days=11)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(os.path.join(state_dir, "holds.json"), "w") as f:
+        json.dump(st, f)
+    tool("notice-sent", nid, "--effective", (now - datetime.timedelta(days=2)).date().isoformat(),
+         "--at", (now - datetime.timedelta(days=10)).isoformat(), "--backdated")
+
+
+def phase_tool_quota():
+    """Tool call surcharges on real rc.44: Apporo's charge = WOOW's / 30 (tool_price_setting.prices written
+    by the replay); then a WOOW override: the increase held until its notice, the decrease written at once."""
+    p = profiles()
+    prof = json.load(open(p["mirror"]))
+    snap = nc.read_snapshot(nc.Psql(KUBECTL, SRC), prof)
+    with aps.PortForward(KUBECTL, SRC) as base:
+        c = root_client(SRC, base)
+        try:
+            for m, ratio in TOOL_MODELS.items():
+                put_map_entry(c, snap, "ModelRatio", m, ratio)
+            models = snap["channels"][1]["models"].split(",") + sorted(TOOL_MODELS)
+            api_call(c, "PUT", "/api/channel/", {"id": 1, "models": ",".join(models), "base_url": "http://mock-llm:4000"})
+        finally:
+            c.close()
+    tool("--profile", p["apporo"], "--auth", "password", "replay", "--yes-bootstrap", "--force", "--why",
+         "sandbox tool quota test: two search-preview models on channel 1, channel 1 at the mock upstream")
+    tool("--profile", p["apporo"], "verify", "--strict", "-v")
+    tgt = nc.read_snapshot(nc.Psql(KUBECTL, TGT), json.load(open(p["apporo"])))
+    print(f"{'PASS' if tgt['options'][nc.TOOL_PRICE_KEY] == nc.divided_tool_prices(nc.NEWAPI_VERSION, None, 30)[0] else 'FAIL'}"
+          " Apporo's tool_price_setting.prices = rc.44's built-in table / 30, byte for byte")
+    time.sleep(65)  # rc.44 refreshes channel and option caches once a minute (SYNC_FREQUENCY)
+    ok = check_tool_charges("built-in prices", tool_charges(), lambda m, ps: ps / 30)
+    with aps.PortForward(KUBECTL, SRC) as base:
+        c = root_client(SRC, base)
+        try:
+            api_call(c, "PUT", "/api/option/", {"key": nc.TOOL_PRICE_KEY, "value": json.dumps(
+                {"web_search_preview": 12, "web_search_preview:gpt-4o*": 20})})
+        finally:
+            c.close()
+    rc, text = tool("--profile", p["apporo"], "--auth", "password", "daily", "--apply")
+    held = "HOLD  tool_price_setting.prices[web_search_preview]: tool price (web_search_preview" in text
+    auto = "AUTO  tool_price_setting.prices[web_search_preview:gpt-4o*]: tool price (web_search_preview" in text
+    print(f"{'PASS' if held and auto else 'FAIL'} WOOW override: the increase held, the decrease written")
+    time.sleep(65)
+    ok &= check_tool_charges("while held", tool_charges(),
+                             lambda m, ps: 10 / 30 if m.startswith("sbx/") else ps / 30, held={"sbx/tool-search-preview"})
+    with open(os.path.join(STATE, "holds.json")) as f:
+        st = json.load(f)
+    (h,) = [h for h in st["holds"].values() if h["state"] == "pending-notice"]
+    with open(st["notices"][h["notice_id"]]["draft"]) as f:
+        draft = f.read()
+    print([ln for ln in draft.splitlines() if ln.startswith("| tool")])
+    notice_matured(STATE, h["notice_id"])
+    tool("--profile", p["apporo"], "--auth", "password", "apply")
+    rc, text = tool("--profile", p["apporo"], "verify", "--strict", "-v", check=False)
+    print(f"{'PASS' if rc == 0 else 'FAIL'} verify --strict after the notice matured")
+    time.sleep(65)
+    ok &= check_tool_charges("after the notice", tool_charges(), lambda m, ps: ps / 30)
+    print("tool-quota:", "ALL PASS" if ok else "FAILED")
 
 
 def put_map_entry(c, snap, key, entry, value):
