@@ -34,6 +34,18 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 import apporo_sync as aps  # noqa: E402
 import newapi_content as nc  # noqa: E402
 
+# Owner decision 2026-11-17: Apporo never fails a WOOW pull request. Once the Apporo
+# values PR (#44) is in, CI runs every scripts/tests/test_apporo_*.py in its own
+# "Apporo checks" step (scripts/apporo_checks.py sets APPORO_CHECKS=1: strict for a
+# change to an Apporo file, warn-only otherwise), and this module skips itself
+# anywhere else, like #44's modules. Without scripts/apporo_checks.py in the tree it
+# runs in "Admin tool unit tests" as before. Locally after #44:
+#   APPORO_CHECKS=1 python3 -m unittest discover -s scripts/tests -p 'test_apporo_sync.py'
+if os.environ.get("APPORO_CHECKS") != "1" and os.path.exists(os.path.join(REPO, "scripts", "apporo_checks.py")):
+    raise unittest.SkipTest("Apporo checks run in their own CI step (scripts/apporo_checks.py, APPORO_CHECKS=1); "
+                            "locally: APPORO_CHECKS=1 python3 -m unittest discover -s scripts/tests "
+                            "-p 'test_apporo_sync.py'")
+
 PROFILE = os.path.join(REPO, "deploy", "apporo-sync", "profile.json")
 PAT = "nap_" + "S" * 43
 SESSION = "session-token-" + "x" * 20
@@ -855,16 +867,43 @@ class PlatformCheckTest(unittest.TestCase):
         self.assertEqual(self.verdict(), "pricing_groups")
 
 
+# Synthetic values files (WOOW's own files are never an input of these tests: a
+# WOOW change must not fail them).
+SYNTHETIC_WOOW_VALUES = """publicUrl: https://newapi.example.invalid
+proxy:
+  enabled: true
+  replicas: 2
+  image:
+    tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb  # the commit
+    digest: sha256:""" + "a" * 64 + """
+  patsSecret: newapi-proxy-pats
+"""
+SYNTHETIC_CHART_VALUES = f"""newapi:
+  image:
+    repository: docker.io/calciumion/new-api
+    tag: {nc.NEWAPI_VERSION}
+    # a comment
+    digest: {nc.SEED_IMAGES[nc.NEWAPI_VERSION]}
+postgres:
+  image:
+    repository: docker.io/library/postgres
+    tag: 16.15-alpine3.24
+    digest: sha256:{"7" * 64}
+"""
+
+
 class ImagesTest(unittest.TestCase):
     def test_yaml_image_pins_and_difference(self):
-        pins = aps.yaml_images(os.path.join(REPO, "deploy", "woow-k3s.yaml"))
-        self.assertRegex(pins["proxy.image.digest"], r"^sha256:[0-9a-f]{64}$")
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
         os.makedirs(os.path.join(tmp, "deploy"))
-        shutil.copy(os.path.join(REPO, "deploy", "woow-k3s.yaml"), os.path.join(tmp, "deploy", "woow-k3s.yaml"))
+        with open(os.path.join(tmp, "deploy", "woow-k3s.yaml"), "w") as f:
+            f.write(SYNTHETIC_WOOW_VALUES)
+        pins = aps.yaml_images(os.path.join(tmp, "deploy", "woow-k3s.yaml"))
+        self.assertEqual(pins, {"proxy.image.tag": "3947d2b08d0813a2fae9f120e8fa67990f86c4cb",
+                                "proxy.image.digest": "sha256:" + "a" * 64})
         self.assertEqual(aps.image_alerts(tmp)[0]["severity"], "info")    # no apporo file yet
-        text = read_text(os.path.join(REPO, "deploy", "woow-k3s.yaml"))
+        text = SYNTHETIC_WOOW_VALUES
         with open(os.path.join(tmp, "deploy", "apporo-k3s.yaml"), "w") as f:
             f.write(text)
         self.assertEqual(aps.image_alerts(tmp), [])
@@ -1396,8 +1435,8 @@ class ToolPriceTableTest(unittest.TestCase):
         self.assertEqual(nc.sha256_text(nc.go_json(nc.RC44_TOOL_PRICE_SEED)), nc.RC44_TOOL_PRICE_SEED_SHA256)
         self.assertEqual(len(nc.RC44_TOOL_PRICE_SEED), 27)
         self.assertEqual(nc.TOOL_PRICE_SEEDS[nc.NEWAPI_VERSION], nc.RC44_TOOL_PRICE_SEED)
-        chart = read_text(os.path.join(REPO, "chart", "values.yaml"))
-        self.assertIn(nc.SEED_IMAGES[nc.NEWAPI_VERSION], chart)
+        self.assertRegex(nc.SEED_IMAGES[nc.NEWAPI_VERSION], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(set(nc.SEED_IMAGES), set(nc.TOOL_PRICE_SEEDS))
 
     @unittest.skipUnless(os.environ.get("NEWAPI_RC44_SRC"), "set NEWAPI_RC44_SRC to a v1.0.0-rc.44 checkout")
     def test_the_tables_match_the_rc44_source(self):
@@ -1661,8 +1700,8 @@ class PriceTableImageTest(unittest.TestCase):
         return tmp
 
     def test_the_pinned_new_api_image_is_the_known_one(self):
-        self.assertEqual(aps.seed_image_alerts(REPO), [])
-        chart = read_text(os.path.join(REPO, "chart", "values.yaml"))
+        chart = SYNTHETIC_CHART_VALUES
+        self.assertEqual(aps.seed_image_alerts(self.tmp_repo(chart)), [])
         tmp = self.tmp_repo(chart.replace("tag: v1.0.0-rc.44", "tag: v1.0.0-rc.45"))
         (al,) = aps.seed_image_alerts(tmp)
         self.assertEqual(al["severity"], "action")
