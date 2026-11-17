@@ -282,9 +282,9 @@ scripts/apporo_checks.py --only render,values     # 只跑其中幾項
 ## 跟著 WOOW 改
 
 - **values、chart、映像**：WOOW 的 PR **不必**同時改 Apporo 的檔案，也**不會**因為 Apporo 變紅（負責人 2026-11-17 決定）。CI 的「Apporo checks」只印警告（〈CI 與檢查〉），連共用 chart 的改動讓 Apporo 的檔案 render 不出來、Apporo 的 pin 落後時 WOOW 升 new-api 映像，也都只警告。
-  - **目前沒有東西會自動把 values 拉回來。** 每天的同步工具（`scripts/apporo_sync.py`，PR #45，尚未合併）會跑 `scripts/apporo_parity.py --strict`，Apporo 落後時寄告警，但不會自動開 PR；它也不跑 Apporo 自己的檢查（`apporo_checks.py` 的 `render`、`values`）。所以 values 落後看得到的地方是：WOOW 那個 PR 的 CI 警告、#45 合併後的每日告警、下一個 Apporo PR 的紅燈、安裝或 `helm upgrade` 前跑的 `scripts/apporo_checks.py --strict`。
-  - 看到警告，就另開 Apporo 的 PR 跟上：改 `deploy/apporo-k3s.yaml`；chart 的改動讓 Apporo 的檢查本身要調整時，也改 `scripts/tests/test_apporo_values.py`。這個 PR 是嚴格檢查，全部過了才合併，負責人合併後才 `helm upgrade`。
-  - 在每天的同步改跑（或加跑）`scripts/apporo_checks.py --strict` 之前（已請 PR #45 那邊；exit 1／2 就告警，之後再自動開 PR）：每次 Apporo 安裝或 `helm upgrade` 前自己跑一次，要全部通過。
+  - **目前沒有東西會自動把 values 拉回來。** 每天的同步工具（`scripts/apporo_sync.py`，PR #45，尚未合併）會跑 `scripts/apporo_checks.py --strict`，有檢查沒過就寄告警，但不會自動開 PR。所以 values 落後看得到的地方是：WOOW 那個 PR 的 CI 警告、#45 合併後的每日告警、下一個 Apporo PR 的紅燈、安裝或 `helm upgrade` 前跑的 `scripts/apporo_checks.py --strict`。
+  - 看到警告或告警，就另開 Apporo 的 PR 跟上：改 `deploy/apporo-k3s.yaml`；chart 的改動讓 Apporo 的檢查本身要調整時，也改 `scripts/tests/test_apporo_values.py`。這個 PR 是嚴格檢查，全部過了才合併，負責人合併後才 `helm upgrade`。
+  - #45 合併之前沒有每日告警：每次 Apporo 安裝或 `helm upgrade` 前自己跑一次 `scripts/apporo_checks.py --strict`，要全部通過。
   - proxy 映像：WOOW 正式站先升，Apporo 另開 PR 跟上（負責人合併後再 `helm upgrade`）。Apporo 不能用 WOOW 正式站沒用過的 pin（測試會擋）。Apporo 的 pin 落後時 WOOW 升 new-api 映像，只會警告；Apporo 的 PR 把 pin 跟上 WOOW 正式站就好，那個組合 WOOW 自己的 gate 已經驗過。
   - 〈AI 條款寫的事〉的值：WOOW 改了只會警告，Apporo 不自動跟，要先改條款。
   - 每套自己的證據（〈和 WOOW 正式站的差異〉）：同步打開的功能要附 Apporo 自己的證據，不抄 WOOW 的。
