@@ -1688,16 +1688,23 @@ class ToolPriceSyncTest(Harness):
         self.assertNotIn("web_search:x/old*", self.tool_map())
         self.assertIn("ALERT [info] KEPT tool_price_setting.prices[web_search:x/old*]", out)
 
-    def test_changes_that_raise_a_paid_price_together_are_alert_only(self):
-        # Synced state: x/old-model is governed by "web_search:x/old*" 25, "web_search:x/*" 5 covers x/ else.
-        before = {"web_search:x/old*": 25, "web_search:x/*": 5}
-        self.set_woow_tools(before)
-        self.tgt.options[nc.TOOL_PRICE_KEY] = nc.divided_tool_prices(nc.NEWAPI_VERSION, json.dumps(before), 30)[0]
+    def synced(self, prices):
+        """WOOW and Apporo both on these tool prices (Apporo's = WOOW's / 30), nothing to write."""
+        self.set_woow_tools(prices)
+        self.tgt.options[nc.TOOL_PRICE_KEY] = nc.divided_tool_prices(nc.NEWAPI_VERSION, json.dumps(prices), 30)[0]
         rc, out = self.run_cli("daily", "--apply")
         self.assertNotIn("tool_price_setting.prices[", out)                         # in sync
+
+    def apporo_price(self, tool, model):
+        idx = nc.tool_price_index(nc.effective_tool_prices(RC44, self.tgt.options[nc.TOOL_PRICE_KEY])[0])[0]
+        return nc.tool_price(idx, tool, model)[0]
+
+    def test_changes_that_raise_a_paid_price_together_are_held_together(self):
+        # Synced state: x/old-model is governed by "web_search:x/old*" 25, "web_search:x/*" 5 covers x/ else.
+        self.synced({"web_search:x/old*": 25, "web_search:x/*": 5})
         # One run: x/new-model (governed by "x/*") is listed and "x/*" rises (alone: its first price), and
-        # "x/old*" is removed (alone: x/old-model falls back to 5, a decrease). Together x/old-model would
-        # go 25 -> 40 with no notice.
+        # "x/old*" is removed (alone: x/old-model falls back to 5, a decrease). Together x/old-model goes
+        # 25 -> 40: the two entries are one change, held for one notice.
         self.src.set_map_entry("ModelRatio", "x/new-model", 0.3)
         self.src.channels[1]["models"] += ",x/new-model"
         self.set_woow_tools({"web_search:x/*": 40})
@@ -1705,9 +1712,97 @@ class ToolPriceSyncTest(Harness):
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.tool_map()["web_search:x/old*"], 25 / 30)            # nothing of it written
         self.assertEqual(self.tool_map()["web_search:x/*"], 5 / 30)
-        self.assertIn("together this run's tool price changes would raise a price without a notice "
-                      "(web_search for x/old-model", out)
+        for entry in ("web_search:x/*", "web_search:x/old*"):
+            self.assertIn(f"HOLD  tool_price_setting.prices[{entry}]: tool price (web_search, per 1,000 calls) "
+                          "increase (offered models such as x/old-model) (with web_search:x/*, web_search:x/old*, "
+                          "judged together)", out)
         self.assertIn("x/new-model", self.tgt.channels[1]["models"])                # the route itself is fine
+        holds = [h for h in self.state_data()["holds"].values() if h["state"] == "pending-notice"]
+        self.assertEqual(sorted(h["subject"][2] for h in holds), ["web_search:x/*", "web_search:x/old*"])
+        (nid,) = {h["notice_id"] for h in holds}
+        notice = read_text(self.state_data()["notices"][nid]["draft"])
+        self.assertIn("| tool `web_search` (models starting with `x/`) | per 1,000 calls | 5.333333 | 42.666667 | "
+                      "+700.0% |", notice)
+        self.assertIn("| tool `web_search` (models starting with `x/old`) | per 1,000 calls | 26.666667 | 42.666667 "
+                      "| +60.0% |", notice)
+        rc, out = self.send_notice(nid)
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.apporo_price("web_search", "x/old-model"), 40 / 30)  # as the notice said
+        self.assertNotIn("web_search:x/old*", self.tool_map())
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+
+    def test_a_removal_that_is_a_decrease_together_is_written(self):
+        # WOOW: x/* 20 -> 5 and drops x/old* (10): x/old-model goes 10 -> 5 at WOOW, a decrease. Alone,
+        # the removal would hand x/old-model to x/* at today's 20 (an increase); judged together it is not.
+        self.synced({"web_search:x/*": 20, "web_search:x/old*": 10})
+        self.set_woow_tools({"web_search:x/*": 5})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.apporo_price("web_search", "x/old-model"), 5 / 30)
+        self.assertNotIn("web_search:x/old*", self.tool_map())
+        self.assertIn("AUTO  tool_price_setting.prices[web_search:x/old*]: tool price (web_search, per 1,000 calls) "
+                      "decrease", out)
+        self.assertEqual(self.state_data()["holds"], {})
+        self.assertNotIn("price-increase notice", out)
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+
+    def test_an_unrelated_decrease_is_written_while_another_tool_waits(self):
+        self.synced({"web_search:x/old*": 25, "web_search:x/*": 5})
+        self.src.set_map_entry("ModelRatio", "x/new-model", 0.3)
+        self.src.channels[1]["models"] += ",x/new-model"
+        self.set_woow_tools({"web_search:x/*": 40, "file_search": 1})               # + file_search 2.5 -> 1
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.tool_map()["file_search"], 1 / 30)                   # round 9: at once
+        self.assertIn("AUTO  tool_price_setting.prices[file_search]: tool price (file_search, per 1,000 calls) "
+                      "decrease", out)
+        self.assertIn("HOLD  tool_price_setting.prices[web_search:x/*]", out)
+        self.assertEqual(self.tool_map()["web_search:x/*"], 5 / 30)
+
+    def test_a_held_removal_applies_once_its_notice_matured(self):
+        # WOOW drops its lower override for x/old (5): x/old-model goes back to the default 10, an increase.
+        self.synced({"web_search:x/old*": 5})
+        self.set_woow_tools({})
+        rc, out = self.run_cli("daily", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("HOLD  tool_price_setting.prices[web_search:x/old*]", out)
+        (h,) = [h for h in self.state_data()["holds"].values() if h["state"] == "pending-notice"]
+        notice = read_text(self.state_data()["notices"][h["notice_id"]]["draft"])
+        self.assertIn("| tool `web_search` (models starting with `x/old`) | per 1,000 calls | 5.333333 | 10.666667 | "
+                      "+100.0% |", notice)
+        rc, out = self.send_notice(h["notice_id"])
+        self.assertEqual(rc, 0, out)
+        rc, out = self.run_cli("apply")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("not applied", out)
+        self.assertNotIn("web_search:x/old*", self.tool_map())                     # applied as announced
+        self.assertEqual(self.apporo_price("web_search", "x/old-model"), 10 / 30)
+        rc, out = self.run_cli("verify", "--strict")
+        self.assertEqual(rc, 0, out)
+
+    def test_the_gate_holds_back_only_the_tool_whose_writes_would_exceed_the_notice(self):
+        cur = nc.go_json({"web_search:x/old*": 25 / 30, "web_search:x/*": 5 / 30, "file_search": 2.5 / 30})
+        tgt = {"options": {nc.TOOL_PRICE_KEY: cur}, "running_version": RC44,
+               "abilities": [{"group": "default", "model": "x/old-model", "channel_id": 1, "enabled": True,
+                              "priority": 0, "weight": 0, "tag": None}]}
+
+        def entry(name, old, new, cls, apply=False):
+            it = aps.item("map", cls, "r", key=nc.TOOL_PRICE_KEY, entry=name, old=old, new=new)
+            it["apply"] = apply
+            return it
+        removal = entry("web_search:x/old*", 25 / 30, None, "auto")                 # alone: 25 -> 5, a decrease
+        matured = entry("web_search:x/*", 5 / 30, 40 / 30, "hold", apply=True)     # its notice: x/ 5 -> 40
+        other = entry("file_search", 2.5 / 30, 1 / 30, "auto")
+        aps.tool_price_gate([removal, matured, other], tgt, {})
+        self.assertEqual(removal["class"], "alert")                               # together: x/old-model 25 -> 40
+        self.assertIn("together this run's web_search prices would raise a price without a notice (web_search for "
+                      "x/old-model", removal["reason"])
+        self.assertTrue(matured["apply"])                                          # what its notice said
+        self.assertEqual(other["class"], "auto")                                   # another tool: not held back
 
     def test_the_violation_fee_follows_woow_over_30(self):
         self.src.options[nc.VIOLATION_FEE_KEY] = "0.02"                              # decrease

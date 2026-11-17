@@ -59,9 +59,11 @@ last served_history_days days.
          (severity info, "kept") increases or price removals of a model that
          is taken off now or was recently: kept until the window ends, so a
          re-listing cannot skip the notice.
-Tool prices and the violation fee follow the same rules, judged by the price
-of every offered model (rc.44's lookup); the tool price entries a run writes
-must also not raise a paid price together. daily also runs
+Tool prices follow the same rules, judged one tool at a time (its entries
+interact through rc.44's longest-prefix lookup) by the price every offered
+model pays before and after all of them; the violation fee by every offered
+model. What a run writes to the tool price table must not raise a paid price
+beyond what a matured notice announced. daily also runs
 scripts/apporo_checks.py --strict (or scripts/apporo_parity.py --strict in an
 older checkout: Helm values drift) and checks that the New API image is one
 whose built-in price tables this tool knows.
@@ -825,10 +827,11 @@ def classify(items, tgt, profile, bootstrap=False, desired=None, history=None):
     for name in ("before", "after", "hist"):
         ctx["groups_" + name] = {g for gs in ctx[name].values() for g in gs}
     for it in items:
-        if it["kind"] == "map":
+        if it["kind"] == "map" and it["key"] != nc.TOOL_PRICE_KEY:
             classify_map(it, ctx)
         elif it["kind"] == "opt" and it["key"] in PRICE_OPTIONS:
             classify_price_option(it, ctx)
+    classify_tool_prices([it for it in items if it["kind"] == "map" and it["key"] == nc.TOOL_PRICE_KEY], ctx)
     tool_price_gate(items, tgt, history)
     expression_gate(items, tgt, profile, desired)
     platform_gate(items, tgt, profile, desired)
@@ -937,25 +940,81 @@ def tool_index(seed, operator):
     return nc.tool_price_index(merged)[0]
 
 
-def classify_tool_price(it, ctx):
-    """One entry of tool_price_setting.prices: its effect on every offered model's price of that tool."""
-    cur, seed = tool_state(ctx["target"])
+def _tool_of(entry):
+    return entry.partition(":")[0]
+
+
+def _with_entries(cur, chosen):
+    """An operator tool price map with these entries written (new None: removed)."""
     alt = dict(cur)
-    if it["new"] is None:
-        alt.pop(it["entry"], None)
-    else:
-        alt[it["entry"]] = it["new"]
-    tool = it["entry"].partition(":")[0]
-    old_idx, new_idx = tool_index(seed, cur), tool_index(seed, alt)
-    old_models, after = offered_sets(ctx)
-    ups, downs = set(), set()
-    for m in old_models | after:
-        p0, p1 = nc.tool_price(old_idx, tool, m)[0], nc.tool_price(new_idx, tool, m)[0]
-        if p1 > p0:
-            ups.add(m)
-        elif p1 < p0:
-            downs.add(m)
-    price_outcome(it, ctx, ups, downs, f"tool price ({tool}, per 1,000 calls)")
+    for it in chosen:
+        if it["new"] is None:
+            alt.pop(it["entry"], None)
+        else:
+            alt[it["entry"]] = it["new"]
+    return alt
+
+
+def _by_tool(tool_items):
+    out = {}
+    for it in tool_items:
+        out.setdefault(_tool_of(it["entry"]), []).append(it)
+    return sorted(out.items())
+
+
+def classify_tool_prices(tool_items, ctx):
+    """tool_price_setting.prices, one tool at a time. rc.44 prices a call with the longest key prefix
+    the model name starts with, else the tool's default: the entries of one tool interact (removing a
+    longer key hands its models to a shorter one), so they are judged together, by the price every
+    offered model (now, after this run, or in the last served_history_days days) pays before and after.
+      - The entries that, written together, raise no price a customer paid (a model offered now or
+        recently) are automatic: decreases, unchanged prices, first listings. Entries are taken out
+        of that set while some paid price still rises: those that set the risen price, or that
+        governed the model before (a removed or changed key).
+      - The rest are judged together on top of them: held for a notice when a model still offered
+        after this run pays more, kept (info) while only models taken off would.
+    Decreases of other tools, and of this tool's other prefixes, are written at once (round 9)."""
+    if not tool_items:
+        return
+    cur, seed = tool_state(ctx["target"])
+    paid, after = offered_sets(ctx)
+    models = sorted(paid | after, key=str.encode)
+    base = tool_index(seed, cur)
+    for tool, its in _by_tool(tool_items):
+        what = f"tool price ({tool}, per 1,000 calls)"
+        p0 = {m: nc.tool_price(base, tool, m) for m in models}
+
+        def prices(chosen):
+            idx = tool_index(seed, _with_entries(cur, chosen))
+            return {m: nc.tool_price(idx, tool, m) for m in models}
+        write = list(its)
+        while True:
+            pw = prices(write)
+            raised = [m for m in sorted(paid, key=str.encode) if pw[m][0] > p0[m][0]]
+            if not raised:
+                break
+            keys = {k for m in raised for k in (p0[m][1], pw[m][1]) if k is not None}
+            left = [it for it in write if it["entry"] not in keys]
+            if len(left) == len(write):     # cannot happen (a risen price comes from an entry of this run)
+                left = []
+            write = left
+        ups = {m for m in models if pw[m][0] > p0[m][0]}            # first listings only (no paid model)
+        downs = {m for m in models if pw[m][0] < p0[m][0]}
+        for it in write:
+            price_outcome(it, ctx, ups, downs, what)
+        rest = [it for it in its if it not in write]
+        if rest:
+            pf = prices(its)
+            ups = {m for m in models if pf[m][0] > pw[m][0]}
+            downs = {m for m in models if pf[m][0] < pw[m][0]}
+            together = "" if len(rest) == 1 else \
+                f" (with {', '.join(sorted((it['entry'] for it in rest), key=str.encode))}, judged together)"
+            for it in rest:
+                price_outcome(it, ctx, ups, downs, what)
+                if it["class"] == "auto":   # never expected: these entries raised a paid price above
+                    it["class"], it["reason"] = "alert", f"{what}: judged together, a paid price would rise: decide " \
+                                                         "by hand"
+                it["reason"] += together
 
 
 def classify_price_option(it, ctx):
@@ -978,54 +1037,39 @@ def classify_price_option(it, ctx):
 
 
 def tool_price_gate(items, tgt, history):
-    """The tool price entries this run writes, together, must not raise any price that customers
-    paid (a model offered now or recently), except by an increase whose notice has matured. Each
-    entry was judged alone; together they could (a first listing raised for a new model plus the
-    removal of a longer key that governed an old one), so check the combination too."""
+    """What this run writes to the tool price table, one tool at a time, must not raise a price
+    customers paid (a model offered now or recently) beyond what the matured notices announced: for
+    each such model, its price after this run's automatic and matured entries together is at most the
+    larger of today's price and its price after the matured entries alone (what their notice said,
+    including a removed key that hands models to a shorter one). Otherwise that tool's automatic
+    entries are not written this run (alert; the next run judges them again on the new prices); the
+    other tools are not held back."""
     tool_items = [it for it in items if it["kind"] == "map" and it["key"] == nc.TOOL_PRICE_KEY]
     if not tool_items:
         return
     cur, seed = tool_state(tgt)
-    old_models = set(routed_models(tgt)) | set(history or {})
-    old_idx = tool_index(seed, cur)
-
-    def unexplained(chosen):
-        alt = dict(cur)
-        for it in chosen:
-            if it["new"] is None:
-                alt.pop(it["entry"], None)
-            else:
-                alt[it["entry"]] = it["new"]
-        new_idx = tool_index(seed, alt)
-        for tool in sorted(set(old_idx) | set(new_idx)):
-            for m in sorted(old_models, key=str.encode):
-                (p0, _), (p1, k1) = nc.tool_price(old_idx, tool, m), nc.tool_price(new_idx, tool, m)
-                if p1 > p0 and not any(it["class"] == "hold" and it["apply"] and it["entry"] == k1 and it["new"] == p1
-                                       for it in chosen):
-                    return f"{tool} for {m}: {p0} -> {p1}"
-        return None
-
-    autos = [it for it in tool_items if it["class"] == "auto"]
-    matured = [it for it in tool_items if it["class"] == "hold" and it["apply"]]
-    why = unexplained(autos + matured)
-    if why and autos:
-        for it in autos:
-            it["class"], it["apply"] = "alert", False
-            it["reason"] = f"together this run's tool price changes would raise a price without a notice ({why}): " \
-                           "decide by hand"
-        why = unexplained(matured)
-    if why and matured:
-        for it in matured:
-            it["apply"] = False
-            it["reason"] += f"; not applied: together with the other tool prices it would raise more than the " \
-                            f"notice said ({why})"
+    paid = sorted(set(routed_models(tgt)) | set(history or {}), key=str.encode)
+    for tool, its in _by_tool(tool_items):
+        autos = [it for it in its if it["class"] == "auto"]
+        matured = [it for it in its if it["class"] == "hold" and it["apply"]]
+        if not autos:
+            continue                         # matured entries alone: what their notice announced
+        i0, im, i1 = (tool_index(seed, _with_entries(cur, chosen)) for chosen in ([], matured, autos + matured))
+        why = None
+        for m in paid:
+            p0, pm, p1 = (nc.tool_price(i, tool, m)[0] for i in (i0, im, i1))
+            if p1 > max(p0, pm):
+                why = f"{tool} for {m}: {p0} -> {p1}"
+                break
+        if why:
+            for it in autos:
+                it["class"], it["apply"] = "alert", False
+                it["reason"] = f"together this run's {tool} prices would raise a price without a notice ({why}): not " \
+                               "written this run; the next run judges it again"
 
 
 def classify_map(it, ctx):
     key, entry, o, n = it["key"], it["entry"], it["old"], it["new"]
-    if key == nc.TOOL_PRICE_KEY:
-        classify_tool_price(it, ctx)
-        return
     if key in nc.BILLING_MAPS:
         it["class"], it["reason"] = "alert", "billing expressions are real US$ prices (rc.44: no ratio conversion), " \
                                              "so the 30:1 rule cannot be applied to them: decide by hand"
