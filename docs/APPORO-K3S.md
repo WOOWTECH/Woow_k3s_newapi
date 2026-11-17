@@ -283,7 +283,9 @@ scripts/apporo_checks.py --only render,values     # 只跑其中幾項
 
 - `scripts/tests/test_apporo_*.py` 只在 `APPORO_CHECKS=1` 時跑（`values` 檢查會設），在 WOOW 的「Admin tool unit tests」步驟整個 skip。
 - `apporo_parity.py --strict` 單獨跑仍然是嚴格的（落後 exit 1、錯誤 exit 2），但只比 parity；安裝前請跑 `apporo_checks.py --strict`，它也包含 Apporo 自己的值與 render。
-- 不要把這個步驟改成 `continue-on-error`，也不要把 Apporo 的檢查放回 WOOW 的步驟；`scripts/tests/test_apporo_checks.py` 會檢查 CI 只有這一步提到 Apporo。
+- **`ci.yml` 裡這一步的任何改動，都要負責人親自審。** CI 擋不住改弱這一步的 PR：PR 跑的是它自己的 workflow，而 `ci.yml` 算 WOOW 的檔，所以改成 `--warn-only`、加 `|| true`／`continue-on-error`／`if:`、拿掉 `--base-ref`，或把 Apporo 的檢查放回 WOOW 的步驟，那個 PR 都只會印警告。
+  - `scripts/tests/test_apporo_checks.py` 檢查的是：只有這一步提到 Apporo、它是最後一步、沒有其他 key、指令一字不差是 `python3 scripts/apporo_checks.py --base-ref "$base"`。
+  - 這種改動一旦合併，安裝與每次 `helm upgrade` 前的 `scripts/apporo_checks.py --strict`（#45 合併後還有每日同步）會因為這個測試失敗；但在那之前，Apporo 的 PR 在 CI 上都不會再被擋。
 
 ## 跟著 WOOW 改
 

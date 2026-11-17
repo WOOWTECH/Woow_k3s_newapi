@@ -409,8 +409,12 @@ class CommittedFilesTests(unittest.TestCase):
             self.assertRegex(proc.stdout, rf'(?m)^-- {name}: .*\n   (OK|FAIL|SKIP) ')
 
     def test_ci_runs_apporo_only_in_its_own_step(self):
-        # WOOW's steps never look at Apporo; the Apporo step resolves the base
-        # like the contract gate and passes it on.
+        # WOOW's steps run no Apporo check; the Apporo step resolves the base like
+        # the contract gate and passes it on, not weakened. CI cannot hold a PR to
+        # this (the PR's own workflow runs, and ci.yml is a WOOW file, so this only
+        # warns there): the owner reviews every change to this step. Once such a
+        # change is merged, every scripts/apporo_checks.py --strict (before an
+        # Apporo install or helm upgrade, the daily sync) fails here.
         text = '\n'.join(line for line in (ROOT / '.gitea/workflows/ci.yml').read_text().splitlines()
                          if not line.lstrip().startswith('#'))
         steps = re.split(r'(?m)^      - (?=name: |uses: )', text)[1:]
@@ -418,10 +422,18 @@ class CommittedFilesTests(unittest.TestCase):
         self.assertEqual(len(apporo), 1, 'only one CI step may mention Apporo')
         step = apporo[0]
         self.assertTrue(step.startswith('name: Apporo checks'), step)
-        self.assertIn('base="origin/${{ github.base_ref }}"', step)
-        self.assertIn('base="HEAD~1"', step)
-        self.assertIn('python3 scripts/apporo_checks.py --base-ref "$base"', step)
-        self.assertNotIn('continue-on-error', step)
+        self.assertIs(steps[-1], step, 'the Apporo step runs last, after all of WOOW\'s')
+        keys = [m.group(1) for m in re.finditer(r'(?m)^        ([A-Za-z_-]+):', step)]
+        self.assertEqual(keys, ['run'], 'a plain run step: no if:, continue-on-error or other keys')
+        lines = [line.strip() for line in step.splitlines()]
+        self.assertIn('set -euo pipefail', lines)
+        self.assertIn('base="origin/${{ github.base_ref }}"', lines)
+        self.assertIn('base="HEAD~1"', lines)
+        # Exactly this command line: no --warn-only or --strict, no "|| true".
+        self.assertEqual([line for line in lines if 'apporo_checks' in line],
+                         ['python3 scripts/apporo_checks.py --base-ref "$base"'])
+        for weakening in ('continue-on-error', 'set +e', '|| true', '|| :', '--warn-only'):
+            self.assertNotIn(weakening, step)
 
 
 if __name__ == '__main__':
