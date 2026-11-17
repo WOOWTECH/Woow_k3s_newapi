@@ -523,7 +523,7 @@ Job 耗時及鎖等待；retention 期間 `/v1/chat/completions` 正常；新舊
 
   **`networkPolicy.clients` 加進來的客戶端同樣被信任 XFF**，可以任意冒用別人的限流桶與稽核 IP：只能加會自己覆寫 XFF 的代理。PaaS 一律走 `newapi-proxy`，Odoo 與租戶 pod 都不能加進 `clients`。
 - Valkey：只收 new-api（預設使用者，`requirepass`）與 `newapi-proxy`（`proxy.enabled` 時；ACL 使用者 `newapi-proxy`，只能 `SET` `newapi-proxy:replay:*` 與 `PING`，讀不到 new-api 的 session、快取與限流計數）。
-- 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`；namespace `new-api-apporo` 建好之後再加上 Apporo 的 `deploy/litellm-from-newapi-apporo-ingress.yaml`、`deploy/apun-odoo-to-newapi-apporo-egress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。
+- 手動 apply、不在 Helm 裡的物件（`deploy/litellm-from-newapi-ingress.yaml`、`deploy/litellm-from-newapi-stg-ingress.yaml`）：`scripts/check-drift.sh --context woow-k3s` 比對叢集與 git（`kubectl diff`，唯讀）。**PaaS canary 失敗或 type=5 錯誤率升高時，第一步先跑它**（DESIGN §7.4）；漂移就照輸出的指令重新 apply。Apporo 那套的兩個手動物件不在預設清單裡，用 `--apporo` 另外比對（[APPORO-K3S.md](APPORO-K3S.md)〈手動套用的物件〉）。
 - 經 Cloudflare 的請求 100 秒內沒回標頭會 524；長的非串流請求請用串流。
 
 ## 已知限制

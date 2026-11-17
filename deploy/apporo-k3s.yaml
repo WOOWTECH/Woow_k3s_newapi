@@ -1,12 +1,14 @@
 # Apporo production values for woow-k3s (release newapi, namespace new-api-apporo).
 # Serves the Apporo AI PaaS (Odoo 18 at www.apporo.ai, namespace apun); runbook
 # docs/APPORO-K3S.md. A 1:1 copy of deploy/woow-k3s.yaml: the only differences are
-# publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and proxy.ap/opExpiresAt
-# (plus proxy.image while an upgrade is rolling out, which needs its own green stg
-# contract report). scripts/tests/test_apporo_values.py fails on any other change,
-# so a WOOW prod values change is mirrored here in the same PR.
+# publicUrl, newapi.env.DEFAULT_LANGUAGE and proxy.clients; proxy.enabled stays
+# false until Apporo's activation PR (which also sets proxy.ap/opExpiresAt);
+# proxy.image may lag WOOW prod but never lead it; per-instance backup evidence
+# (encryptedBackup capacity/restore verification, ageRecipient) is Apporo's own.
+# scripts/tests/test_apporo_values.py fails on any other change, so a WOOW prod
+# values change is mirrored here in the same PR.
+# Install and upgrade with this file as is (never --set; docs/APPORO-K3S.md 〈安裝〉):
 #   helm upgrade --install newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml --wait
-# The very first install runs before the AP/OP PATs exist: docs/APPORO-K3S.md 〈安裝〉.
 publicUrl: https://newapi.apporo.ai
 
 newapi:
@@ -49,11 +51,16 @@ retention:
 # Same image, tuning and Secret names as WOOW prod; the Secrets themselves are new
 # values created by hand in new-api-apporo (docs/APPORO-K3S.md 〈Secret〉).
 proxy:
-  enabled: true
+  # Dormant: no proxy workloads, NetworkPolicies or Valkey ACL until Apporo's own
+  # activation PR (like WOOW NA-05), after its Secrets, service account and PATs
+  # exist. That PR sets enabled: true together with apExpiresAt/opExpiresAt below
+  # (docs/APPORO-K3S.md 〈打開 proxy〉).
+  enabled: false
   replicas: 2
   image:
     # Keep equal to deploy/woow-k3s.yaml. Bump it only after WOOW prod, in its own
-    # PR (owner decision D7); CI requires a green stg report for this pin.
+    # PR (owner decision D7). The test accepts only a pin deploy/woow-k3s.yaml has
+    # or had, with a green stg report.
     tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb
     digest: sha256:0fdf5e12da8c8fec9d4b1650d2a134d6dc58d1ba86b82d54ea62b8b6fb8ce3bd
   imagePullSecrets:
@@ -62,11 +69,11 @@ proxy:
   hmacSecret: newapi-proxy-hmac
   usernameRegex: '^wp\d{10}$'
   tenantIpRange: 198.18.1.0-198.19.255.255
-  # PLACEHOLDER until the Apporo AP/OP PATs exist (""= unknown: /readyz reports
-  # null days left, so the PaaS cannot warn before they expire). Once created, put
-  # the unix seconds from the woowtech.io/ap-expires-at / op-expires-at annotations
-  # of Secret new-api-apporo/newapi-proxy-pats here in a PR, before apun traffic is
-  # switched on; update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
+  # Expiry of the Apporo AP / OP (unix seconds from the woowtech.io/ap-expires-at /
+  # op-expires-at annotations of Secret new-api-apporo/newapi-proxy-pats; dates are
+  # not secret). Empty only while dormant: the activation PR fills both and the
+  # test requires them once enabled, so /readyz reports days left and the PaaS
+  # warns 14 days ahead. Update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
   apExpiresAt: ""
   opExpiresAt: ""
   clients:

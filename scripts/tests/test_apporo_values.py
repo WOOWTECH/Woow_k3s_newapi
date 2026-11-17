@@ -1,13 +1,26 @@
 """Apporo new-api (deploy/apporo-k3s.yaml) stays a 1:1 copy of WOOW prod.
 
-Offline: helm template only; no cluster, credentials or network. The Apporo
-render must equal the WOOW prod render (deploy/woow-k3s.yaml) with only the
-documented Apporo differences layered on top (docs/APPORO-K3S.md): publicUrl,
-newapi.env.DEFAULT_LANGUAGE, proxy.clients and proxy.ap/opExpiresAt, plus
-proxy.image, which may lag prod during an upgrade (owner decision D7) but needs
-its own green stg contract report. Any other WOOW prod values change has to be
-mirrored into deploy/apporo-k3s.yaml in the same PR, or listed here and in the
-runbook as a new documented difference.
+Offline: helm template only; no cluster, credentials or network. WOOW prod
+renders in new-api and Apporo in new-api-apporo, each against its own
+namespace-bound evidence. The Apporo render must equal the WOOW prod render
+with only the documented Apporo differences layered on top
+(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉):
+
+- publicUrl, newapi.env.DEFAULT_LANGUAGE and proxy.clients;
+- proxy.enabled stays false (dormant) until Apporo's own activation PR, which
+  also sets proxy.apExpiresAt/opExpiresAt to the unix-seconds expiry of
+  Apporo's PATs. While dormant, the proxy settings are still compared with
+  proxy.enabled forced on, so they cannot fall behind WOOW before activation;
+- proxy.image may lag WOOW prod (owner decision D7) but never lead it: it must
+  be a pin deploy/woow-k3s.yaml has or had, with a green stg contract report;
+- per-instance evidence, which is never copied from WOOW:
+  encryptedBackup.capacityVerification and restoreVerification (the chart
+  binds both to the release namespace) and ageRecipient come from
+  deploy/apporo-k3s.yaml: Apporo's own capacity review, restore drill and age
+  key. The rendered recipient is the only output they change.
+
+Any other WOOW prod values change has to be mirrored into deploy/apporo-k3s.yaml
+in the same PR, or listed here and in the runbook as a new documented difference.
 """
 import json
 from pathlib import Path
@@ -16,11 +29,12 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.contract import report
+from tests.contract import gate_check, report
 
 ROOT = Path(__file__).resolve().parents[2]
 APPORO = ROOT / 'deploy/apporo-k3s.yaml'
 PROD = ROOT / 'deploy/woow-k3s.yaml'
+NAMESPACE = {APPORO: 'new-api-apporo', PROD: 'new-api'}
 # The apun Odoo web pod (component application, live) and its cron pod.
 APUN_POD_SELECTOR = {
     'matchLabels': {'app.kubernetes.io/name': 'apun'},
@@ -33,37 +47,58 @@ APUN_CLIENTS = [{
     'podSelector': APUN_POD_SELECTOR,
 }]
 SECRET_KEYS = 'SESSION_SECRET|CRYPTO_SECRET|POSTGRES_PASSWORD|REDIS_PASSWORD|PROXY_VALKEY_PASSWORD'
+EVIDENCE_HINT = ('per-instance evidence (encryptedBackup.capacityVerification, restoreVerification, '
+                 'ageRecipient) must be Apporo\'s own: its own capacity review and restore drill, bound '
+                 'to namespace new-api-apporo; never copy WOOW\'s (docs/APPORO-K3S.md)')
 
 
-def proxy_scalar(text, key):
-    """Top-level ``proxy.<key>`` from simple YAML text ('' when unset)."""
-    section = None
-    for line in text.splitlines():
-        body = line.split('#', 1)[0].rstrip()
-        if not body.strip():
-            continue
-        indent = len(body) - len(body.lstrip())
-        name, _, value = body.strip().partition(':')
-        if indent == 0:
-            section = name
-        elif section == 'proxy' and indent == 2 and name == key:
-            return value.strip().strip('\'"')
-    return ''
-
-
-def render(values, extra=None):
-    args = ['helm', 'template', 'newapi', str(ROOT / 'chart'), '-n', 'new-api-apporo', '-f', str(values)]
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tmp:
-        if extra is not None:
-            json.dump(extra, tmp)
-            tmp.flush()
-            args += ['-f', tmp.name]
-        proc = subprocess.run(args, text=True, capture_output=True)
+def helm(*args):
+    proc = subprocess.run(['helm', *args], text=True, capture_output=True)
     if proc.returncode:
         raise AssertionError(proc.stderr)
+    return proc.stdout
+
+
+def values(path):
+    """The values a file sets, parsed by helm itself (no YAML library in CI)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        chart = Path(tmp)
+        (chart / 'templates').mkdir()
+        (chart / 'Chart.yaml').write_text('apiVersion: v2\nname: values-dump\nversion: 0.0.0\n')
+        (chart / 'templates/values.json').write_text('{{ toJson .Values }}\n')
+        out = helm('template', 'v', str(chart), '-f', str(path))
+    return json.loads(out.split('# Source: values-dump/templates/values.json\n', 1)[1])
+
+
+def render(path, extra):
+    """``helm template`` of ``path`` (plus ``extra``) in the file's own namespace."""
+    namespace = NAMESPACE[path]
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as tmp:
+        json.dump(extra, tmp)
+        tmp.flush()
+        try:
+            out = helm('template', 'newapi', str(ROOT / 'chart'), '-n', namespace, '-f', str(path), '-f', tmp.name)
+        except AssertionError as err:
+            hint = f'\n{EVIDENCE_HINT}' if path == APPORO else ''
+            raise AssertionError(f'{path.relative_to(ROOT)} does not render in {namespace}: {err}{hint}') from None
     # Offline Helm generates random Secret bytes (templates/secret.yaml): keep
     # the key names, drop the values.
-    return re.sub(rf'(?m)^(  (?:{SECRET_KEYS}):).*$', r'\1 <redacted>', proc.stdout)
+    out = re.sub(rf'(?m)^(  (?:{SECRET_KEYS}):).*$', r'\1 <redacted>', out)
+    # Per-instance output: the age recipient and the namespace in PromQL.
+    out = re.sub(r'(?m)^(\s+- name: AGE_RECIPIENT\n\s+value: ).*$', r'\1<per-instance>', out)
+    return out.replace(f'namespace="{namespace}"', 'namespace="<release namespace>"')
+
+
+def prod_pins():
+    """Proxy pins deploy/woow-k3s.yaml has now or had in a commit reachable from HEAD."""
+    pins = [report.image_pin(PROD.read_text(), 'proxy')]
+    log = subprocess.run(['git', 'log', '--format=%H', '--', 'deploy/woow-k3s.yaml'],
+                         cwd=ROOT, text=True, capture_output=True)
+    for sha in log.stdout.split() if log.returncode == 0 else []:
+        old = subprocess.run(['git', 'show', f'{sha}:deploy/woow-k3s.yaml'], cwd=ROOT, text=True, capture_output=True)
+        if old.returncode == 0:
+            pins.append(report.image_pin(old.stdout, 'proxy'))
+    return list({(pin['tag'], pin['digest']): pin for pin in pins if pin['tag'] and pin['digest']}.values())
 
 
 def block(text, start):
@@ -91,22 +126,64 @@ class ApporoValuesTests(unittest.TestCase):
 
     def setUp(self):
         self.text = APPORO.read_text()
+        self.values = values(APPORO)
+        self.proxy = self.values.get('proxy') or {}
 
-    def test_render_is_prod_plus_documented_differences(self):
-        pin = report.image_pin(self.text, 'proxy')
-        documented = {
+    def documented(self, enabled):
+        """The Apporo differences, layered on the WOOW prod values."""
+        image = self.proxy.get('image') or {}
+        return {
             'publicUrl': 'https://newapi.apporo.ai',
             'newapi': {'env': {'DEFAULT_LANGUAGE': 'en'}},
             'proxy': {
+                'enabled': enabled,
                 'clients': APUN_CLIENTS,
-                'apExpiresAt': proxy_scalar(self.text, 'apExpiresAt'),
-                'opExpiresAt': proxy_scalar(self.text, 'opExpiresAt'),
-                'image': {'tag': pin['tag'] or '', 'digest': pin['digest'] or ''},
+                'apExpiresAt': self.proxy.get('apExpiresAt', ''),
+                'opExpiresAt': self.proxy.get('opExpiresAt', ''),
+                'image': {'tag': image.get('tag', ''), 'digest': image.get('digest', '')},
             },
         }
-        self.assertEqual(render(APPORO), render(PROD, documented),
-                         'deploy/apporo-k3s.yaml must equal deploy/woow-k3s.yaml plus the documented '
-                         'Apporo differences (docs/APPORO-K3S.md): mirror the WOOW prod change')
+
+    def test_render_is_prod_plus_documented_differences(self):
+        # As committed, and (while dormant) with the proxy switched on.
+        for enabled in dict.fromkeys([self.proxy.get('enabled'), True]):
+            with self.subTest(proxy_enabled=enabled):
+                self.assertEqual(
+                    render(APPORO, {'proxy': {'enabled': enabled}}), render(PROD, self.documented(enabled)),
+                    'deploy/apporo-k3s.yaml must equal deploy/woow-k3s.yaml plus the documented Apporo '
+                    'differences (docs/APPORO-K3S.md): mirror the WOOW prod change; ' + EVIDENCE_HINT)
+
+    def test_per_instance_evidence_is_not_copied_from_prod(self):
+        prod = values(PROD).get('encryptedBackup') or {}
+        mine = self.values.get('encryptedBackup') or {}
+        for section, key in (('capacityVerification', 'evidenceRef'), ('restoreVerification', 'evidenceRef'),
+                             ('restoreVerification', 'archiveSha256')):
+            theirs = (prod.get(section) or {}).get(key)
+            with self.subTest(field=f'{section}.{key}'):
+                if theirs:
+                    self.assertNotEqual((mine.get(section) or {}).get(key), theirs, EVIDENCE_HINT)
+
+    def test_proxy_switch_is_a_literal_boolean(self):
+        # CI tells dormant from active with gate_check.proxy_enabled (fail-closed).
+        self.assertIsInstance(self.proxy.get('enabled'), bool)
+        self.assertEqual(gate_check.proxy_enabled(self.text), self.proxy['enabled'],
+                         'write proxy.enabled as a literal true/false directly under proxy:')
+
+    def test_pat_expiry_matches_the_proxy_state(self):
+        active = gate_check.proxy_enabled(self.text)
+        want = r'^[0-9]{10}$' if active else r'^(|[0-9]{10})$'
+        for key in ('apExpiresAt', 'opExpiresAt'):
+            value = self.proxy.get(key, '')
+            with self.subTest(key=key):
+                self.assertIsInstance(value, str, f'quote proxy.{key}')
+                self.assertRegex(value, want, 'the activation PR sets proxy.enabled: true together with the '
+                                 'unix-seconds expiry of the Apporo PATs (docs/APPORO-K3S.md 〈打開 proxy〉)')
+
+    def test_proxy_pin_lags_woow_prod_never_leads(self):
+        pin = report.image_pin(self.text, 'proxy')
+        self.assertIn(pin, prod_pins(),
+                      'deploy/apporo-k3s.yaml proxy.image must be a pin deploy/woow-k3s.yaml has or had: '
+                      'Apporo follows WOOW prod and never runs ahead of it (owner decision D7)')
 
     def test_proxy_pin_has_a_green_stg_report(self):
         want = {'newapi': report.image_pin((ROOT / 'chart/values.yaml').read_text(), 'newapi'),
@@ -118,11 +195,6 @@ class ApporoValuesTests(unittest.TestCase):
         self.assertTrue(path.exists(), f'no green stg report tests/contract/reports/{path.name} '
                                        'for the Apporo proxy pin (docs/OPERATIONS.md 〈升版〉)')
         self.assertEqual(report.gate_problems(json.loads(path.read_text()), want), [])
-
-    def test_pat_expiry_is_placeholder_or_unix_seconds(self):
-        for key in ('apExpiresAt', 'opExpiresAt'):
-            with self.subTest(key=key):
-                self.assertRegex(proxy_scalar(self.text, key), r'^(|[0-9]{10})$')
 
     def test_unique_top_level_keys(self):
         keys = re.findall(r'^([A-Za-z][A-Za-z0-9_]*):', self.text, re.M)

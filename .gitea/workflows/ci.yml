@@ -54,11 +54,23 @@ jobs:
             if [ -n "$bad" ]; then echo "unpinned images in $f:"; echo "$bad"; exit 1; fi
           done
 
-      # newapi-proxy must be active with a real pinned image in every environment.
+      # newapi-proxy must be active with a real pinned image in every WOOW
+      # environment. Apporo stays dormant (proxy.enabled: false) until its own
+      # activation PR (docs/APPORO-K3S.md 〈打開 proxy〉); from then on it is
+      # checked like the others. scripts/tests/test_apporo_values.py compares
+      # its proxy settings with WOOW prod in both states.
       - name: newapi-proxy component
         run: |
           set -euo pipefail
-          for f in /tmp/rendered.yaml /tmp/rendered-stg.yaml /tmp/rendered-apporo.yaml; do
+          renders="/tmp/rendered.yaml /tmp/rendered-stg.yaml"
+          if python3 -c 'import sys; from tests.contract import gate_check; sys.exit(not gate_check.proxy_enabled(open("deploy/apporo-k3s.yaml").read()))'; then
+            renders="$renders /tmp/rendered-apporo.yaml"
+          elif grep -q '^  name: newapi-proxy$' /tmp/rendered-apporo.yaml; then
+            echo "::error::deploy/apporo-k3s.yaml is dormant but renders newapi-proxy objects"; exit 1
+          else
+            echo "deploy/apporo-k3s.yaml: newapi-proxy dormant until its activation PR"
+          fi
+          for f in $renders; do
             for kind in ConfigMap Service Deployment PodDisruptionBudget NetworkPolicy; do
               awk -v k="$kind" '$0=="kind: "k{f=1} f&&/^  name: newapi-proxy$/{found=1} /^---/{f=0} END{exit !found}' \
                 "$f" || { echo "$f lacks the newapi-proxy $kind"; exit 1; }
@@ -130,8 +142,9 @@ jobs:
       # newapi.image or a deploy/woow-k3s*.yaml proxy.image must commit the
       # green stg report for exactly those digests
       # (tests/contract/reports/<tag>_<sha>.json; docs/OPERATIONS.md 〈升版〉).
-      # deploy/apporo-k3s.yaml's proxy pin needs the same green report; the
-      # admin tool unit tests check it (scripts/tests/test_apporo_values.py).
+      # deploy/apporo-k3s.yaml's proxy pin needs the same green report and must
+      # be a pin deploy/woow-k3s.yaml has or had (Apporo never leads WOOW prod);
+      # the admin tool unit tests check it (scripts/tests/test_apporo_values.py).
       - name: Contract gate (image bump needs a green stg report)
         run: |
           set -euo pipefail
