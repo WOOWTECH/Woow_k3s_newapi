@@ -23,10 +23,10 @@ What is read (and nothing else):
   Never: users, tokens, user_access_tokens, two_fas, passkeys, sessions,
   logs, quota_data, audit_logs or any other customer or identity table.
 
-The read-only SQL is checked against a whitelist (check_read_only_sql): the
-preamble, one SELECT over options/channels/abilities/setups/channels_id_seq,
-whitelisted functions only, no *, alias, join, quoted or schema-qualified
-table, comment, psql meta-command or variable.
+The read-only SQL is one of the tool's own two queries, byte for byte
+(check_read_only_sql; the templates are pinned by sha256 in
+SQL_TEMPLATE_SHA256): the only variable part is the list of option key names,
+each a literal matching OPTION_KEY_RE. Any other statement is refused.
 
 rc.44 facts this module depends on (docs/APPORO-SYNC.md):
   - The 11 pricing options are stored as Go json.Marshal output

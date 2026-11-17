@@ -6,9 +6,14 @@ the same content as WOOW production (namespace new-api), with these
 differences (deploy/apporo-sync/profile.json, docs/APPORO-SYNC.md):
 
   - ModelRatio and ModelPrice divided by 30 (float64, stored exactly as rc.44
-    stores them); the other ratio maps are copied unchanged. Billing
-    expressions (billing_setting.*) are real US$ prices that the 30:1 rule
-    cannot reach: replay refuses them and the daily sync only alerts;
+    stores them); the other ratio maps are copied unchanged. The absolute
+    US$ prices rc.44 charges besides them are divided too, so that every
+    usage charge is WOOW's / 30: tool calls (tool_price_setting.prices =
+    WOOW's effective price of every key, rc.44's built-in table where WOOW
+    has no override, / 30) and the content-safety violation fee
+    (grok.violation_deduction_amount). Billing expressions (billing_setting.*)
+    are real US$ prices that the 30:1 rule cannot reach: replay refuses them
+    and the daily sync only alerts;
   - channel 2 (WOOW's internal ChatGPT subscription test route) is not copied;
     channels 1, 3, 4 keep their ids; their keys are Apporo's own LiteLLM keys
     from the Secret new-api-apporo/newapi-upstream-keys (never printed);
@@ -54,6 +59,11 @@ last served_history_days days.
          (severity info, "kept") increases or price removals of a model that
          is taken off now or was recently: kept until the window ends, so a
          re-listing cannot skip the notice.
+Tool prices and the violation fee follow the same rules, judged by the price
+of every offered model (rc.44's lookup); the tool price entries a run writes
+must also not raise a paid price together. daily also runs
+scripts/apporo_parity.py --strict (Helm values drift) and checks that the New
+API image is one whose built-in price tables this tool knows.
 
 Writes run in an order that never leaves an offered model without its price:
 options and new or changed prices, then channels, then removed price entries.

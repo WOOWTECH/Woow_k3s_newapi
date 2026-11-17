@@ -2,7 +2,7 @@
 
 把 WOOW 正式站（namespace `new-api`）的 New API 內容複製到 Apporo 那一套（namespace `new-api-apporo`，<https://newapi.apporo.ai>），之後每天跟著 WOOW 改。部署（Helm values）見 [APPORO-K3S.md](APPORO-K3S.md)；這份只講資料庫裡的內容。
 
-- 讀：兩邊都用唯讀 SQL（`kubectl exec ... psql`，第一句 `SET default_transaction_read_only = on`）。SQL 由程式內的白名單守衛檢查（見〈機密與輸出〉）。
+- 讀：兩邊都用唯讀 SQL（`kubectl exec ... psql`，第一句 `SET default_transaction_read_only = on`）。SQL 只能是工具自己的兩種固定查詢，逐字比對（見〈機密與輸出〉）。
 - 寫：只寫 Apporo，用 New API 的管理 API（`kubectl port-forward`），身分是 root。WOOW 那一側永遠不寫，工具也拒絕以 WOOW 的網址或 `new-api`／`new-api-stg` 當目標。
 - Python 3 標準函式庫，沒有其他相依。設定檔：[`deploy/apporo-sync/profile.json`](../deploy/apporo-sync/profile.json)。
 - 只支援 New API `v1.0.0-rc.44`：兩邊版本不是它就停（價目表的儲存格式、渠道 API 的行為都是照 rc.44 驗證的）。
@@ -12,8 +12,10 @@
 | 項目 | Apporo 的值 | 說明 |
 |---|---|---|
 | `ModelRatio`、`ModelPrice` | WOOW 的值 ÷30 | Apporo 的 30:1 規則（1 點＝US$1、價格＝WOOW 台幣價 ÷30）。float64 除法，存成 rc.44 自己存的 Go JSON 位元組，所以驗證是逐 byte 比對。零價模型仍是 0 |
+| `tool_price_setting.prices`（工具呼叫價） | WOOW **有效**工具價的每一個 key ÷30 | 工具呼叫（`web_search`、`file_search`、`image_generation`…）在 rc.44 是每千次的絕對價，不經 `ModelRatio`。WOOW 沒覆寫的 key 用 rc.44 內建表（目前 WOOW 沒有這一列，所以 Apporo＝內建表 ÷30，27 個 key 全部寫出）。存成 rc.44 自己序列化這張表的格式（Go JSON：key 排序、Go 浮點數），逐 byte 比對（見〈30:1 規則〉） |
+| `grok.violation_deduction_amount`（違規扣費） | WOOW 的有效值 ÷30 | 上游錯誤帶內容安全標記時，rc.44 對任何模型加扣這筆美元絕對價（內建 US$0.05，預設開啟）。Apporo 寫 `0.0016666666666666668`（rc.44 匯出這個設定的格式：`strconv` `'f'`）。開關 `grok.violation_deduction_enabled` 照抄，但重新打開算漲價 |
 | `CompletionRatio`、`CacheRatio`、`CreateCacheRatio`、`ImageRatio`、`AudioRatio`、`AudioCompletionRatio` | 照抄 | 都是相對於 `ModelRatio` 的倍數，不用換 |
-| `billing_setting.billing_mode`／`billing_expr`／`plugin_billing_expr` | **不同步** | 計費公式寫的是**真實美元價**（rc.44：不經過任何倍率換算），30:1 規則套不上去。重播時來源不是 `{}` 就拒絕；每日同步只告警（見〈不會被 ÷30 的價格〉） |
+| `billing_setting.billing_mode`／`billing_expr`／`plugin_billing_expr` | **不同步** | 計費公式寫的是**真實美元價**（rc.44：不經過任何倍率換算），30:1 規則套不上去。重播時來源不是 `{}` 就拒絕；每日同步只告警（見〈30:1 規則〉） |
 | `GroupRatio` 與顯示設定（`CUSTOM`／`32`） | 照抄 | 平台與 proxy 的 R＝32、1 點＝15,625 quota 不改 |
 | `UserUsableGroups` | WOOW 的分組，標籤換英文：`default`→`Default`、`free`→`Free trial` | 顧客看得到 |
 | `general_setting.custom_currency_symbol` | `$` | WOOW 沒有這一列（顯示預設 `¤`） |
@@ -27,16 +29,21 @@
 
 不讀也不碰：使用者、token、PAT、2FA、passkey、session、logs、quota、audit 等所有客戶與身分資料表。名稱像機密的設定（`SMTPToken`、`*Secret`、`*Key`……）連值都不讀，除非列在 `secret_like_allowed`；值長得像金鑰的設定讀到就丟掉，只告警。渠道欄位的處理見〈機密與輸出〉。
 
-### 不會被 ÷30 的價格
+### 30:1 規則：每一筆用量扣費都是 WOOW 的 ÷30
 
-30:1 規則只作用在 `ModelRatio`／`ModelPrice`。下面這些是**美元（或供應商幣別）絕對價**，在 Apporo（1 點＝US$1）上會變成約 **30 倍**，所以工具不會自動寫入，或根本碰不到：
+規則的本意是「Apporo 上每一筆用量的扣費＝WOOW 同一筆的扣費 ÷30」。rc.44 每一種扣費來源與 Apporo 的做法：
 
-| 來源 | 內容 | 工具怎麼處理 |
+| 來源 | 性質 | Apporo 怎麼做 |
 |---|---|---|
-| `billing_setting.*`（WOOW 目前三張都是 `{}`） | 每個模型的計費公式，例如 `p * 3 + c * 15`＝每百萬 token US$3／US$15 | 重播拒絕；每日同步只告警，不寫、不暫停 |
-| rc.44 內建公式（`gpt-image-2`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-6-astra`） | 模型**沒有** `ModelRatio`／`ModelPrice` 也沒有 `billing_mode` 時，rc.44 用內建美元公式計價 | 這種模型不會被同步加進渠道（告警）；已在渠道上的每天告警 |
-| rc.44 內建工具價格（不在 options 裡） | 每千次：`web_search` 10、`web_search_preview` 10、`file_search` 2.5、`google_search` 14、`image_generation` 150，以及各家搜尋分級價 | 工具碰不到。**要負責人決定**：在 Apporo 寫 `tool_price_setting.prices` 覆寫成 ÷30 的值並納入同步，或在條款／價格頁說明 |
-| `tool_price_setting.*`、`task_pricing_setting.*` | 管理者覆寫的工具價、任務價 | 只告警 |
+| `ModelRatio`、`ModelPrice` | 每個模型的基本價 | ÷30（上表） |
+| `CompletionRatio`、`CacheRatio`、`CreateCacheRatio`、`ImageRatio`、`AudioRatio`、`AudioCompletionRatio`、`GroupRatio`，以及 `task_pricing_setting.*`（Sora 尺寸、Vertex 4K 的倍數） | 乘在基本價上的**相對倍數** | 照抄：基本價已 ÷30，扣費自然 ÷30。`task_pricing_setting.*` 的變更仍只告警（工具不逐模型判斷方向） |
+| 工具呼叫價 `tool_price_setting.prices` ＋ rc.44 內建表 | **絕對價**（每千次） | ÷30：Apporo 寫出 WOOW 有效表的每一個 key ÷30。rc.44 查價是「最長的 `工具:模型前綴*` → 工具預設 → 0」，兩邊 key 完全相同、值都 ÷30，所以任何工具、任何模型名查到的價都是 WOOW 的 ÷30（`verify` 逐一比對每個工具 × 每個 key 前綴與路由中的模型；沙盒實測見〈已驗證〉13） |
+| 違規扣費 `grok.violation_deduction_amount` | **絕對價**（每筆被標記的請求） | ÷30 |
+| 計費公式 `billing_setting.*`（WOOW 目前三張都是 `{}`）與 rc.44 內建公式模型（`gpt-image-2`、`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`、`gpt-6-astra`，沒有 ratio／price 時） | **絕對價**（公式裡寫的是真實美元） | **不同步**：重播拒絕；每日同步只告警；這種模型不會被同步加進渠道 |
+| Gemini 音訊輸入（rc.44 常數，模型名以 `gemini-2.5-flash`、`gemini-2.0-flash`、`gemini-robotics-er-1.5` 開頭） | **絕對價**（每百萬 token），任何設定都改不了 | 只告警（`fixed-audio-price`）：路由中有這種模型時每天告警，音訊請求約是規則的 30 倍。WOOW 現在的模型名都有供應商前綴（`google/…`），不會觸發 |
+| 付款相關：`Price`、`USDExchangeRate`、Stripe／Waffo 單價、`TopupGroupRatio` | 儲值，不是用量 | Apporo 的 New API 付款功能關閉（點數由平台轉換），照舊只告警或照抄 |
+
+工具價與違規扣費的漲價規則和模型價一樣（見〈每日同步的分類〉）：降價立刻寫入，漲價暫停到通知發出 7 天後。
 
 ## 指令
 
@@ -73,6 +80,16 @@
 | 只告警 | 需要平台或 values 一起改的變更（`GroupRatio` 的 default／free、`GroupGroupRatio`、`UserUsableGroups` 的分組、限流、註冊與贈額、顯示單位與匯率等〈PaaS 依賴的設定不變量〉，免費試用渠道 4 的模型、渠道的群組／上游網址／類型／覆寫參數）、計費公式（`billing_setting.*`）與會用計費公式計價的模型、會讓平台定價檢查失敗的變更、顧客看得到的文字與品牌、需要 Apporo 自己帳號或金鑰的功能（OAuth、SMTP、付款……）、資安開關（JS 任務外掛）、價格降到 0、提供中的模型失去價格、WOOW 新增的渠道、rc.44 的 `PUT /api/channel/` 清不掉的欄位（改成 null 或一般字串改成空字串） | 不寫入，每天告警，等負責人決定 |
 | 只告警（info，`KEPT`） | 這一輪下架、或過去 30 天內提供過但現在沒提供的模型：漲價、拿掉價格 | 先**保留 Apporo 的舊值**：30 天內重新上架時，漲價仍要走通知。期間過了才照抄（變成自動） |
 
+**工具價與違規扣費**（絕對價，不屬於某一個模型）：
+
+- 工具價表**逐個 key** 判斷：用 rc.44 的查價規則，比較這一個 key 改變前後，**每一個提供中的模型**（現在、這一輪之後、過去 30 天）查到的該工具價。
+  - 沒有任何提供中模型的價格改變（例如 `web_search_preview:gpt-4o*`，Apporo 沒有模型名以 `gpt-4o` 開頭）→ 自動；
+  - 只有降價 → 自動；
+  - 讓「現在或過去 30 天提供過、這一輪之後仍提供」的模型變貴 → 暫停＋通知；
+  - 只讓這一輪下架或最近下架的模型變貴 → `KEPT`（保留舊值）；只讓這一輪新上架的模型變貴 → 自動（第一個價格）。
+- **合起來的檢查**：每個 key 是單獨判斷的，但同一輪的幾個 key 合起來可能讓舊模型變貴（例：拿掉較長的 `web_search:x/old*`，同時調高較短的 `web_search:x/*`）。所以寫入前再算一次「這一輪全部要寫的 key 一起套上」：任何提供過的模型的任何工具價變高、又不是已到期通知的那個 key 造成的，這一輪的工具價自動項目全部改成只告警。
+- 違規扣費：扣費＝開關 × 金額，影響所有提供中的模型。金額調高或重新打開 → 暫停；調低或關閉 → 自動。
+
 細節：
 
 - 同一個價目表裡，降價的條目立刻寫入，漲價的條目維持舊值；每個條目分開判斷。
@@ -88,11 +105,11 @@
 2. 渠道（建立、路由增減、金鑰）；
 3. **拿掉**的價格條目。
 
-失敗或寫完後仍有差異時，會發一筆 `action` 告警（列出已寫入的、仍不同的），並印出 `LEFT` 行；下一輪會重試剩下的部分。
+失敗或寫完後仍有差異時，會發一筆 `action` 告警（列出已寫入的、仍不同的），並印出 `LEFT` 行；下一輪會重試剩下的部分。「仍有差異」只算這一輪本來要寫的項目：寫完後狀態變了（例如這一輪上架的模型現在算提供中），原本被暫停或擋下的項目由下一輪重新判斷，不算失敗。
 
 ## 漲價通知流程
 
-1. 同步發現漲價 → 狀態檔記一筆 `pending-notice`，`<state>/notices/N-YYYYMMDD-n.md` 起草英文通知（每個模型的輸入／輸出／快取讀寫，舊價與新價，單位 US$／百萬 token，1 點＝US$1），並告警。舊價是**這一輪自動寫入（例如同一模型的降價）之後**的價格。用計費公式計價、或算不出價格的模型，表格那一列寫「by hand」，要負責人自己填。
+1. 同步發現漲價 → 狀態檔記一筆 `pending-notice`，`<state>/notices/N-YYYYMMDD-n.md` 起草英文通知（每個模型的輸入／輸出／快取讀寫，舊價與新價，單位 US$／百萬 token，1 點＝US$1；工具價是 US$／千次呼叫，例如 `| tool `web_search` | per 1,000 calls | 10.666667 | 12.8 | +20.0% |`；違規扣費是 US$／每筆），並告警。舊價是**這一輪自動寫入（例如同一模型的降價）之後**的價格。用計費公式計價、或算不出價格的模型，表格那一列寫「by hand」，要負責人自己填。
 2. 負責人補上 `{EFFECTIVE_DATE}`、`{SUPPORT_CONTACT}`，用 email 寄給所有有 AI 帳號的顧客（AI 條款第 3 節：至少 7 天前通知）。草稿最後一行寫著「現在寄出時最早可以填的生效日」。
 3. 寄出後執行：`scripts/apporo_sync.py notice-sent N-YYYYMMDD-n --effective 2026-11-27 --at 2026-11-20T10:00:00+08:00`
    - `--effective` 必填，就是信裡寫的生效日；生效日在寄出後不到 7 天就拒絕（並印出最早可用的日期）。
@@ -115,6 +132,15 @@
 | `daily sync failed` | `daily` 途中任何例外：連線、逾時、狀態檔壞掉、SIGTERM（systemd 逾時或停止） |
 | `daily sync unit failed` | systemd `OnFailure=`（工具自己來不及回報，例如被 SIGKILL） |
 
+其他每日告警：
+
+| 標題開頭 | 什麼時候 |
+|---|---|
+| `values: Apporo's Helm values are behind WOOW prod`（exit 1）／`values: Apporo's values do not render …`（exit 2）／`… did not finish` | 見〈Helm values 落後〉 |
+| `images: chart/values.yaml pins New API …`／`images (live): … runs …, not an image whose built-in prices this tool knows` | 見〈映像〉：New API 映像不是工具知道內建價格表的那一版 |
+| `built-in prices changed: New API A -> B` | 工具改支援新版本、內建價格表換了：這一輪已依新表重算 Apporo 的工具價（降價寫入、漲價暫停） |
+| `fixed-audio-price: model …` | 路由中有 rc.44 以固定美元價計音訊輸入的 Gemini 模型名 |
+
 另外：同步 PAT 到期前 14 天是 `action`；Secret 沒有 `woowtech.io/expires-at` 或讀不到是 `info`；狀態目錄沒有提供紀錄（見上）是 `info`。
 
 ## 平台定價檢查
@@ -130,7 +156,7 @@ Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試�
 
 - **渠道欄位**：除了 `key` 以外的欄位都會讀，但讀到時就檢查。`header_override`、`param_override`、`setting`、`settings`、`other`、`model_mapping`… 這類 JSON 欄位，只要成員名稱像憑證（`Authorization`、`Cookie`、`x-api-key`、`*_token`、`*_key`、`CF-Access-*`、`secret`、`password`…；`max_tokens` 這種不算），或值是 `Bearer …` 這類驗證值、32 字以上的十六進位、24 字以上大小寫數字混雜的隨機字串、網址帳密或像金鑰的查詢參數，整個欄位立刻換成 `[redacted]`：這個渠道不複製、不印、不匯出，只告警。
 - **印出的值**：渠道欄位只印 `name`、`models`、`group`、`test_model`、`type`、`status`、`priority`、`weight`、`auto_ban`、`tag`；其他欄位（含 `base_url`、`remark`）在 `plan`、`plan --json`、`verify`、告警裡都只顯示 sha256 前 12 碼與長度。值像金鑰的字串（`sk-` 加 16 字以上、`nap_…`、JWT、PEM）一律遮成 `[redacted]`。
-- **唯讀 SQL**：工具送出的每一句都先過白名單：只能讀 `options`、`channels`、`abilities`、`setups`、`channels_id_seq`；只能用白名單內的函式；不能有 `*`、別名、join、逗號 join、加引號或加 schema 的表名、註解、psql 反斜線指令與變數；欄位 `key` 只能出現在讀 options 與算渠道金鑰指紋的位置。沙盒測試腳本的兩句固定 SQL 以 sha256 釘住。
+- **唯讀 SQL**：工具只送兩種查詢（option 名稱清單、內容），守衛**逐字**比對這兩個樣板，三個樣板文字（內容查詢分來源用與目標用兩種）以 sha256 釘在 `newapi_content.SQL_TEMPLATE_SHA256`。唯一能變的是內容查詢 `WHERE key IN (…)` 裡的 option 名稱常值，每個都必須是 `'[A-Za-z0-9_.:-]{1,128}'`（引號、反斜線、空白都不可能出現）。所以 `key` 只會在樣板讀它的位置出現：options 的 key 欄、以及只在目標端算的 `sha256(convert_to(channels.key))` 前 16 碼與長度。任何其他 SQL（包括把 options 用的 `key` 片段套在 channels 上、巢狀子查詢、`UNION`、多一個空白）一律拒絕。改了樣板（例如 `CHANNEL_COLUMNS`）時，所有讀取都會被拒，直到審過新文字並更新 pin。沙盒測試腳本的兩句固定 SQL 另以 sha256 釘住。
 - `export --out` 用實際路徑比對，拒絕寫進本 repo（main 會鏡像到公開的 GitHub）。
 
 ## Secret（全部在 `new-api-apporo`，只列名稱）
@@ -197,9 +223,30 @@ EOF
 
 Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個 checkout 要跟著 main 更新（映像 pin 比對讀的是 checkout 裡的 values 檔）；`--live-images` 另外比實際跑的映像。
 
+## Helm values 落後（每日檢查）
+
+負責人的決定（第 10 輪）是：Woow_k3s_newapi 的 CI 對 WOOW／Apporo 的一致性只警告，差距由每日同步補。所以 `daily`（report 與 apply 兩種模式都一樣）會在 checkout 裡跑 `scripts/apporo_parity.py --strict`（這支工具隨 Apporo values 的 PR #44 進來；離線 `helm template`，不連叢集、不需要任何憑證）：
+
+| 結果 | 告警 |
+|---|---|
+| exit 0（in sync） | 無 |
+| exit 1：Apporo 的 values、LiteLLM ingress NP 複本或 proxy pin 落後 WOOW 正式站 | `action`「values: Apporo's Helm values are behind WOOW prod」，第一行是工具的 `FAILED` 摘要（列出不同的 key），後面附「values that differ」那幾行（不附 render diff） |
+| exit 2：Apporo 的檔案 render 不出來（含休眠中的 proxy 打開後）或比對失敗 | `action`「values: Apporo's values do not render, or the comparison failed」 |
+| 跑不完（逾時 300 秒、找不到 python） | `action`「values: … did not finish」 |
+| checkout 裡沒有這支工具（PR #44 還沒合併） | `info`，提醒合併後更新 checkout |
+
+同一個落後狀態每天的告警 fingerprint 相同（只有第一次是 `new`，之後 email 管道可以只寄一次）；落後的 key 改變了才是新告警。修正方式不變：開一張 Apporo 自己的 values PR（APPORO-K3S.md〈跟著 WOOW 改〉），負責人合併後 `helm upgrade`；自動開 PR 和映像一樣是之後的工作。排程主機要有 `helm`（cluster1：`/usr/local/bin/helm`，systemd user unit 的預設 PATH 找得到）。
+
 ## 映像
 
 `daily` 也比 `deploy/woow-k3s.yaml` 與 `deploy/apporo-k3s.yaml` 的映像 pin（`--live-images` 再比兩個 namespace 實際跑的映像）。不同就告警「開 PR 把 Apporo 跟上 WOOW 正式站的 pin」。自動開 PR 是之後的工作；PR 由負責人合併，合併後再 `helm upgrade`。
+
+**New API 映像與內建價格表**：工具價的內建表（`tools.go`）與違規扣費的預設（`grok.go`）跟著 New API 版本走。工具記錄它驗證過的映像（`newapi_content.SEED_IMAGES`：rc.44 的 digest）與該版的表（`TOOL_PRICE_SEEDS`）。`daily` 在這兩種情況告警（`action`），並說明要做的事：
+
+- checkout 的 `chart/values.yaml` 釘的 `newapi.image` 不是工具認得的映像（tag 或 digest 不同）；
+- `--live-images`：WOOW 或 Apporo 實際跑的 New API 映像不是工具認得的。
+
+新版本的步驟：用 `tests/apporo_sync/rc44_price_tables.py <新版原始碼>` 讀出新表（只讀文字，不建置），把表與映像 digest 加進 `TOOL_PRICE_SEEDS`／`SEED_IMAGES`（並重新確認其他 rc.44 規則、改 `NEWAPI_VERSION`）。之後每天都依「來源版本的表」重算 Apporo 的工具價：降價寫入、漲價暫停並起草通知；表換掉的那一輪另有一筆「built-in prices changed」告警（狀態檔記著上次用的版本與表的 sha256）。**順序**：工具還不認得新版本之前，同步會在版本檢查停下（每天 `daily sync failed`）；不要先把 Apporo 升到新映像，否則新版本新增的工具會以 WOOW 的價格（約 30 倍）計費。
 
 ## 已驗證（2026-11-17，woow-k3s 的 dev-sandbox namespace，測完已刪）
 
@@ -221,13 +268,22 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 11. 以 `deploy/apporo-sync/rbac.yaml` 的 ServiceAccount（沙盒 namespace，用 impersonation，沒有經手 token）跑 `daily --apply --live-images`、`verify`、`export` 都成功；它讀不到 root 帳密、不能建 Secret、不能改 deployment。
 12. `mint-sync-pat` 的 Secret 寫入失敗時，新 PAT 被真的 rc.44 撤銷（PAT 數量前後相同）。
 
-單元測試：`scripts/tests/test_apporo_sync.py`（CI 的 `Admin tool unit tests` 步驟會跑），用程序內的假 rc.44（價目表 Go 重新序列化、渠道流水號、abilities）跑重播、冪等、分類、暫停、通知、金鑰輪替、唯讀 SQL 守衛、平台檢查，以及第二輪的停用渠道、下架再上架、計費公式、生效日、重播守衛、寫入順序、失敗告警、SIGTERM、渠道憑證遮罩、PAT 撤銷。沙盒整合測試的腳本在 `tests/apporo_sync/`（手動跑，不在 CI）。
+第三輪（同日深夜；沙盒 `dev-sandbox-nasync-{src,tgt}-1117r3`，來源仍用第 1 步的匯出檔，沒有再讀正式站）：
+
+13. 工具呼叫計價：重播寫入的 `tool_price_setting.prices` 等於 rc.44 內建表 ÷30（逐 byte），`grok.violation_deduction_amount` 是 `0.0016666666666666668`，兩列都被真的 rc.44 接受；`verify --strict --check-keys` 121 項 0 失敗（含兩項 `prices` 檢查）。來源與目標的渠道 1 指向假上游，各加一個名稱以 `search-preview` 結尾的模型（rc.44 對這種 chat 請求計一次 `web_search_preview`）：`gpt-4o-search-preview`（命中內建 `web_search_preview:gpt-4o*`）WOOW 扣 23,755 quota、記錄的工具價 25；Apporo 扣 792、工具價 0.8333333333333334（23,755÷30＝791.83）。`sbx/tool-search-preview`（工具預設價）WOOW 6,501、工具價 10；Apporo 217、工具價 0.3333333333333333（÷30＝216.7）。
+14. WOOW 改工具價（`web_search_preview` 12、`web_search_preview:gpt-4o*` 20）：`daily --apply` 把漲價暫停並起草通知（`| tool `web_search_preview` | per 1,000 calls | 10.666667 | 12.8 | +20.0% |`），降價當輪寫入。暫停期間真的計費：`gpt-4o-search-preview` 已是新價（WOOW 21,255、Apporo 709，工具價 20 與 0.6666666666666666）；`sbx/tool-search-preview` 仍是舊價（WOOW 7,501、Apporo 217，工具價 12 與 0.3333333333333333）。登記通知、生效日到了之後下一次 `apply` 套用，`verify --strict` 0 失敗，Apporo 扣 250＝7,501÷30（工具價 0.4）。
+15. 新的 SQL 守衛（逐字比對樣板）在真的 psql 上讀兩邊都正常：來源三個研究指紋仍等於 WOOW；第二輪的每日同步流程重跑（12 項檢查、寫入順序、通知到期套用）全部通過，`verify --strict` 抓出的仍是那 5 項刻意的只告警差異（與第二輪相同，檢查數 114→118 是多了兩列設定與兩項 `prices`）。
+16. 兩個 namespace 已刪除並確認 NotFound；log 與狀態目錄掃過，沒有 `sk-`／`nap_` 值。
+
+單元測試：`scripts/tests/test_apporo_sync.py`（CI 的 `Admin tool unit tests` 步驟會跑），用程序內的假 rc.44（價目表 Go 重新序列化、渠道流水號、abilities）跑重播、冪等、分類、暫停、通知、金鑰輪替、唯讀 SQL 守衛、平台檢查，以及第二輪的停用渠道、下架再上架、計費公式、生效日、重播守衛、寫入順序、失敗告警、SIGTERM、渠道憑證遮罩、PAT 撤銷；第三輪的 SQL 樣板（第二輪檢查員列出的繞法全部被拒、樣板改了就拒絕讀取）、rc.44 工具價規則（載入、查價、序列化）、Apporo 每個工具 × 模型都是 WOOW 的 ÷30、工具價與違規扣費的暫停／KEPT／第一個價格／合起來的檢查、通知列、`verify` 的 `prices` 檢查、映像與內建價格表告警、Helm values 每日檢查、`served_history_days` 下限。`NEWAPI_RC44_SRC=<v1.0.0-rc.44 原始碼>` 時另比對工具內的表與 rc.44 原始碼（CI 沒有原始碼，略過）。沙盒整合測試的腳本在 `tests/apporo_sync/`（手動跑，不在 CI）。
 
 ## 限制
 
-- 只支援 rc.44。New API 升版時要重新驗證價目表的儲存格式、渠道 API、內建計費公式清單與 `channelHasSensitiveChanges`，再改 `NEWAPI_VERSION`。
+- 只支援 rc.44。New API 升版時要重新驗證價目表的儲存格式、渠道 API、內建計費公式清單、內建工具價表與違規扣費預設（`tests/apporo_sync/rc44_price_tables.py`）與 `channelHasSensitiveChanges`，再改 `NEWAPI_VERSION`（見〈映像〉）。
 - rc.44 的 `PUT /api/channel/` 無法把欄位清成 null，也無法把一般字串欄位（名稱、模型清單……）清成空字串；這類變更只告警，要在管理介面手動改。
 - 設定列沒有刪除 API：WOOW 刪掉的設定列，Apporo 端只會告警。
 - 渠道 1、4 共用的那把金鑰若被 LiteLLM 停用（月預算用完），渠道會被 New API 自動停用；同步不改渠道狀態，只告警（它的模型仍算提供中，漲價照樣暫停）。
-- 30 天提供紀錄只在狀態目錄裡；目錄遺失時，之前下架的模型重新上架不會被暫停（見〈每日同步的分類〉）。狀態目錄要和 cluster1 的家目錄一起備份。
-- 計費公式與 rc.44 內建工具價格沒有 ÷30 的轉換（見〈不會被 ÷30 的價格〉）。
+- 30 天提供紀錄只在狀態目錄裡；目錄遺失時，之前下架的模型重新上架不會被暫停（見〈每日同步的分類〉）。狀態目錄要和 cluster1 的家目錄一起備份。`served_history_days` 不能小於 30（設定檔與程式都擋）。
+- 計費公式與 Gemini 音訊輸入的固定美元價沒有 ÷30 的轉換（見〈30:1 規則〉）。
+- 工具價「是否影響提供中的模型」是用路由中的模型名比對 key 前綴。rc.44 計價時用的「計費模型名」可能是去掉思考後綴（`-thinking` 等）的名稱；前綴比較短於基本名稱時兩者結果相同，WOOW 現在的 key 都不受影響。
+- 同一個工具有兩個 key 指向同一個前綴（例如 `t:abc*` 與 `t:abc`）而價格不同時，rc.44 兩者之間的選擇沒有定義：工具照算、但另外告警（`tool-price-ambiguous`），要在 WOOW 修掉。
