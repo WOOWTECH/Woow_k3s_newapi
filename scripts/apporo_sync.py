@@ -62,8 +62,9 @@ last served_history_days days.
 Tool prices and the violation fee follow the same rules, judged by the price
 of every offered model (rc.44's lookup); the tool price entries a run writes
 must also not raise a paid price together. daily also runs
-scripts/apporo_parity.py --strict (Helm values drift) and checks that the New
-API image is one whose built-in price tables this tool knows.
+scripts/apporo_checks.py --strict (or scripts/apporo_parity.py --strict in an
+older checkout: Helm values drift) and checks that the New API image is one
+whose built-in price tables this tool knows.
 
 Writes run in an order that never leaves an offered model without its price:
 options and new or changed prices, then channels, then removed price entries.
@@ -2085,15 +2086,21 @@ def image_alerts(repo, kube=None, live=False, profile=None):
 NEWAPI_IMAGE_RE = re.compile(r"(^|/)calciumion/new-api[:@]")
 
 
-PARITY_SCRIPT = os.path.join("scripts", "apporo_parity.py")
-PARITY_TIMEOUT = 300
-PARITY_STATUS_RE = re.compile(r"^(DIFFERS|ERROR|WARN|FAILED)\b")
+# Helm values drift (Apporo values PR #44): scripts/apporo_checks.py --strict runs every check of
+# deploy/apporo-k3s.yaml (render, dormant proxy, images, Apporo's own values and the AI terms'
+# periods, and parity = scripts/apporo_parity.py --strict); an older checkout may have only
+# apporo_parity.py. Both: exit 0 ok, 1 a check failed / Apporo is behind, 2 error.
+VALUES_TOOLS = (("scripts/apporo_checks.py", "Apporo checks"), ("scripts/apporo_parity.py", "Apporo parity"))
+VALUES_TIMEOUT = 600
+PARITY_STATUS_RE = re.compile(r"^(DIFFERS|ERROR|WARN|FAILED)\b|^\s+FAIL\s")
 
 
 def parity_lines(text):
-    """The status lines of apporo_parity.py and its "values that differ" block (not the render diff)."""
+    """The status lines of apporo_checks.py / apporo_parity.py and the "values that differ" block
+    (not render diffs). apporo_checks.py quotes the sub-tool's lines behind "   | "."""
     out, in_block = [], False
-    for ln in text.splitlines():
+    for raw in text.splitlines():
+        ln = raw[5:] if raw.startswith("   | ") else raw
         if re.match(r"^\s+values that differ", ln):
             in_block = True
             out.append(ln.strip())
@@ -2101,36 +2108,39 @@ def parity_lines(text):
             out.append(ln.strip())
         else:
             in_block = False
-            if PARITY_STATUS_RE.match(ln):
-                out.append(ln.rstrip())
+            if PARITY_STATUS_RE.match(ln) and not ln.startswith("::"):
+                out.append(ln.strip())
     return [nc.redact(ln)[:300] for ln in out]
 
 
 def values_alerts(repo, run=subprocess.run):
-    """Helm values drift: scripts/apporo_parity.py --strict (offline helm template; it arrives with the
-    Apporo values PR). exit 1 = Apporo's values (or NP copy, or proxy pin) are behind WOOW prod,
-    exit 2 = Apporo's file does not render or the comparison failed: both are action alerts."""
-    path = os.path.join(repo, PARITY_SCRIPT)
-    if not os.path.exists(path):
-        return [{"severity": "info", "title": "values: scripts/apporo_parity.py is not in this checkout",
-                 "details": ["the Helm values comparison with WOOW prod comes with the Apporo values PR; update the "
-                             "checkout to main after it is merged"]}]
+    """Helm values drift, daily: scripts/apporo_checks.py --strict, or scripts/apporo_parity.py --strict
+    in a checkout that only has that one (offline helm template; they come with the Apporo values PR).
+    exit 1 (Apporo is behind WOOW prod, or one of its own checks fails) and exit 2 (error) are action
+    alerts; no tool in the checkout is info."""
+    found = [(rel, name) for rel, name in VALUES_TOOLS if os.path.exists(os.path.join(repo, rel))]
+    if not found:
+        return [{"severity": "info", "title": "values: scripts/apporo_checks.py is not in this checkout",
+                 "details": ["the Helm values checks (Apporo vs WOOW prod) come with the Apporo values PR; update "
+                             "the checkout to main after it is merged"]}]
+    rel, name = found[0]
     try:
-        r = run([sys.executable, path, "--strict"], cwd=repo, capture_output=True, timeout=PARITY_TIMEOUT)
+        r = run([sys.executable, os.path.join(repo, rel), "--strict"], cwd=repo, capture_output=True,
+                timeout=VALUES_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return [{"severity": "action", "title": "values: scripts/apporo_parity.py --strict did not finish",
-                 "details": [f"{e.__class__.__name__} (helm template, timeout {PARITY_TIMEOUT}s)"]}]
+        return [{"severity": "action", "title": f"values: {rel} --strict did not finish",
+                 "details": [f"{e.__class__.__name__} (helm template, timeout {VALUES_TIMEOUT}s)"]}]
     if r.returncode == 0:
         return []
     text = ((r.stdout or b"") + b"\n" + (r.stderr or b"")).decode("utf-8", "replace")
     lines = parity_lines(text)
     summary = next((ln for ln in lines if ln.startswith(("FAILED", "ERROR"))), f"exit {r.returncode}")
-    title = {1: "values: Apporo's Helm values are behind WOOW prod (apporo_parity.py --strict exit 1)",
-             2: "values: Apporo's values do not render, or the comparison failed (apporo_parity.py --strict exit 2)"
-             }.get(r.returncode, f"values: apporo_parity.py --strict exit {r.returncode}")
+    title = {1: f"values: Apporo's Helm values fail the {name} or are behind WOOW prod ({rel} --strict exit 1)",
+             2: f"values: the {name} could not run, or Apporo's values do not render ({rel} --strict exit 2)"
+             }.get(r.returncode, f"values: {rel} --strict exit {r.returncode}")
     return [{"severity": "action", "title": title, "details": [summary] + [ln for ln in lines if ln != summary][:40] + [
-        "bring deploy/apporo-k3s.yaml up to WOOW prod in a PR of its own (docs/APPORO-K3S.md 〈跟著 WOOW 改〉); the "
-        "owner merges it, then helm upgrade (scripts/apporo_parity.py --strict says in sync first)"]}]
+        "bring deploy/apporo-k3s.yaml up to WOOW prod (or fix it) in a PR of its own (docs/APPORO-K3S.md "
+        "〈跟著 WOOW 改〉); the owner merges it, then helm upgrade once scripts/apporo_checks.py --strict passes"]}]
 
 
 def price_table_alerts(state, version):

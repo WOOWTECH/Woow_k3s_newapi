@@ -11,8 +11,9 @@
 #   APPORO_SYNC_MODE       report (default: classify, hold and alert; write nothing) | apply
 #                          (start with report for a few days, read the alerts, then switch)
 #   APPORO_SYNC_PLATFORM_PRICING  optional path of the platform's llm_pricing.py for the pricing gate
-# daily also runs scripts/apporo_parity.py --strict (Helm values drift; offline
-# helm template): helm must be on PATH (cluster1: /usr/local/bin/helm).
+# daily also runs scripts/apporo_checks.py --strict (Helm values drift and Apporo's
+# own value checks; offline helm template): helm must be on PATH (cluster1:
+# /usr/local/bin/helm).
 set -euo pipefail
 umask 077
 

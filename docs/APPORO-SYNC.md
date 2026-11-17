@@ -136,7 +136,7 @@
 
 | 標題開頭 | 什麼時候 |
 |---|---|
-| `values: Apporo's Helm values are behind WOOW prod`（exit 1）／`values: Apporo's values do not render …`（exit 2）／`… did not finish` | 見〈Helm values 落後〉 |
+| `values: Apporo's Helm values fail the Apporo checks or are behind WOOW prod`（exit 1）／`values: the Apporo checks could not run …`（exit 2）／`… did not finish` | 見〈Helm values 落後〉 |
 | `images: chart/values.yaml pins New API …`／`images (live): … runs …, not an image whose built-in prices this tool knows` | 見〈映像〉：New API 映像不是工具知道內建價格表的那一版 |
 | `built-in prices changed: New API A -> B` | 工具改支援新版本、內建價格表換了：這一輪已依新表重算 Apporo 的工具價（降價寫入、漲價暫停） |
 | `fixed-audio-price: model …` | 路由中有 rc.44 以固定美元價計音訊輸入的 Gemini 模型名 |
@@ -225,17 +225,22 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 
 ## Helm values 落後（每日檢查）
 
-負責人的決定（第 10 輪）是：Woow_k3s_newapi 的 CI 對 WOOW／Apporo 的一致性只警告，差距由每日同步補。所以 `daily`（report 與 apply 兩種模式都一樣）會在 checkout 裡跑 `scripts/apporo_parity.py --strict`（這支工具隨 Apporo values 的 PR #44 進來；離線 `helm template`，不連叢集、不需要任何憑證）：
+負責人的決定（第 10 輪）是：Woow_k3s_newapi 的 CI 對 WOOW／Apporo 的一致性只警告，差距由每日同步補。所以 `daily`（report 與 apply 兩種模式都一樣）會在 checkout 裡跑 Apporo values PR（#44）帶進來的檢查（離線 `helm template`，不連叢集、不需要任何憑證）：
+
+- 有 `scripts/apporo_checks.py` 就跑 `scripts/apporo_checks.py --strict`：Apporo 檔案的 render、休眠中 proxy 打開後能否 render、映像 pin、proxy 物件、Apporo 自己的值與 AI 條款寫的期間，以及 parity（`scripts/apporo_parity.py --strict`：其他一切等於 WOOW 正式站＋文件記載的差異）。這也是安裝與每次 `helm upgrade` 前要過的那一個檢查。
+- 只有 `scripts/apporo_parity.py` 的舊 checkout：跑 `scripts/apporo_parity.py --strict`。
 
 | 結果 | 告警 |
 |---|---|
-| exit 0（in sync） | 無 |
-| exit 1：Apporo 的 values、LiteLLM ingress NP 複本或 proxy pin 落後 WOOW 正式站 | `action`「values: Apporo's Helm values are behind WOOW prod」，第一行是工具的 `FAILED` 摘要（列出不同的 key），後面附「values that differ」那幾行（不附 render diff） |
-| exit 2：Apporo 的檔案 render 不出來（含休眠中的 proxy 打開後）或比對失敗 | `action`「values: Apporo's values do not render, or the comparison failed」 |
-| 跑不完（逾時 300 秒、找不到 python） | `action`「values: … did not finish」 |
-| checkout 裡沒有這支工具（PR #44 還沒合併） | `info`，提醒合併後更新 checkout |
+| exit 0 | 無 |
+| exit 1：Apporo 落後 WOOW 正式站（values、LiteLLM ingress NP 複本或 proxy pin），或 Apporo 自己的某項檢查失敗 | `action`「values: Apporo's Helm values fail the Apporo checks or are behind WOOW prod」。第一行是工具的 `FAILED` 摘要（parity 會列出不同的 key），後面附失敗的檢查（`FAIL …`）與「values that differ」那幾行；不附 render diff，也不附 CI 用的 `::error::` 行 |
+| exit 2：檢查跑不起來，或 Apporo 的檔案 render 不出來 | `action`「values: the Apporo checks could not run, or Apporo's values do not render」 |
+| 跑不完（逾時 600 秒、找不到 python） | `action`「values: … did not finish」 |
+| checkout 裡兩支都沒有（PR #44 還沒合併） | `info`，提醒合併後更新 checkout |
 
-同一個落後狀態每天的告警 fingerprint 相同（只有第一次是 `new`，之後 email 管道可以只寄一次）；落後的 key 改變了才是新告警。修正方式不變：開一張 Apporo 自己的 values PR（APPORO-K3S.md〈跟著 WOOW 改〉），負責人合併後 `helm upgrade`；自動開 PR 和映像一樣是之後的工作。排程主機要有 `helm`（cluster1：`/usr/local/bin/helm`，systemd user unit 的預設 PATH 找得到）。
+同一個落後狀態每天的告警 fingerprint 相同（只有第一次是 `new`，之後 email 管道可以只寄一次）；落後的 key 改變了才是新告警。修正方式不變：開一張 Apporo 自己的 values PR（APPORO-K3S.md〈跟著 WOOW 改〉），負責人合併後、`scripts/apporo_checks.py --strict` 通過再 `helm upgrade`；自動開 PR 和映像一樣是之後的工作。排程主機要有 `helm`（cluster1：`/usr/local/bin/helm`，systemd user unit 的預設 PATH 找得到）。整套檢查約 1 分鐘（含 `scripts/tests/test_apporo_*.py`），systemd 範本的 `TimeoutStartSec` 是 1800 秒。
+
+實測（11-17，本機把 #44 head `7e110a5` 與本 PR 合併，未推送）：`apporo_checks.py --strict` 全部通過（render、proxy-on、images、proxy、values 153 個測試、parity），`daily` 的檢查不產生告警；只改 WOOW 的 `deploy/woow-k3s.yaml`（`backup.keepDays` 7→8）時，產生一筆 action 告警，內容是 `backup.keepDays: 8 | 7`。
 
 ## 映像
 

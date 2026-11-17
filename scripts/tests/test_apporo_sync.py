@@ -1709,6 +1709,26 @@ def types_ns(**kw):
     return ns
 
 
+CHECKS_STUB = """import os, sys
+code = int(os.environ.get("CHECKS_STUB_EXIT", "0"))
+assert sys.argv[1:] == ["--strict"], sys.argv
+print("Apporo checks (strict; docs/APPORO-K3S.md)")
+print("-- values: Apporo's own values, the AI terms' promises")
+if code == 1:
+    print("   FAIL 1 of 21 tests failed: test_values_promised_in_the_ai_terms")
+    print("-- parity: everything else equals WOOW prod (scripts/apporo_parity.py --strict)")
+    print("   FAIL scripts/apporo_parity.py --strict: differs from WOOW prod + the documented differences (exit 1)")
+    print("   | DIFFERS values, proxy as committed (enabled: false): the renders differ in 4 line(s)")
+    print("   |         values that differ (WOOW prod + documented differences | Apporo):")
+    print("   |           retention.days: 180 | 90")
+    print("   |         render diff (proxy as committed (enabled: false)), first 60 lines:")
+    print("   |           -  days: 180")
+    print("FAILED  Apporo checks: values, parity. strict. Do not install or helm upgrade Apporo until they pass")
+    print("::error file=deploy/apporo-k3s.yaml,title=Apporo values::1 of 21 tests failed")
+sys.exit(code)
+"""
+
+
 PARITY_STUB = """import os, sys
 code = int(os.environ.get("PARITY_STUB_EXIT", "0"))
 if os.environ.get("PARITY_STUB_SLEEP"):
@@ -1743,10 +1763,26 @@ class ValuesDriftTest(unittest.TestCase):
         with open(os.path.join(self.repo, "scripts", "apporo_parity.py"), "w") as f:
             f.write(PARITY_STUB)
 
-    def test_no_parity_tool_yet_is_info(self):
+    def test_no_values_tool_yet_is_info(self):
         (al,) = REAL_VALUES_ALERTS(self.repo)
         self.assertEqual(al["severity"], "info")
-        self.assertIn("apporo_parity.py is not in this checkout", al["title"])
+        self.assertIn("apporo_checks.py is not in this checkout", al["title"])
+
+    def test_apporo_checks_is_preferred_and_its_failures_are_quoted(self):
+        self.stub()
+        with open(os.path.join(self.repo, "scripts", "apporo_checks.py"), "w") as f:
+            f.write(CHECKS_STUB)
+        os.environ["CHECKS_STUB_EXIT"], os.environ["PARITY_STUB_EXIT"] = "0", "1"   # parity alone would fail
+        self.assertEqual(REAL_VALUES_ALERTS(self.repo), [])
+        os.environ["CHECKS_STUB_EXIT"] = "1"
+        (al,) = REAL_VALUES_ALERTS(self.repo)
+        self.assertEqual(al["severity"], "action")
+        self.assertIn("fail the Apporo checks or are behind WOOW prod (scripts/apporo_checks.py --strict exit 1)",
+                      al["title"])
+        self.assertTrue(al["details"][0].startswith("FAILED  Apporo checks: values, parity"))
+        self.assertIn("FAIL 1 of 21 tests failed: test_values_promised_in_the_ai_terms", al["details"])
+        self.assertIn("retention.days: 180 | 90", al["details"])
+        self.assertFalse(any("days: 180" == d.strip("- ") or d.startswith("::") for d in al["details"]))
 
     def test_in_sync_is_quiet_and_drift_or_errors_are_action_alerts(self):
         self.stub()
@@ -1755,7 +1791,7 @@ class ValuesDriftTest(unittest.TestCase):
         os.environ["PARITY_STUB_EXIT"] = "1"
         (al,) = REAL_VALUES_ALERTS(self.repo)
         self.assertEqual(al["severity"], "action")
-        self.assertIn("behind WOOW prod (apporo_parity.py --strict exit 1)", al["title"])
+        self.assertIn("behind WOOW prod (scripts/apporo_parity.py --strict exit 1)", al["title"])
         self.assertTrue(al["details"][0].startswith("FAILED  Apporo differs"))
         self.assertIn('newapi.resources.limits.memory: "2Gi" | "1Gi"', al["details"])
         self.assertFalse(any("memory: 2Gi" == d.strip("- ") for d in al["details"]), "no render diff lines")
@@ -1767,8 +1803,8 @@ class ValuesDriftTest(unittest.TestCase):
     def test_a_hanging_check_is_an_alert(self):
         self.stub()
         os.environ["PARITY_STUB_SLEEP"] = "5"
-        self.addCleanup(setattr, aps, "PARITY_TIMEOUT", aps.PARITY_TIMEOUT)
-        aps.PARITY_TIMEOUT = 1
+        self.addCleanup(setattr, aps, "VALUES_TIMEOUT", aps.VALUES_TIMEOUT)
+        aps.VALUES_TIMEOUT = 1
         (al,) = REAL_VALUES_ALERTS(self.repo)
         self.assertIn("did not finish", al["title"])
 
