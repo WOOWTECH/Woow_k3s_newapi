@@ -13,7 +13,7 @@
 Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相同。
 
 - `scripts/apporo_parity.py` 比對兩邊 render 的結果：WOOW 正式站在 `new-api`、Apporo 在 `new-api-apporo` 各自 render，Apporo 的 render 要等於「WOOW 正式站＋下表的差異」。proxy pin 另外和 WOOW 正式站目前的 pin 比。
-- 表裡 Apporo 這一欄的值和〈AI 條款寫的事〉，由 `scripts/tests/test_apporo_values.py` 檢查。
+- 表裡 Apporo 這一欄的值和〈AI 條款寫的事〉，由 `scripts/tests/test_apporo_values.py` 檢查。負責人決定的值（namespace、網址、語言、呼叫端、每小時加額度上限，以及上限算法用到的單次轉換上限與換算）以字面值寫在它的 `DECIDED`，註明哪一輪決定；`scripts/apporo_parity.py` 的差異清單也要等於它。所以只改 `apporo_parity.py` 和 values 不會過，要改決定就得明白改這個測試。
 - 這些檢查全在 CI 最後的「Apporo checks」步驟：動到 Apporo 檔案的 PR 會被擋；只改 WOOW 的 PR 一律只警告，連 Apporo 的檔案 render 不出來也一樣（〈CI 與檢查〉）。
 
 | 項目 | WOOW 正式站 | Apporo |
@@ -38,7 +38,7 @@ Helm values：除了下表這幾項，其他都要和 `deploy/woow-k3s.yaml` 相
 
 AI 條款寫給顧客的保留期間、備份、Cloudflare 與 New API 版本，見下一節〈AI 條款寫的事〉。
 
-**WOOW 正式站的 values 有其他改動時，同一個 PR 不必改 `deploy/apporo-k3s.yaml`。** CI 只印警告、job 仍是綠的。目前沒有東西會自動把它拉回來，Apporo 另開 PR 跟上（〈跟著 WOOW 改〉）。真的要讓兩邊不同，就把它加進 `scripts/apporo_parity.py` 的差異清單、`scripts/tests/test_apporo_values.py` 的檢查和這張表，給負責人審。
+**WOOW 正式站的 values 有其他改動時，同一個 PR 不必改 `deploy/apporo-k3s.yaml`。** CI 只印警告、job 仍是綠的。目前沒有東西會自動把它拉回來，Apporo 另開 PR 跟上（〈跟著 WOOW 改〉）。真的要讓兩邊不同，就把它加進 `scripts/apporo_parity.py` 的差異清單、`scripts/tests/test_apporo_values.py` 的檢查（負責人決定的值放進 `DECIDED`）和這張表，給負責人審。
 
 - WOOW 正式站打開加密備份（NA-07）時，CI 一樣只會警告。Apporo 要另開 PR 跟上，並附上 Apporo 自己的容量檢查（`capacityVerification`，namespace `new-api-apporo`）；這種證據不能抄 WOOW 的。
 
@@ -271,7 +271,7 @@ Apporo 的檢查全部在 CI 最後一個步驟「Apporo checks」（`scripts/ap
 | `proxy-on` | proxy 休眠時，把 proxy 打開再 render 一次：chart 的 proxy 檢查（呼叫端、pin、帳號格式…）要過，proxy 的五種物件和釘住的映像都要在。`scripts/chart-guards.sh` 只放 WOOW 的形狀，Apporo 的呼叫端形狀在這裡檢查 |
 | `images` | 照提交的 render，每個映像都釘 digest |
 | `proxy` | 休眠時 render 裡沒有 proxy 物件；打開後和 WOOW 一樣，要有五種物件和一個釘 commit tag＋digest 的映像 |
-| `values` | `scripts/tests/test_apporo_*.py`：〈和 WOOW 正式站的差異〉的決定值、〈AI 條款寫的事〉、proxy pin 與 stg 報告、兩條手動 NP，以及這些工具自己的測試 |
+| `values` | `scripts/tests/test_apporo_*.py`：〈和 WOOW 正式站的差異〉的決定值（寫死在 `test_apporo_values.py` 的 `DECIDED`，`apporo_parity.py` 的差異清單也要和它相同）、〈AI 條款寫的事〉、proxy pin 與 stg 報告、兩條手動 NP、`scripts/apporo_check_drift.sh`，以及這些工具自己的測試 |
 | `parity` | `scripts/apporo_parity.py --strict`：其他全部等於 WOOW 正式站＋文件化的差異（values、LiteLLM NP 的複本、proxy pin） |
 
 ```bash

@@ -9,7 +9,8 @@ step, this module skips itself. Locally: scripts/apporo_checks.py --only values.
 Offline: helm template only; no cluster, credentials or network.
 
 ApporoValuesTests: the documented Apporo differences hold the decided values
-(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉): publicUrl,
+(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉), written out in DECIDED below and
+held against scripts/apporo_parity.py's list too: publicUrl,
 newapi.env.DEFAULT_LANGUAGE, proxy.clients and proxy.addQuotaHourlyCapPoints
 20000, which still lets the largest conversion through; proxy.enabled is a
 literal boolean and the AP/OP expiries match it; the proxy pin is one WOOW prod
@@ -65,6 +66,38 @@ RELAY_LABELS = {'app.kubernetes.io/name': 'newapi', 'app.kubernetes.io/instance'
 EVIDENCE_HINT = ('per-instance evidence (encryptedBackup.capacityVerification, restoreVerification, '
                  'ageRecipient) must be Apporo\'s own: its own capacity review and restore drill, bound '
                  'to namespace new-api-apporo; never copy WOOW\'s (docs/APPORO-K3S.md)')
+
+# The owner's decisions for Apporo (docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉), written out
+# here: scripts/apporo_parity.py's constants (its list of documented differences) must equal
+# them, so a decision changes only by changing this test, in a PR the owner reviews for it,
+# never by editing the parity tool's list together with the values.
+DECIDED = {
+    # Q&A round 2: the public URL.
+    'PUBLIC_URL': 'https://newapi.apporo.ai',
+    # Q&A round 4: what customers see is in English (and US$).
+    'DEFAULT_LANGUAGE': 'en',
+    # Q&A round 3: apun-odoo split into its web pod (component application) and a cron pod;
+    # both call the proxy, each with its own signing key.
+    'APUN_CLIENTS': [{
+        'name': 'apun-odoo',
+        'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': 'apun'}},
+        'podSelector': {
+            'matchLabels': {'app.kubernetes.io/name': 'apun'},
+            'matchExpressions': [{'key': 'app.kubernetes.io/component', 'operator': 'In',
+                                  'values': ['application', 'cron']}],
+        },
+    }],
+    # Q&A round 10: proxy.addQuotaHourlyCapPoints 20000 (WOOW prod: the chart default 100000).
+    'HOURLY_CAP_POINTS': 20000,
+    # Q&A rounds 7-8: conversions of 50-10,000 points copied from WOOW, and R = 32 unchanged
+    # (15,625 quota a point; the 30:1 rule divides the model prices instead).
+    'LARGEST_CONVERSION_POINTS': 10000,
+    'QUOTA_PER_POINT': 15625,
+    # Q&A rounds 7-8, the defaults: namespace new-api-apporo.
+    'APPORO_NAMESPACE': 'new-api-apporo',
+}
+DECIDED_HINT = ('an owner decision (2026-11-17; docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉): change it only when '
+                'the owner decides again, here in DECIDED, in scripts/apporo_parity.py and in the values together')
 
 # What Apporo's AI terms (v2.2) state about the gateway, as values deploy/apporo-k3s.yaml
 # writes out itself (docs/APPORO-K3S.md 〈AI 條款寫的事〉). A chart default never counts:
@@ -185,26 +218,32 @@ class ApporoValuesTests(unittest.TestCase):
             self.fail(f'deploy/apporo-k3s.yaml does not render in {parity.APPORO_NAMESPACE} as committed '
                       f'(proxy.enabled={enabled}): {err}\n{EVIDENCE_HINT}')
         if enabled:
-            self.assertIn(f'PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: "{parity.HOURLY_CAP_POINTS}"', out)
+            self.assertIn(f'PROXY_ADD_QUOTA_HOURLY_CAP_POINTS: "{DECIDED["HOURLY_CAP_POINTS"]}"', out)
+
+    def test_parity_tool_holds_the_decided_values(self):
+        # The parity tool lays these over WOOW prod; it must not carry a decision of its own.
+        for name, want in DECIDED.items():
+            with self.subTest(name=name):
+                self.assertEqual(getattr(parity, name), want, f'scripts/apporo_parity.py {name} is {DECIDED_HINT}')
 
     def test_documented_differences_hold_the_decided_values(self):
         env = (self.values.get('newapi') or {}).get('env') or {}
-        self.assertEqual(self.values.get('publicUrl'), parity.PUBLIC_URL)
-        self.assertEqual(env.get('DEFAULT_LANGUAGE'), parity.DEFAULT_LANGUAGE)
-        self.assertEqual(self.proxy.get('clients'), parity.APUN_CLIENTS)
-        self.assertEqual(self.proxy.get('addQuotaHourlyCapPoints'), parity.HOURLY_CAP_POINTS,
-                         'proxy.addQuotaHourlyCapPoints is an owner decision (2026-11-17): 20000 for Apporo '
-                         '(docs/APPORO-K3S.md 〈和 WOOW 正式站的差異〉)')
+        self.assertEqual(self.values.get('publicUrl'), DECIDED['PUBLIC_URL'], f'publicUrl is {DECIDED_HINT}')
+        self.assertEqual(env.get('DEFAULT_LANGUAGE'), DECIDED['DEFAULT_LANGUAGE'],
+                         f'newapi.env.DEFAULT_LANGUAGE is {DECIDED_HINT}')
+        self.assertEqual(self.proxy.get('clients'), DECIDED['APUN_CLIENTS'], f'proxy.clients is {DECIDED_HINT}')
+        self.assertEqual(self.proxy.get('addQuotaHourlyCapPoints'), DECIDED['HOURLY_CAP_POINTS'],
+                         f'proxy.addQuotaHourlyCapPoints is {DECIDED_HINT}')
 
     def test_hourly_cap_lets_the_largest_conversion_through(self):
         # newapi-proxy gives every replica cap * 15,625 // replicas quota an
         # hour; a smaller share answers the largest single conversion with 429.
         proxy = parity.merge(parity.values(ROOT / 'chart/values.yaml'), self.values)['proxy']
-        share = proxy['addQuotaHourlyCapPoints'] * parity.QUOTA_PER_POINT // proxy['replicas']
-        self.assertGreaterEqual(share, parity.LARGEST_CONVERSION_POINTS * parity.QUOTA_PER_POINT,
+        per_point, largest = DECIDED['QUOTA_PER_POINT'], DECIDED['LARGEST_CONVERSION_POINTS']
+        share = proxy['addQuotaHourlyCapPoints'] * per_point // proxy['replicas']
+        self.assertGreaterEqual(share, largest * per_point,
                                 f'with {proxy["replicas"]} replicas the cap must be at least '
-                                f'{proxy["replicas"] * parity.LARGEST_CONVERSION_POINTS} points: '
-                                'ask the owner for a new value')
+                                f'{proxy["replicas"] * largest} points: ask the owner for a new value')
 
     def test_per_instance_evidence_is_not_copied_from_prod(self):
         prod = parity.values(PROD).get('encryptedBackup') or {}
@@ -268,11 +307,12 @@ class ApporoValuesTests(unittest.TestCase):
         self.assertEqual(policy.get('metadata'), {'name': 'litellm-from-newapi-apporo-ingress',
                                                   'namespace': upstream['namespace'],
                                                   'labels': {'app.kubernetes.io/part-of': 'woow-k3s-newapi'}})
+        namespace = {'kubernetes.io/metadata.name': DECIDED['APPORO_NAMESPACE']}
         self.assertEqual(policy.get('spec'), {
             'podSelector': {'matchLabels': upstream['podLabels']},
             'policyTypes': ['Ingress'],
             'ingress': [{
-                'from': [{'namespaceSelector': {'matchLabels': {'kubernetes.io/metadata.name': parity.APPORO_NAMESPACE}},
+                'from': [{'namespaceSelector': {'matchLabels': namespace},
                           'podSelector': {'matchLabels': RELAY_LABELS}}],
                 'ports': [{'protocol': 'TCP', 'port': upstream['port']}],
             }],
@@ -397,7 +437,7 @@ class AiTermsTests(unittest.TestCase):
         self.assertTrue(any('cloudflare/cloudflared:' in c['image'] for c in pod_spec(tunnel)['containers']),
                         CHART_HINT)
         master = parsed(self.objects, 'Deployment', 'newapi-master')
-        self.assertEqual(container_env(master, 'new-api').get('SESSION_COOKIE_TRUSTED_URL'), parity.PUBLIC_URL)
+        self.assertEqual(container_env(master, 'new-api').get('SESSION_COOKIE_TRUSTED_URL'), DECIDED['PUBLIC_URL'])
         images = [c['image'] for c in pod_spec(master)['containers'] if c['name'] == 'new-api']
         self.assertEqual(len(images), 1, CHART_HINT)
         self.assertTrue(images[0].startswith(UPSTREAM_NEW_API + ':'), f'{images[0]}. {TERMS_HINT}')
