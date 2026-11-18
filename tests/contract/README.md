@@ -58,8 +58,9 @@ export NEWAPI_CONTRACT_TARGET=stg NEWAPI_CONTRACT_KUBECTL=kubectl
 export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract
 export NEWAPI_CONTRACT_SETTINGS_PAT_FILE=~/.config/newapi-stg/pat-settings
 export NEWAPI_CONTRACT_ADMIN_CREDS_FILE=~/.config/newapi-stg/root-credentials
-# 兩把簽章金鑰只進變數：先在這個 shell 定義 docs/OPERATIONS.md〈輪替：簽章金鑰〉的 cur()
-# （不讓 kubectl 格式化 Secret：-o jsonpath 出錯會把整個 Secret 印出來；讀不到或格式不對就停）
+# 兩把簽章金鑰只進變數：先在這個 shell 貼上 docs/OPERATIONS.md〈簽章金鑰的函式〉那一段
+# （只定義函式，不讀也不改任何東西）。不要整段複製〈輪替：簽章金鑰〉：函式後面就是輪替的步驟。
+# cur() 不讓 kubectl 格式化 Secret（-o jsonpath 出錯會把整個 Secret 印出來），讀不到或格式不對就停。
 WOOW_NEWAPI_PROXY_AUTH_CRON=$(cur paas-stg-system paas-stg-newapi-proxy-client cron) &&
   WOOW_NEWAPI_PROXY_AUTH_WEB=$(cur paas-stg-system paas-stg-newapi-proxy-client web) &&
   export WOOW_NEWAPI_PROXY_AUTH_CRON WOOW_NEWAPI_PROXY_AUTH_WEB

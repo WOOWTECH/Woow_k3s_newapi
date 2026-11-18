@@ -109,7 +109,7 @@ Apporo 的 AI 條款（版本 `2026-11-18-1`，2026-11-18 在官網發布）對�
 
 | Secret | key | 內容 |
 |---|---|---|
-| `apun-newapi-llm`（Woow_k3s_odoo PR #4 用的名稱與 key） | `proxy-auth-web`、`proxy-auth-cron`、`fernet-keys` | 前兩個是 `newapi-proxy-hmac` 的 `web`／`cron` 同一份字串（Odoo 用清單第一把簽；兩邊只比 sha256 前 12 碼）。`fernet-keys` 是新產生的 Fernet 金鑰（逗號分隔、第一把加密），兩份離線備份由負責人保管。key 名稱照 WOOW 正式站的 `paas-system/paas-odoo-platform-llm`。**建好之後不可再用 `create … \| replace` 重建**：只放簽章金鑰會刪掉 `fernet-keys`，網頁與排程兩個 pod 都起不來。輪替見〈簽章金鑰輪替〉 |
+| `apun-newapi-llm`（Woow_k3s_odoo PR #4 用的名稱與 key） | `proxy-auth-web`、`proxy-auth-cron`、`fernet-keys` | 前兩個是 `newapi-proxy-hmac` 的 `web`／`cron` 同一份字串（Odoo 用清單第一把簽；兩邊只比 sha256 前 12 碼）。`fernet-keys` 是新產生的 Fernet 金鑰（逗號分隔、第一把加密），必須有兩份離線備份，由負責人保管（〈簽章金鑰輪替與 Fernet 金鑰〉）。key 名稱照 WOOW 正式站的 `paas-system/paas-odoo-platform-llm`。**建好之後不可再用 `create … \| replace` 重建**：只放簽章金鑰會刪掉 `fernet-keys`，網頁與排程兩個 pod 都起不來。輪替見〈簽章金鑰輪替〉 |
 
 環境變數：網頁 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_WEB`＋`WOOW_LLM_SECRET_KEYS`，排程 pod 只有 `WOOW_NEWAPI_PROXY_AUTH_CRON`＋`WOOW_LLM_SECRET_KEYS`（和 WOOW 一樣把兩把簽章金鑰分在兩個 pod）。兩個 pod 另外都帶四個 `WOOW_LLM_EXTRA_*` 變數（不是機密，見〈apun 那一側〉）。
 
@@ -210,7 +210,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 - proxy 打開時兩個到期日一定要填（測試要求）：proxy 的 `/readyz` 依它回 `ap_days_left`／`op_days_left`，沒填是 `null`。
 - **到期前沒有任何東西會提醒。** 平台只在管理員按後台的〔Test connection〕時讀一次 `/readyz`，把天數寫進測試結果，不寄信、不告警；proxy 的 readiness 也不看到期日，剩幾天都照樣回 ready。過期之後 New API 會拒絕這兩把 PAT，代理替平台做的呼叫（開通帳號、轉換點數時加額度、讀設定的檢查）都會失敗。
-- 所以到期日由**負責人記在行事曆上**，提前（建議 30 天）照下面的流程輪替：Apporo 的 AP／OP 與每日同步用的 PAT 都是 2027-05-17，WOOW 正式站的 AP／OP 是 2027-04-23。同步 PAT 雖然有 `daily` 的 14 天前告警，但每日排程裝好之前不會跑（APPORO-SYNC.md〈排程〉）。
+- 所以到期日由**負責人記在行事曆上**，提前（建議 30 天）照下面的流程輪替：Apporo 的 AP／OP 與每日同步用的 PAT 都是 2027-05-17；WOOW 正式站的 AP／OP 是 2027-04-23，WOOW stg 的是 2027-04-14（三套裡最早；三套的表在 OPERATIONS〈輪替：AP／OP〉）。同步 PAT 雖然有 `daily` 的 14 天前告警，但每日排程裝好之前不會跑（APPORO-SYNC.md〈排程〉）。
 - PAT 建好後只讀這兩個 annotation（不要整包印 annotation，裡面還有 token hint；也不要用 `-o jsonpath` 讀 Secret，OPERATIONS〈Secret〉）：
 
   ```bash
@@ -222,7 +222,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ## 簽章金鑰輪替
 
-和 WOOW 正式站一樣用 OPERATIONS〈輪替：簽章金鑰〉的〈正式站與 Apporo〉做法：`P=new-api-apporo O=apun S=apun-newapi-llm`。那段用 `kubectl patch` 只換 `proxy-auth-web`／`proxy-auth-cron`，`fernet-keys` 與 label 不動。
+和 WOOW 正式站一樣用 OPERATIONS〈輪替：簽章金鑰〉的〈正式站與 Apporo〉做法：先在 shell 貼上〈簽章金鑰的函式〉（只定義函式），再用 `P=new-api-apporo O=apun S=apun-newapi-llm`。那段用 `kubectl patch` 只換 `proxy-auth-web`／`proxy-auth-cron`，`fernet-keys` 與 label 不動。
 
 - **不要**用同一節前面 stg 的 `create … | replace`：`apun-newapi-llm` 裡的 `fernet-keys` 會被刪掉，`apun-odoo` 和 `apun-odoo-cron` 重啟後都起不來（`CreateContainerConfigError`）。
 - 第 3 步要重啟 `apun-odoo-cron` 與 `apun-odoo`（Recreate），官網會短暫中斷：排在台北 15:00–18:00，先通知。
@@ -230,9 +230,9 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ## apun 那一側
 
-這些屬於 apun 切換（一次停機，台北 15:00–18:00，先通知）。**2026-11-18 已做完**（停機約 4 分鐘），下面的步驟留作紀錄與回退參考；之後換映像、改 AI 設定見〈Apporo 官網 Odoo 的 AI 維運〉。odoo-tenant 那邊負責拆 pod、接環境變數、排程 pod 的出口規則，步驟寫在 Woow_k3s_odoo PR #4 那一版的 `deploy/woow-k3s/planned/apun/cron-split.yaml` 檔頭（下面的「步驟 N」指那裡）；本 repo 只提供 `deploy/apun-odoo-to-newapi-apporo-egress.yaml`。
+這些屬於 apun 切換（一次停機，台北 15:00–18:00，先通知）。**2026-11-18 已做完**（停機約 4 分鐘），下面的步驟留作紀錄與回退參考；之後換映像、改 AI 設定見〈Apporo 官網 Odoo 的 AI 維運〉。odoo-tenant 那邊負責拆 pod、接環境變數、排程 pod 的出口規則，步驟寫在 Woow_k3s_odoo PR #4 那一版的 `deploy/woow-k3s/planned/apun/cron-split.yaml` 檔頭（下面的「步驟 N」指那裡；PR #8 已把它併回 `deploy/woow-k3s/apun.yaml`，這個檔已刪除）；本 repo 只提供 `deploy/apun-odoo-to-newapi-apporo-egress.yaml`。
 
-1. 窗口之前：建 `apun-newapi-llm`（步驟 1）：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈輪替：簽章金鑰〉最後〈正式站與 Apporo〉那段的 `cur()`：Secret 或 key 不在、空值、格式不對都會停），不印出；兩邊用 sha256 前 12 碼核對。排程 pod 的出口規則 `allow-odoo-cron-to-mailcow` 也在窗口之前套（步驟 2）。
+1. 窗口之前：建 `apun-newapi-llm`（步驟 1）：`proxy-auth-web`／`proxy-auth-cron` 從 `new-api-apporo/newapi-proxy-hmac` 讀進變數（OPERATIONS〈簽章金鑰的函式〉的 `cur()`：Secret 或 key 不在、空值、格式不對都會停），不印出；兩邊用 sha256 前 12 碼核對。排程 pod 的出口規則 `allow-odoo-cron-to-mailcow` 也在窗口之前套（步驟 2）。
 2. 窗口內：切換後確認兩個 pod 都帶著四個 `WOOW_LLM_EXTRA_*` 變數在跑（步驟 8；只印變數名稱與這四個非機密的值）：
 
    | 變數 | 值 |
@@ -260,8 +260,11 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
   - 每日排程 `apporo_paas_overlay.ir_cron_llm_pilot_list_sync`（台北 04:00）補上漏掉的；
   - 每次 `-u apporo_paas_overlay` 也補一次。
 - 會加進名單的帳號：active 的內部或 portal 使用者（不含 OdooBot、public 與範本使用者），partner 有 email，而且 partner（含它的商業實體與送貨地址）沒有綁公司，或綁在 Apporo US（AI 憑證開在 Apporo US）。綁在別家公司的只記一行 WARNING，不加。
-- **名單只加不減，不要靠改名單來排除人**：手動拿掉的帳號，下一次帳號變動、每日排程或 `-u` 就會加回去。要讓某個帳號不能用 AI，到後台〔Apporo Platform → AI Models → Accounts〕打開它的 AI 帳號，按〔Suspend (operations)〕或〔Suspend (policy)〕；恢復按〔Restore AI service〕（都要具名操作員，見〈手動加點與帳務〉）。或者封存（停用）那個使用者。
-- 名單變成空的是故障：付費定價不成立，付費金鑰和付費模型全部失敗，AI 頁面卻照樣顯示。手動填回任一個 partner id（並照下一節送快取失效通知），下一次排程就會補齊。
+- **名單只加不減，不要靠改名單來排除人**：手動拿掉的帳號，下一次每日排程、`-u apporo_paas_overlay`，或這個帳號自己被重新啟用（或再次授予 portal）時，就會被加回去。帳號建立與啟用的 hook 只看那一次建立或啟用的帳號，別的帳號變動不會把它加回去。要讓某個帳號不能用 AI，到後台〔Apporo Platform → AI Models → Accounts〕打開它的 AI 帳號，按〔Suspend (operations)〕或〔Suspend (policy)〕；恢復按〔Restore AI service〕（都要具名操作員，見〈手動加點與帳務〉）。或者封存（停用）那個使用者。
+- 名單變成空的是故障：付費定價不成立，付費金鑰和付費模型全部失敗，AI 頁面卻照樣顯示。程式不會自己填回空的名單（空名單對平台的意思不同，只記 WARNING）。處理方式：
+  1. 用下一節的 shell 填回任一個 partner id（commit、清快取、送通知）。
+  2. 在同一段 `odoo shell` 輸入的最後（`signal_changes()` 之後）加一行 `print(env['res.users']._cron_apporo_llm_pilot_sync())`：它用自己的交易補齊所有帳號，commit 之後送通知，印出加進去的 partner id。也可以在後台的排程動作（Scheduled Actions，要開發者模式）打開「Apporo: AI Models pilot list follows every account」，按〔Run Manually〕。
+  3. 第 2 步沒做的話，到下一次每日排程（台北 04:00）之前，只有填回的那一個 partner 看得到 AI。
 
 ### 在 odoo shell 改 AI 設定：commit 之後送快取失效通知
 
@@ -270,8 +273,11 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ```bash
 kubectl -n apun exec -i deploy/apun-odoo -c odoo -- odoo shell --config=/etc/odoo/odoo.conf --no-http <<'PY'
+KEY, VALUE = '<key>', '<value>'     # 例：〈回退〉停新轉換是 'woow_paas_platform.llm_orders_enabled', 'False'
+if '<' in KEY + VALUE:
+    raise SystemExit('fill in KEY and VALUE first')   # 沒填就停下，什麼都不寫
 ICP = env['ir.config_parameter'].sudo()
-ICP.set_param('<key>', '<value>')   # 例：〈回退〉停新轉換是 'woow_paas_platform.llm_orders_enabled', 'False'
+ICP.set_param(KEY, VALUE)
 env.cr.commit()                     # 先 commit：其他行程收到通知後重讀，要讀得到新值
 env.registry.clear_cache()
 env.registry.signal_changes()       # base_cache_signaling_default 加一：網頁與排程 pod 的下一個請求或排程就會重讀
@@ -309,12 +315,12 @@ PY
 
 ### 換映像
 
-apun 換官網映像（`ghcr.io/woowtech/apporo-odoo`）的步驟在 Woow_k3s_odoo 的 runbook `docs/apun-image-change/README.md`（Woow_k3s_odoo PR #8 新增，manifest 範本放在同一個目錄；`deploy/woow-k3s/apun.yaml` 的檔頭有摘要）。最要緊的一條：apun 沒有 WOOW 正式站那種會自動跑 `-u` 的初始化容器，**平台或 overlay 的版號變了，一定要先用新映像跑完 `-u` Job，才 `helm upgrade` 換映像**（先停排程 pod、再停網頁 pod，先備份）。漏了 `-u`，新程式會跑在沒升級的資料庫上。只改靜態檔（branding 的 JS／SCSS）時，換映像重啟即可。
+apun 換官網映像（`ghcr.io/woowtech/apporo-odoo`）的步驟在 Woow_k3s_odoo 的 runbook `docs/apun-image-change/README.md`（2026-11-18 由 Woow_k3s_odoo PR #8 加入；manifest 範本與 `module_check.py` 在同一個目錄，`deploy/woow-k3s/apun.yaml` 的檔頭有摘要）。最要緊的一條：apun 沒有 WOOW 正式站那種會自動跑 `-u` 的初始化容器（`upgrade-gate`），所以**映像裡任何一個模組的版號變了（runbook 第 1 步 `module_check.py` 列出的），或 XML 資料／畫面改了但版號沒變，都要先用新映像跑完 `-u` Job，才 `helm upgrade` 換映像**（先備份，先停排程 pod、再停網頁 pod）。vendor 進來的平台與綠界模組、`apporo_paas_overlay`、`apporo_paas_branding`（branding 也有畫面）都算，不只平台與 overlay。漏了 `-u`，新程式會跑在沒升級的資料庫上。只改 JS／SCSS、`module_check.py` 也沒列出任何模組時，才可以跳過 `-u` Job（runbook 第 6 步），其他步驟照做。
 
 ### 簽章金鑰輪替與 Fernet 金鑰
 
-- 照〈簽章金鑰輪替〉與 OPERATIONS〈輪替：簽章金鑰〉〈正式站與 Apporo〉（2026-11-18 WOOW 正式站照那段做過一次）。第 3 步重啟 `apun-odoo-cron` 與 `apun-odoo`，官網會短暫中斷：排在台北 15:00–18:00，先通知。第 4 步算舊 kid 的指令一定要加 `--tail=-1`。
-- `apun-newapi-llm` 的 `fernet-keys` 不輪替，也不在資料庫備份裡：它加密了每個 AI 帳戶在 New API 的密碼與使用者權杖，弄丟了所有 AI 帳戶都要重新開通。兩份離線備份由負責人保管。
+- 照〈簽章金鑰輪替〉與 OPERATIONS〈輪替：簽章金鑰〉：先貼上〈簽章金鑰的函式〉，再照〈正式站與 Apporo〉做（2026-11-18 WOOW 正式站照那段做過一次）。第 3 步重啟 `apun-odoo-cron` 與 `apun-odoo`，官網會短暫中斷：排在台北 15:00–18:00，先通知。第 4 步算舊 kid 的指令一定要加 `--tail=-1`。
+- `apun-newapi-llm` 的 `fernet-keys` 不輪替，也不在資料庫備份裡：它加密了每個 AI 帳戶在 New API 的密碼與使用者權杖，弄丟了所有 AI 帳戶都要重新開通。所以**必須有兩份離線備份**，由負責人保管；備份做好與還原驗證過的紀錄另外記，不寫進這個 repo。
 
 ## CI 與檢查
 

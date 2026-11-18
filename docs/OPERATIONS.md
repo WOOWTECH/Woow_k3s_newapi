@@ -62,7 +62,7 @@ kubectl apply -f deploy/litellm-from-newapi-ingress.yaml   # LiteLLM 那邊放�
 - 關閉所有自助註冊與第三方登入（帳號只由 PaaS 開）
 - 新使用者、邀請、簽到贈額全部為 0／關閉（GHSA-8r8v 計費溢位要先有餘額才打得動）
 - 關閉效能保護（它讀整台節點的 CPU／記憶體／磁碟，節點忙時會讓所有請求 503）
-- 重試 2 次、自動停用／恢復渠道（恢復只在渠道測試裡發生，而定時測試沒開：停用的渠道要手動啟用，見〈已知限制〉）
+- 重試 2 次、自動停用／恢復渠道（恢復只在定時渠道測試或〔測試所有渠道〕裡發生，而定時測試沒開：停用的渠道要手動啟用，見〈已知限制〉）
 - 關閉 JS 任務外掛（外掛讀得到渠道 key）
 - 加價、免費試用分組、限流與顯示單位：見〈PaaS 依賴的設定不變量〉
 
@@ -219,7 +219,8 @@ PaaS「AI 模型」分頁假設 new-api 長這個樣子。依 DESIGN §4.4 I8，
      export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract       # root：user:read、user:write、log:read（不要借代理的 AP/OP）
      export NEWAPI_CONTRACT_SETTINGS_PAT_FILE=~/.config/newapi-stg/pat-settings    # root：option:read、option:write
      export NEWAPI_CONTRACT_ADMIN_CREDS_FILE=~/.config/newapi-stg/root-credentials # url= 必須是 stg
-     # 兩把簽章金鑰只進變數：先在這個 shell 定義〈輪替：簽章金鑰〉的 cur()（不讓 kubectl 格式化 Secret，讀不到就停）
+     # 兩把簽章金鑰只進變數：先在這個 shell 貼上〈簽章金鑰的函式〉那一段（只定義函式，不讀也不改任何東西）。
+     # 不要整段複製〈輪替：簽章金鑰〉：函式後面就是輪替的步驟。cur() 不讓 kubectl 格式化 Secret，讀不到就停。
      WOOW_NEWAPI_PROXY_AUTH_CRON=$(cur paas-stg-system paas-stg-newapi-proxy-client cron) &&
        WOOW_NEWAPI_PROXY_AUTH_WEB=$(cur paas-stg-system paas-stg-newapi-proxy-client web) &&
        export WOOW_NEWAPI_PROXY_AUTH_CRON WOOW_NEWAPI_PROXY_AUTH_WEB
@@ -539,7 +540,7 @@ Job 耗時及鎖等待；retention 期間 `/v1/chat/completions` 正常；新舊
 - `/v1/messages/count_tokens` 回 404。
 - 每個模型都要先設價格（倍率），否則請求被拒。
 - 兌換碼、儲值、邀請返利要先在後台確認「金流合規條款」才能開。
-- **渠道被自動停用後不會自己恢復。** rc.44 遇到上游回 401、錯誤訊息含 7 句內建停用關鍵字之一等情況會停用渠道（`AutomaticDisableChannelEnabled`；正式站、stg、Apporo 都沒有改停用條件），只有渠道測試會把它打開：被自動停用、這次測試成功，而且 `AutomaticEnableChannelEnabled` 開著（`service/channel.go` `ShouldEnableChannel`、`controller/channel-test.go`）。定時測試要 `monitor_setting.auto_test_channel_enabled`，或 master 的 `CHANNEL_TEST_FREQUENCY`／`CHANNEL_TEST_ENABLED`，正式站、stg、Apporo 都沒有（2026-11-18 唯讀核對）。所以修好原因之後，要在後台把那個渠道改回啟用。停用時 rc.44 會通知 root（`NotifyRootUser`，預設是寄信），但三套都沒設 SMTP，信寄不出去：渠道停了要靠用量或客戶回報才會發現。
+- **渠道被自動停用後不會自己恢復。** rc.44 遇到上游回 401、錯誤訊息含 7 句內建停用關鍵字之一等情況會停用渠道（`AutomaticDisableChannelEnabled`；正式站、stg、Apporo 都沒有改停用條件），只有定時渠道測試和後台的〔測試所有渠道〕會把它打開：被自動停用、這次測試成功，而且 `AutomaticEnableChannelEnabled` 開著（`controller/channel-test.go` 的 `testChannelForHealthCheck`、`service/channel.go` 的 `ShouldEnableChannel`）。後台單一渠道的〔測試〕（`TestChannel`）只回報結果，**不會**把它打開。定時測試要 `monitor_setting.auto_test_channel_enabled`，或 master 的 `CHANNEL_TEST_FREQUENCY`／`CHANNEL_TEST_ENABLED`，正式站、stg、Apporo 都沒有（2026-11-18 唯讀核對）。所以修好原因之後，最直接的做法是在後台把那個渠道的狀態改回啟用。〔測試所有渠道〕也會把它打開，但它會對每個沒有被手動停用的渠道各打一次上游；還在啟用的渠道這次測試失敗（含回應超過 `ChannelDisableThreshold`，預設 5 秒）時，反而會被停用。停用時 rc.44 會通知 root（`NotifyRootUser`，預設是寄信），但三套都沒設 SMTP，信寄不出去：渠道停了要靠用量或客戶回報才會發現。
 
 ## 渠道、分組與價格（2026-10-16 實測配置）
 
@@ -608,7 +609,7 @@ $B apply-channels --dry-run
 
 ### Secret（值不進 repo、不進任何檔案或 log）
 
-一律從 stdin 或 0600 暫存檔 `kubectl create`／`replace`，**不要 `kubectl apply`**（會把值複製進 `last-applied-configuration` 註解）。讀 Secret 也**不要讓 kubectl 格式化**：不用 `-o yaml`、`-o jsonpath`、`-o go-template`。template 一出錯，kubectl 會把整個 Secret（含所有值）印到 stderr，後面接 pipe 也擋不住（2026-11-17 事故）。一律 `-o json 2>/dev/null` 交給 python 取一個 key，並檢查格式（〈輪替：簽章金鑰〉的 `cur()`）；值只進變數或 0600 暫存檔。**代理不會察覺 Secret 改了**：env 只在 pod 啟動時讀，改完一定要 `kubectl -n <ns> rollout restart deploy/newapi-proxy`。
+一律從 stdin 或 0600 暫存檔 `kubectl create`／`replace`，**不要 `kubectl apply`**（會把值複製進 `last-applied-configuration` 註解）。在終端機手動讀 Secret 時也**不要讓 kubectl 格式化**：不用 `-o yaml`、`-o jsonpath`、`-o go-template`。template 一出錯，kubectl 會把整個 Secret（含所有值）印到 stderr，後面接 pipe 也擋不住（2026-11-17 事故）。一律 `-o json 2>/dev/null` 交給 python 取一個 key，並檢查格式（〈簽章金鑰的函式〉的 `cur()`）；值只進變數或 0600 暫存檔。repo 裡的工具（`scripts/apporo_sync.py` 的 `read_secret`／`read_annotation`、`scripts/bootstrap_service_account.py` 的 `secret_annotation`）雖然用 `-o jsonpath`，但 kubectl 的 stdout 與 stderr 都收進程式裡，錯誤訊息不帶 kubectl 的輸出，不會印到終端機。**代理不會察覺 Secret 改了**：env 只在 pod 啟動時讀，改完一定要 `kubectl -n <ns> rollout restart deploy/newapi-proxy`。
 
 | Secret | key | 內容 |
 |---|---|---|
@@ -676,79 +677,24 @@ stg 與 prod 的簽章金鑰、AP、OP、Valkey 密碼必須全部不同（NA-05
 
 prod（NA-05）：root 有 2FA，第 1、5 步在瀏覽器做（建 PAT、從 stdin `kubectl replace` Secret、撤舊 PAT），第 2–4 步相同。
 
+**到期前沒有任何提醒**：平台只在管理員按後台的〔Test connection〕時讀一次 `/readyz`，不寄信、不告警（DESIGN §7.3 寫的 14 天前告警沒有實作）。所以三套的到期日都由負責人記在行事曆上，提前（建議 30 天）照上面的步驟輪替。日期以各自 values 的 `proxy.apExpiresAt`／`opExpiresAt`（unix 秒）為準，每次輪替後連同下表一起改；2026-11-18 的這一組：
+
+| 環境 | values | AP／OP 到期 |
+|---|---|---|
+| stg | `deploy/woow-k3s-stg.yaml` | 2027-04-14（三套裡最早） |
+| 正式站 | `deploy/woow-k3s.yaml` | 2027-04-23 |
+| Apporo | `deploy/apporo-k3s.yaml` | 2027-05-17（Apporo 每日同步用的 PAT 也是這天，[APPORO-K3S.md](APPORO-K3S.md)〈AP／OP 到期日〉） |
+
 ### 輪替：簽章金鑰（WEB／CRON）
 
 代理接受清單內任一把、Odoo 只用第一把簽，所以先讓代理認得新的、再讓 Odoo 改用新的、最後拿掉舊的；簽章不會中斷。值只在變數與 0600 暫存檔裡。
 
-下面的指令是 stg 的：stg 兩個 Secret 都只有 `web`／`cron`，可以整份重建。**正式站與 Apporo 不可照抄**：它們的 Odoo 端 Secret 還放著 Fernet 金鑰，整份重建會把它刪掉。改用本節最後〈正式站與 Apporo〉的做法。
+**簽章金鑰的函式（只定義，不讀也不改任何東西）**：下面 stg 的步驟、〈正式站與 Apporo〉，以及〈升版〉第 4 步契約測試的 export 都用這幾個函式。先在同一個 shell 貼上這一段：它只定義函式，不會呼叫 kubectl。讀值與輪替都在之後另外貼的段落裡。
 
-`cur()` 和〈正式站與 Apporo〉那段是同一個：kubectl 只輸出 JSON，python 取一個 key（**不用 `-o jsonpath`**，template 一出錯會把整個 Secret 印出來）；Secret 或 key 不在、空值、不是 `kid:secret[,kid:secret]` 都以 exit 1 停下，訊息裡沒有值。第 1、2 步放在 `( set -euo pipefail … )` 裡、先把四個現用值讀齊：讀不到任何一個就什麼都不改，不會寫出 `web=,<新>` 這種值。
-
-```bash
-k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
-# cur <ns> <secret> <key>：那個 key 的值，只進變數、不印出（同〈正式站與 Apporo〉）
-cur() {
-  kubectl -n "$1" get secret "$2" -o json 2>/dev/null | python3 -c '
-import base64, json, re, sys
-try:
-    value = base64.b64decode(json.load(sys.stdin)["data"][sys.argv[1]], validate=True).decode()
-except Exception:
-    value = ""
-pair = r"[A-Za-z0-9_-]{1,64}:[A-Za-z0-9_-]{32,256}"
-if not re.fullmatch(pair + "(," + pair + ")*", value):
-    sys.exit("cur: " + sys.argv[1] + ": Secret or key missing, empty, or not kid:secret[,...] (value not shown)")
-print(value)' "$3"
-}
-(
-  set -euo pipefail
-  umask 077; f=$(mktemp); trap 'shred -u "$f" 2>/dev/null || rm -f "$f"' EXIT
-  stamp=$(date +%Y%m%d%H%M%S); nw=$(k web-$stamp); nc=$(k cron-$stamp)   # 重跑也不會重複 kid
-  # 先讀齊四個現用值
-  pw=$(cur new-api-stg newapi-proxy-hmac web); pc=$(cur new-api-stg newapi-proxy-hmac cron)
-  ow=$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)
-  oc=$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)
-  # 1. 代理端：現用在前、新的在後
-  printf 'web=%s,%s\ncron=%s,%s\n' "$pw" "$nw" "$pc" "$nc" > "$f"
-  kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
-    | kubectl -n new-api-stg replace -f -
-  kubectl -n new-api-stg rollout restart deploy/newapi-proxy
-  kubectl -n new-api-stg rollout status deploy/newapi-proxy
-  # 2. Odoo 端：新的放第一把（Odoo 用它簽），舊的留在後面
-  printf 'web=%s,%s\ncron=%s,%s\n' "$nw" "$ow" "$nc" "$oc" > "$f"
-  kubectl -n paas-stg-system create secret generic paas-stg-newapi-proxy-client --from-env-file="$f" --dry-run=client -o yaml \
-    | kubectl -n paas-stg-system replace -f -
-)
-```
-
-子 shell 停在半途時和〈正式站與 Apporo〉一樣：只做完第 1 步無害（代理新舊都接受、Odoo 仍用舊的簽），修好原因後整段重跑。
-
-3. 重啟所有讀這份金鑰的 Odoo（env 只在啟動時讀）：prod `kubectl -n paas-system rollout restart deploy/paas-odoo-platform deploy/paas-odoo-platform-cron`（Odoo 端是 `paas-system/paas-odoo-platform-llm` 的 `proxy-auth-web`／`proxy-auth-cron`，不是 stg 的 `web`／`cron`；prod 的第 1、2、5 步用本節最後〈正式站與 Apporo〉的做法）；stg 是每個開了 LLM 的沙盒 Odoo（LLM-01b 的 `WOOW_LLM_SANDBOX` 沙盒）——rollout restart 它的 Odoo deployment，或重建沙盒。
-4. 等舊 kid 不再出現（access log 每行都有 `kid`）：`kubectl -n new-api-stg logs -l app.kubernetes.io/component=proxy --since=10m --tail=-1 --prefix | grep -c '"kid":"<舊 kid>"'` 連續幾分鐘都是 0。**`--tail=-1` 不能省**：用 `-l` 選 pod 時，`--tail` 預設只取每個 pod 最後 10 行，`--since` 也救不回來，算出來的次數會太少，看起來像已經歸零（2026-11-18 實測 Apporo 兩個 proxy pod 24 小時的 log：不加只拿到 20 行，加了是 602 行）。
-5. 代理端拿掉舊的（新的那把就是 Odoo 端清單的第一把），再重啟一次（同一個 shell，上面的 `cur()` 還在）：
-
-   ```bash
-   (
-     set -euo pipefail
-     umask 077; f=$(mktemp); trap 'shred -u "$f" 2>/dev/null || rm -f "$f"' EXIT
-     ow=$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)
-     oc=$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)
-     printf 'web=%s\ncron=%s\n' "$ow" "$oc" > "$f"
-     kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
-       | kubectl -n new-api-stg replace -f -
-     kubectl -n new-api-stg rollout restart deploy/newapi-proxy
-     kubectl -n new-api-stg rollout status deploy/newapi-proxy
-   )
-   ```
-
-   Odoo 端的舊值留著無害（不會拿來簽），下次輪替時自然被擠掉。
-
-**正式站與 Apporo**：Odoo 端的 Secret（正式站 `paas-system/paas-odoo-platform-llm`，Apporo `apun/apun-newapi-llm`）同一份裡還有 `fernet-keys`，兩個 Odoo pod 都讀它、不是 optional。照上面 stg 的 `create … | replace` 只放兩把簽章金鑰，會把 `fernet-keys` 和 label 一起刪掉：Odoo 重啟後起不來（`CreateContainerConfigError`；兩個 Deployment 都是 Recreate，舊 pod 先停），Fernet 金鑰沒有離線備份就救不回來。所以這兩套一律用 `kubectl patch` 只換那兩個 key，其他 key 與 label 不動。
-
-這段和上面 stg 的寫法還有三個不同，都是為了不帶著錯的值往下改：
-
-- `cur()` 只讓 kubectl 輸出 JSON、交給 python 取一個 key，**不用 `-o jsonpath`／`go-template`**：template 一出錯，kubectl 會把整個 Secret（含所有值）印出來（2026-11-17 事故）。Secret 或 key 不在、值是空的、或不是 `kid:secret[,kid:secret]`，`cur()` 都以 exit 1 停下，訊息裡沒有值。
-- `setkeys()` 寫入前再檢查每個值的格式，不對就整個不改；`kubectl patch` 失敗時回傳失敗（不會被後面的刪暫存檔蓋掉）。
-- 第 1、2 步放在 `( set -euo pipefail … )` 裡，而且先把四個現用值讀齊才開始改：任何一步失敗就停在那裡，不會把 `web=,<新>` 這種值寫進正式站，也不會在代理還不認得新金鑰時改 Odoo 端。新產生的金鑰隨子 shell 一起消失。
+- `k <kid>`：產生一把新的 `kid:secret`。
+- `cur <ns> <secret> <key>`：那個 key 的值，只進變數、不印出。kubectl 只輸出 JSON，交給 python 取一個 key，**不用 `-o jsonpath`／`go-template`**：template 一出錯，kubectl 會把整個 Secret（含所有值）印出來（2026-11-17 事故）。Secret 或 key 不在、值是空的、或不是 `kid:secret[,kid:secret]`，都以 exit 1 停下，訊息裡沒有值。
+- `setkeys <ns> <secret> <key>=<value> …`（正式站與 Apporo 用）：`kubectl patch` 只換這幾個 key，其他 key 與 label 不動。寫入前再檢查每個值的格式，不對就整個不改；`kubectl patch` 失敗時回傳失敗（不會被後面的刪暫存檔蓋掉）。
+- `keys <ns> <secret>`：只列出 key 的名稱。
 
 ```bash
 k() { printf '%s:%s' "$1" "$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"; }
@@ -786,6 +732,63 @@ setkeys() {
   return $rc
 }
 keys() { kubectl -n "$1" get secret "$2" -o json 2>/dev/null | python3 -c 'import json, sys; print(*sorted(json.load(sys.stdin).get("data", {})))'; }
+```
+
+下面的指令是 stg 的：stg 兩個 Secret 都只有 `web`／`cron`，可以整份重建。**正式站與 Apporo 不可照抄**：它們的 Odoo 端 Secret 還放著 Fernet 金鑰，整份重建會把它刪掉。改用本節最後〈正式站與 Apporo〉的做法。
+
+第 1、2 步放在 `( set -euo pipefail … )` 裡、先把四個現用值讀齊：讀不到任何一個就什麼都不改，不會寫出 `web=,<新>` 這種值。
+
+```bash
+# 先在這個 shell 貼上〈簽章金鑰的函式〉
+(
+  set -euo pipefail
+  umask 077; f=$(mktemp); trap 'shred -u "$f" 2>/dev/null || rm -f "$f"' EXIT
+  stamp=$(date +%Y%m%d%H%M%S); nw=$(k web-$stamp); nc=$(k cron-$stamp)   # 重跑也不會重複 kid
+  # 先讀齊四個現用值
+  pw=$(cur new-api-stg newapi-proxy-hmac web); pc=$(cur new-api-stg newapi-proxy-hmac cron)
+  ow=$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)
+  oc=$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)
+  # 1. 代理端：現用在前、新的在後
+  printf 'web=%s,%s\ncron=%s,%s\n' "$pw" "$nw" "$pc" "$nc" > "$f"
+  kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
+    | kubectl -n new-api-stg replace -f -
+  kubectl -n new-api-stg rollout restart deploy/newapi-proxy
+  kubectl -n new-api-stg rollout status deploy/newapi-proxy
+  # 2. Odoo 端：新的放第一把（Odoo 用它簽），舊的留在後面
+  printf 'web=%s,%s\ncron=%s,%s\n' "$nw" "$ow" "$nc" "$oc" > "$f"
+  kubectl -n paas-stg-system create secret generic paas-stg-newapi-proxy-client --from-env-file="$f" --dry-run=client -o yaml \
+    | kubectl -n paas-stg-system replace -f -
+)
+```
+
+子 shell 停在半途時和〈正式站與 Apporo〉一樣：只做完第 1 步無害（代理新舊都接受、Odoo 仍用舊的簽），修好原因後整段重跑。
+
+3. 重啟所有讀這份金鑰的 Odoo（env 只在啟動時讀）：prod `kubectl -n paas-system rollout restart deploy/paas-odoo-platform deploy/paas-odoo-platform-cron`（Odoo 端是 `paas-system/paas-odoo-platform-llm` 的 `proxy-auth-web`／`proxy-auth-cron`，不是 stg 的 `web`／`cron`；prod 的第 1、2、5 步用本節最後〈正式站與 Apporo〉的做法）；stg 是每個開了 LLM 的沙盒 Odoo（LLM-01b 的 `WOOW_LLM_SANDBOX` 沙盒）——rollout restart 它的 Odoo deployment，或重建沙盒。
+4. 等舊 kid 不再出現（access log 每行都有 `kid`）：`kubectl -n new-api-stg logs -l app.kubernetes.io/component=proxy --since=10m --tail=-1 --prefix | grep -c '"kid":"<舊 kid>"'` 連續幾分鐘都是 0。**`--tail=-1` 不能省**：用 `-l` 選 pod 時，`--tail` 預設只取每個 pod 最後 10 行，`--since` 也救不回來，算出來的次數會太少，看起來像已經歸零（2026-11-18 實測 Apporo 兩個 proxy pod 24 小時的 log：不加只拿到 20 行，加了是 602 行）。
+5. 代理端拿掉舊的（新的那把就是 Odoo 端清單的第一把），再重啟一次（同一個 shell，〈簽章金鑰的函式〉還在）：
+
+   ```bash
+   (
+     set -euo pipefail
+     umask 077; f=$(mktemp); trap 'shred -u "$f" 2>/dev/null || rm -f "$f"' EXIT
+     ow=$(cur paas-stg-system paas-stg-newapi-proxy-client web | cut -d, -f1)
+     oc=$(cur paas-stg-system paas-stg-newapi-proxy-client cron | cut -d, -f1)
+     printf 'web=%s\ncron=%s\n' "$ow" "$oc" > "$f"
+     kubectl -n new-api-stg create secret generic newapi-proxy-hmac --from-env-file="$f" --dry-run=client -o yaml \
+       | kubectl -n new-api-stg replace -f -
+     kubectl -n new-api-stg rollout restart deploy/newapi-proxy
+     kubectl -n new-api-stg rollout status deploy/newapi-proxy
+   )
+   ```
+
+   Odoo 端的舊值留著無害（不會拿來簽），下次輪替時自然被擠掉。
+
+**正式站與 Apporo**：Odoo 端的 Secret（正式站 `paas-system/paas-odoo-platform-llm`，Apporo `apun/apun-newapi-llm`）同一份裡還有 `fernet-keys`，兩個 Odoo pod 都讀它、不是 optional。照上面 stg 的 `create … | replace` 只放兩把簽章金鑰，會把 `fernet-keys` 和 label 一起刪掉：Odoo 重啟後起不來（`CreateContainerConfigError`；兩個 Deployment 都是 Recreate，舊 pod 先停），Fernet 金鑰沒有離線備份就救不回來。所以這兩套一律用 `kubectl patch` 只換那兩個 key，其他 key 與 label 不動。
+
+這段和上面 stg 的寫法只差在寫入：用 `setkeys()`（`kubectl patch`）只換兩把簽章金鑰，不用 stg 的 `create … | replace`。讀值一樣用 `cur()`；第 1、2 步一樣放在 `( set -euo pipefail … )` 裡，先把四個現用值讀齊才開始改：任何一步失敗就停在那裡，不會把 `web=,<新>` 這種值寫進正式站，也不會在代理還不認得新金鑰時改 Odoo 端。新產生的金鑰隨子 shell 一起消失。
+
+```bash
+# 先在這個 shell 貼上〈簽章金鑰的函式〉
 P=new-api O=paas-system S=paas-odoo-platform-llm        # Apporo: P=new-api-apporo O=apun S=apun-newapi-llm
 (
   set -euo pipefail
@@ -806,7 +809,7 @@ P=new-api O=paas-system S=paas-odoo-platform-llm        # Apporo: P=new-api-appo
 - 子 shell 停在半途時：只做完第 1 步也無害（代理同時接受新舊兩把，Odoo 仍用舊的簽），修好原因後整段重跑即可：會再產生一組新的，kid 帶到秒，不會和上一組重複（代理拒絕重複的 kid，起不來）。
 - 第 3 步：重啟兩個 Odoo。正式站同上；Apporo 是 `kubectl -n apun rollout restart deploy/apun-odoo-cron deploy/apun-odoo`。兩套的 Odoo 都是 Recreate，重啟時網站會短暫中斷：Apporo 是官網，要排在台北 15:00–18:00 並先通知。
 - 第 4 步相同，namespace 換成 `$P`，一樣要加 `--tail=-1`。
-- 第 5 步：代理端只留 Odoo 端的第一把（同一個 shell，上面的函式與 `P`／`O`／`S` 還在）：
+- 第 5 步：代理端只留 Odoo 端的第一把（同一個 shell，〈簽章金鑰的函式〉與 `P`／`O`／`S` 還在）：
 
   ```bash
   (
@@ -818,7 +821,7 @@ P=new-api O=paas-system S=paas-odoo-platform-llm        # Apporo: P=new-api-appo
   )
   ```
 
-- 這段指令（2026-11-18 版）在 `dev-sandbox-*` 用假的 Secret 照抄跑過，只換了 `P`／`O`／`S` 那一行：
+- 這段指令（2026-11-18 版，當時函式寫在這段裡面，和現在的〈簽章金鑰的函式〉逐字相同）在 `dev-sandbox-*` 用假的 Secret 照抄跑過，只換了 `P`／`O`／`S` 那一行：
   - 第 1、2、5 步之後兩邊的金鑰順序都對，`fernet-keys` 與 label 不變，也沒有 `last-applied-configuration`。
   - Odoo 端少了 `proxy-auth-cron`、代理端 `web` 是空值、Odoo 端的 Secret 不在、代理端的 Secret 改不動（`immutable`）：四種都在改任何東西之前就停下。兩個 Secret 的 resourceVersion 不變，proxy 沒有重啟，暫存檔沒有留下，訊息裡也沒有值。
   - 第 1 步做完、第 2 步失敗（Odoo 端改不動）：停在那裡，代理端是舊＋新、Odoo 端沒動。整段重跑之後代理端三把、kid 都不同，Odoo 端換成最新那把在前；第 5 步後代理端只剩那一把。

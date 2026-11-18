@@ -13,8 +13,9 @@
 #    what the selecting policies allow: this one alone would leave a running cron
 #    pod without DNS, DB and mail.
 # 2. The apun switch is done and BOTH apun Odoo pods, web and cron, run with the
-#    four WOOW_LLM_EXTRA_* variables (step 9 of Woow_k3s_odoo
-#    deploy/woow-k3s/planned/apun/cron-split.yaml, after its step 8 checks).
+#    four WOOW_LLM_EXTRA_* variables (step 9 in the header of Woow_k3s_odoo
+#    deploy/woow-k3s/planned/apun/cron-split.yaml as of its PR #4, after its
+#    step 8 checks; PR #8 folded that file into deploy/woow-k3s/apun.yaml).
 #    Those make the platform's MCP URL guard treat new-api-apporo as protected:
 #    no apun pod without them may reach the proxy.
 # On rollback of the apun switch, delete this policy first.
