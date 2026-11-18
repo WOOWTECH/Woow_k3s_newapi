@@ -107,13 +107,14 @@ proxy:
   # Expiry of the Apporo AP / OP (unix seconds from the woowtech.io/ap-expires-at /
   # op-expires-at annotations of Secret new-api-apporo/newapi-proxy-pats; dates are
   # not secret). Empty only while dormant: the activation PR fills both and the
-  # test requires them once enabled, so /readyz reports days left and the PaaS
-  # warns 14 days ahead. Update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
+  # test requires them once enabled, so /readyz reports days left. Nothing warns
+  # before they expire (the PaaS reads them only in its admin Test connection):
+  # the owner tracks the date. Update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
   apExpiresAt: "1810514722"
   opExpiresAt: "1810514722"
   clients:
-    # The apun Odoo web pod (component application, live) and its planned cron pod
-    # (component cron), same name label; not apun-cloudflared or apun-postgres.
+    # The apun Odoo web pod (component application) and its cron pod (component
+    # cron, split out 2026-11-18), same name label; not apun-cloudflared or apun-postgres.
     # Same shape as WOOW prod (paas-odoo server|cron). The apun side's egress
     # allow is deploy/apun-odoo-to-newapi-apporo-egress.yaml.
     - name: apun-odoo
