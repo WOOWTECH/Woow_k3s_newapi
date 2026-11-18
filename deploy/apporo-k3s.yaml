@@ -2,8 +2,8 @@
 # Serves the Apporo AI PaaS (Odoo 18 at www.apporo.ai, namespace apun); runbook
 # docs/APPORO-K3S.md. A 1:1 copy of deploy/woow-k3s.yaml: the only differences are
 # publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and
-# proxy.addQuotaHourlyCapPoints; proxy.enabled stays false until Apporo's
-# activation PR (which also sets proxy.ap/opExpiresAt); proxy.image may lag WOOW
+# proxy.addQuotaHourlyCapPoints; proxy.ap/opExpiresAt are Apporo's own PAT dates
+# (proxy activated 2026-11-18); proxy.image may lag WOOW
 # prod but never lead it; per-instance backup evidence (encryptedBackup
 # capacity/restore verification, ageRecipient) is Apporo's own.
 # What Apporo's AI terms state about the gateway (log retention, backups, the
@@ -80,11 +80,10 @@ cloudflared:
 # Same image, tuning and Secret names as WOOW prod; the Secrets themselves are new
 # values created by hand in new-api-apporo (docs/APPORO-K3S.md 〈Secret〉).
 proxy:
-  # Dormant: no proxy workloads, NetworkPolicies or Valkey ACL until Apporo's own
-  # activation PR (like WOOW NA-05), after its Secrets, service account and PATs
-  # exist. That PR sets enabled: true together with apExpiresAt/opExpiresAt below
-  # (docs/APPORO-K3S.md 〈打開 proxy〉).
-  enabled: false
+  # Activated 2026-11-18 (docs/APPORO-K3S.md 〈打開 proxy〉): Secrets
+  # newapi-proxy-registry, newapi-proxy-hmac and newapi-proxy-pats exist, the
+  # service account apporo-svc and its AP / OP were created before root's 2FA.
+  enabled: true
   replicas: 2
   image:
     # Keep equal to deploy/woow-k3s.yaml. Bump it only after WOOW prod, in its own
@@ -110,8 +109,8 @@ proxy:
   # not secret). Empty only while dormant: the activation PR fills both and the
   # test requires them once enabled, so /readyz reports days left and the PaaS
   # warns 14 days ahead. Update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
-  apExpiresAt: ""
-  opExpiresAt: ""
+  apExpiresAt: "1810514722"
+  opExpiresAt: "1810514722"
   clients:
     # The apun Odoo web pod (component application, live) and its planned cron pod
     # (component cron), same name label; not apun-cloudflared or apun-postgres.
