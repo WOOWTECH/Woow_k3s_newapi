@@ -7,6 +7,21 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 - GitHub `WOOWTECH/Woow_k3s_newapi` 是 Gitea 的**單向公開鏡像**（`.gitea/workflows/mirror-to-github.yml` 推 main＋tag），不要在 GitHub 提交或開 PR
 - 舊版 chart 2.x（`latest`＋NodePort，2026-10-04 已下線）留在歷史裡：tag `legacy-v2.1.0`
 
+## 部署（同一個 chart，各自一份 values）
+
+| 站 | namespace | values | 網址 | 呼叫端（`proxy.clients`） |
+|---|---|---|---|---|
+| WOOW 正式 | `new-api` | `deploy/woow-k3s.yaml` | <https://newapi.woowtech.io> | `paas-system` 平台 Odoo（web／cron） |
+| WOOW staging | `new-api-stg` | `deploy/woow-k3s-stg.yaml` | 未公開（tunnel 只回 404） | dev 沙盒 Odoo、`paas-stg-system` 平台 Odoo |
+| Apporo 正式 | `new-api-apporo` | `deploy/apporo-k3s.yaml` | <https://newapi.apporo.ai> | `apun` 官網 Odoo（web／cron），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md) |
+
+Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與每小時加額度上限；proxy 先休眠，等 Apporo 自己的 Secret 與 PAT 齊了再用啟用 PR 打開（同時填 PAT 到期日）。
+
+- Apporo 的檢查全部在 CI 最後的「Apporo checks」步驟（`scripts/apporo_checks.py`），前面 WOOW 的步驟不跑任何 Apporo 的檢查（Apporo 的測試模組在 WOOW 的單元測試步驟整個 skip）。
+- **只改 WOOW 的 PR 不會因為 Apporo 變紅**：Apporo 沒跟上、共用 chart 讓 Apporo 的檔案 render 不出來、Apporo 落後的 proxy pin 配新 new-api 映像沒有 stg 報告，都只印警告。
+- 動到 Apporo 檔案（路徑含 `apporo`）的 PR 嚴格檢查：Apporo 決定過的值、AI 條款寫給顧客的事（保留 180 天、備份 7 天、Cloudflare、未修改的 New API），以及和 WOOW 正式站一致。
+- 目前沒有東西會自動同步 values（每日同步工具合併後只會告警）：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_checks.py --strict`。細節見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈CI 與檢查〉。
+
 ## 架構
 
 | 元件 | 說明 |
@@ -34,6 +49,8 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 4. port-forward 後 `NEWAPI_ROOT_USER=<管理員帳號> scripts/bootstrap-root.sh http://127.0.0.1:3300`（`/api/setup` 先到先得，一定要在 DNS 之前）
 5. 正式站用 PAT 做唯讀 `get-options`／`verify-settings` 對帳；固定 `CUSTOM`／`32` 兩項顯示值可用 [`display-settings`](docs/NA04-DISPLAY-SETTINGS.md) 預覽，明確加 `--apply` 才修正。`newapi_admin.py` 對正式站的 `apply-settings`、`apply-pricing`、`apply-channels` 與非 GET `call` 均預設拒絕，原始 GET 也只允許四條已確認唯讀路徑。待公告、逐人回執、七天成熟及全寫入者互鎖完成後，再另行設計受信任的正式調價流程。正式站即使尚未開 2FA 也不得使用 `--creds`，見 OPERATIONS〈設定即程式碼〉。
 6. `scripts/cf-tunnel.sh dns`（公開網址生效）
+
+Apporo 那套的安裝順序不同（proxy 先休眠、PAT 建好後另開啟用 PR，root 帳密只存在叢集），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈安裝〉。
 
 ## 授權
 

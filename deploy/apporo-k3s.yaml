@@ -1,0 +1,130 @@
+# Apporo production values for woow-k3s (release newapi, namespace new-api-apporo).
+# Serves the Apporo AI PaaS (Odoo 18 at www.apporo.ai, namespace apun); runbook
+# docs/APPORO-K3S.md. A 1:1 copy of deploy/woow-k3s.yaml: the only differences are
+# publicUrl, newapi.env.DEFAULT_LANGUAGE, proxy.clients and
+# proxy.addQuotaHourlyCapPoints; proxy.enabled stays false until Apporo's
+# activation PR (which also sets proxy.ap/opExpiresAt); proxy.image may lag WOOW
+# prod but never lead it; per-instance backup evidence (encryptedBackup
+# capacity/restore verification, ageRecipient) is Apporo's own.
+# What Apporo's AI terms state about the gateway (log retention, backups, the
+# Cloudflare edge) is written out below even where it equals the chart default,
+# so a new chart default cannot change it silently.
+# All of Apporo's checks run in CI's "Apporo checks" step (scripts/apporo_checks.py;
+# docs/APPORO-K3S.md 〈CI 與檢查〉): strictly for a change to an Apporo file such as
+# this one, warn-only for every other change (owner decision 2026-11-17: a WOOW PR
+# is never failed by Apporo and does not have to change this file). Nothing brings
+# this file up to date automatically yet: follow WOOW prod in a PR of its own
+# (docs/APPORO-K3S.md 〈跟著 WOOW 改〉).
+# Install and upgrade with this file as is (never --set; docs/APPORO-K3S.md 〈安裝〉),
+# after scripts/apporo_checks.py --strict passes:
+#   helm upgrade --install newapi ./chart -n new-api-apporo -f deploy/apporo-k3s.yaml --wait
+publicUrl: https://newapi.apporo.ai
+
+newapi:
+  # No image here: Apporo runs the chart's new-api image, the upstream
+  # docker.io/calciumion/new-api unmodified, as its AI terms state (section 12).
+  # The chart's own files (the Valkey rate-limit script, the rc.44 schema checks)
+  # belong to that version, so Apporo never pins a different one.
+  env:
+    # Customer-visible new-api messages in English (owner decision 2026-11-17);
+    # rc.44 accepts en, zh-CN and zh-TW. Every other env keeps the chart default.
+    DEFAULT_LANGUAGE: en
+
+networkPolicy:
+  upstreams:
+    # WoowTech's own LiteLLM in the PaaS (workspace 37, service 203), shared with
+    # WOOW prod through Apporo-only LiteLLM keys (channel keys, not in values).
+    # Its namespace carries the matching ingress allow
+    # (deploy/litellm-from-newapi-apporo-ingress.yaml).
+    - name: litellm-svc203
+      namespace: paas-ws-32e92be2
+      podLabels:
+        app.kubernetes.io/instance: svc-a8389061
+        app.kubernetes.io/name: litellm
+        app.kubernetes.io/component: app
+      port: 4000
+
+# Apporo's AI terms: "Backups of the AI gateway rotate over 7 days" (same as WOOW
+# prod; a change needs the terms changed first). Owner decision: the daily
+# plaintext pg_dump on an in-cluster Longhorn volume. enabled and storageClassName
+# are the chart defaults, written out like everything the terms rely on.
+backup:
+  enabled: true
+  schedule: "45 3 * * *"
+  keepDays: 7
+  suspend: false
+  storageClassName: longhorn
+
+# Same as WOOW prod: the encrypted track stays off; the daily backup above is active.
+encryptedBackup:
+  enabled: false
+  schedule: "45 */6 * * *"
+  keepDays: 7
+  suspend: true
+  pruneEnabled: false
+
+# Apporo's AI terms: usage records and audit logs are "kept for 180 days" and
+# "cleared by daily jobs". days and schedule are the chart defaults, written out
+# so a new chart default cannot change them silently.
+retention:
+  enabled: true
+  suspend: false
+  days: 180
+  schedule: "30 4 * * *"
+
+# Apporo's AI terms: requests and responses pass through Cloudflare, "our network
+# edge". The chart default, written out for the same reason.
+cloudflared:
+  enabled: true
+
+# Same image, tuning and Secret names as WOOW prod; the Secrets themselves are new
+# values created by hand in new-api-apporo (docs/APPORO-K3S.md 〈Secret〉).
+proxy:
+  # Dormant: no proxy workloads, NetworkPolicies or Valkey ACL until Apporo's own
+  # activation PR (like WOOW NA-05), after its Secrets, service account and PATs
+  # exist. That PR sets enabled: true together with apExpiresAt/opExpiresAt below
+  # (docs/APPORO-K3S.md 〈打開 proxy〉).
+  enabled: false
+  replicas: 2
+  image:
+    # Keep equal to deploy/woow-k3s.yaml. Bump it only after WOOW prod, in its own
+    # PR (owner decision D7). The test accepts only a pin deploy/woow-k3s.yaml has
+    # or had, with a green stg report.
+    tag: 3947d2b08d0813a2fae9f120e8fa67990f86c4cb
+    digest: sha256:0fdf5e12da8c8fec9d4b1650d2a134d6dc58d1ba86b82d54ea62b8b6fb8ce3bd
+  imagePullSecrets:
+    - name: newapi-proxy-registry
+  patsSecret: newapi-proxy-pats
+  hmacSecret: newapi-proxy-hmac
+  usernameRegex: '^wp\d{10}$'
+  tenantIpRange: 198.18.1.0-198.19.255.255
+  # Platform-wide add_quota cap per sliding hour, in points (owner decision
+  # 2026-11-17; WOOW prod keeps the chart default 100000). An Apporo point is
+  # US$1 and its model ratios are WOOW's / 30, so 100000 would allow about
+  # US$93,750 of usage an hour. Every replica gets cap / replicas: 2 replicas x
+  # the 10,000-point largest single conversion = 20000, so that conversion still
+  # passes on either replica. Recompute with replicas or the conversion limit.
+  addQuotaHourlyCapPoints: 20000
+  # Expiry of the Apporo AP / OP (unix seconds from the woowtech.io/ap-expires-at /
+  # op-expires-at annotations of Secret new-api-apporo/newapi-proxy-pats; dates are
+  # not secret). Empty only while dormant: the activation PR fills both and the
+  # test requires them once enabled, so /readyz reports days left and the PaaS
+  # warns 14 days ahead. Update with every rotation (docs/APPORO-K3S.md 〈AP／OP 到期日〉).
+  apExpiresAt: ""
+  opExpiresAt: ""
+  clients:
+    # The apun Odoo web pod (component application, live) and its planned cron pod
+    # (component cron), same name label; not apun-cloudflared or apun-postgres.
+    # Same shape as WOOW prod (paas-odoo server|cron). The apun side's egress
+    # allow is deploy/apun-odoo-to-newapi-apporo-egress.yaml.
+    - name: apun-odoo
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: apun
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: apun
+        matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [application, cron]

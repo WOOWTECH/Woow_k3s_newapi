@@ -137,3 +137,25 @@ jobs:
             base="HEAD~1"
           fi
           python3 tests/contract/gate_check.py --base-ref "$base"
+
+      # Apporo's new-api (deploy/apporo-k3s.yaml, docs/APPORO-K3S.md): all of
+      # its checks are here and none of the steps above runs one (its test
+      # modules skip themselves there). Owner decision 2026-11-17: Apporo
+      # never turns a WOOW PR red. A change that touches no Apporo file (a path
+      # containing "apporo") gets them warn-only: ::warning:: lines and a green
+      # step, also when a chart or image change leaves Apporo's committed or
+      # dormant values behind. A change to an Apporo file gets them strictly,
+      # parity with WOOW prod included. Changed files are taken against the
+      # merge base with the PR base, the base fetched as the contract gate does
+      # it. CI cannot hold a PR to this step (the PR's own workflow runs): the
+      # owner reviews every change to it.
+      - name: Apporo checks (strict only when the change touches Apporo files)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD~1"
+          fi
+          python3 scripts/apporo_checks.py --base-ref "$base"
