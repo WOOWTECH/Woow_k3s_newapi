@@ -15,12 +15,12 @@ WoowTech 統一一台 LLM 閘道，對外網址 <https://newapi.woowtech.io>。
 | WOOW staging | `new-api-stg` | `deploy/woow-k3s-stg.yaml` | 未公開（tunnel 只回 404） | dev 沙盒 Odoo、`paas-stg-system` 平台 Odoo |
 | Apporo 正式 | `new-api-apporo` | `deploy/apporo-k3s.yaml` | <https://newapi.apporo.ai> | `apun` 官網 Odoo（web／cron），見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md) |
 
-Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與每小時加額度上限；proxy 先休眠，等 Apporo 自己的 Secret 與 PAT 齊了再用啟用 PR 打開（同時填 PAT 到期日）。
+Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼叫端與每小時加額度上限；proxy 原本休眠，2026-11-18 由 Apporo 自己的啟用 PR 打開（同時填了 PAT 到期日），同一天官網的 AI 模型上線（官網 Odoo 端的維運見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈Apporo 官網 Odoo 的 AI 維運〉）。
 
 - Apporo 的檢查全部在 CI 最後的「Apporo checks」步驟（`scripts/apporo_checks.py`），前面 WOOW 的步驟不跑任何 Apporo 的檢查（Apporo 的測試模組在 WOOW 的單元測試步驟整個 skip）。
 - **只改 WOOW 的 PR 不會因為 Apporo 變紅**：Apporo 沒跟上、共用 chart 讓 Apporo 的檔案 render 不出來、Apporo 落後的 proxy pin 配新 new-api 映像沒有 stg 報告，都只印警告。
 - 動到 Apporo 檔案（路徑含 `apporo`）的 PR 嚴格檢查：Apporo 決定過的值、AI 條款寫給顧客的事（保留 180 天、備份 7 天、Cloudflare、未修改的 New API），以及和 WOOW 正式站一致。
-- 目前沒有東西會自動同步 values（每日同步工具合併後只會告警）：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_checks.py --strict`。細節見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈CI 與檢查〉。
+- 目前沒有東西會自動同步 values（每日同步工具已合併，但排程還沒裝；裝好後也只會告警）：Apporo 另開 PR 跟上，安裝與每次 `helm upgrade` 前先跑 `scripts/apporo_checks.py --strict`。細節見 [docs/APPORO-K3S.md](docs/APPORO-K3S.md)〈CI 與檢查〉。
 
 ## 架構
 
@@ -31,10 +31,10 @@ Apporo 那套和 WOOW 正式站內容一致，values 只差網址、語言、呼
 | `newapi-postgres` | PostgreSQL 16（Longhorn 20Gi，Retain） |
 | `newapi-valkey` | Valkey 8.1（Redis 相容、BSD），只當快取，有密碼、不落地 |
 | `newapi-cloudflared` | Cloudflare Tunnel connector ×2（遠端管理 tunnel `woow-k3s-new-api`） |
-| `newapi-pg-backup` | 保留原名及 active：每天 03:45（台北）明文 `pg_dump -Fc`、保留設定 14 天、原 PVC；新軌驗證前不得停用 |
+| `newapi-pg-backup` | 保留原名及 active：每天 03:45（台北）明文 `pg_dump -Fc`、保留 7 天（chart 預設 14，三套 values 都設 7）、原 PVC；新軌驗證前不得停用 |
 | `newapi-pg-backup-age` | chart／prod 預設停用；stg 啟用資源但暫停、不清理；獨立 PVC、每六小時 :45 age 加密、七日保留設定，需 pinned image＋公鑰啟用、還原證據才可停舊／開清理（見 OPERATIONS） |
-| `newapi-retention` | chart／prod 預設停用；stg 啟用並暫停，每天 04:30（台北）分批刪 180 天前 logs／audit_logs，待 EXPLAIN 驗收 |
-| `newapi-proxy` | 選用（`proxy.enabled`，預設關；stg 開）×2＋PDB：PaaS Odoo 呼叫 new-api 的唯一通道，驗 HMAC 簽章、白名單路由與 body、注入服務帳號 PAT、XFF 一律覆寫成合成 IP；8080 簽章代理、8081 健康檢查；重放紀錄放在 Valkey 的專屬 ACL 使用者（程式在 `woow_paas_platform` 的 `extra/newapi-proxy/`，image 以 digest 釘住） |
+| `newapi-retention` | chart 預設停用；正式站、stg（2026-10-25 起）與 Apporo 都已啟用，每天 04:30（台北）分批刪 180 天前 logs／audit_logs |
+| `newapi-proxy` | 選用（`proxy.enabled`，chart 預設關；正式站、stg、Apporo 都開）×2＋PDB：PaaS Odoo 呼叫 new-api 的唯一通道，驗 HMAC 簽章、白名單路由與 body、注入服務帳號 PAT、XFF 一律覆寫成合成 IP；8080 簽章代理、8081 健康檢查；重放紀錄放在 Valkey 的專屬 ACL 使用者（程式在 `woow_paas_platform` 的 `extra/newapi-proxy/`，image 以 digest 釘住） |
 | NetworkPolicy | 全部 default-deny；new-api 只收 cloudflared 與同 ns 的 `newapi-proxy`，只出 DB、Valkey、LiteLLM（svc203）與公網 80/443（擋私網）；Valkey 只收 new-api 與 `newapi-proxy`；`newapi-proxy` 只收 `proxy.clients` 列的 Odoo pod |
 
 上游映像釘 tag＋digest，升版前用 `scripts/verify-image.sh` 驗 cosign 簽章。

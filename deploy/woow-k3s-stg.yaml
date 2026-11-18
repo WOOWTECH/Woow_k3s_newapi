@@ -62,7 +62,9 @@ proxy:
   tenantIpRange: 198.18.17.0-198.19.255.255
   # Expiry of the AP / OP now in Secret newapi-proxy-pats (its
   # woowtech.io/ap-expires-at / op-expires-at annotations, unix seconds; dates
-  # are not secret). /readyz reports days left; PaaS alerts at 14 (DESIGN §7.3).
+  # are not secret). /readyz reports days left; the PaaS reads them only in its
+  # admin Test connection and sends no alert (DESIGN §7.3's 14-day alert is not
+  # implemented), so track the expiry date.
   # Update together with every PAT rotation (docs/OPERATIONS.md).
   apExpiresAt: "1807713552"
   opExpiresAt: "1807713552"

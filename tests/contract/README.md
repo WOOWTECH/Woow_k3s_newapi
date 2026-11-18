@@ -58,8 +58,11 @@ export NEWAPI_CONTRACT_TARGET=stg NEWAPI_CONTRACT_KUBECTL=kubectl
 export NEWAPI_CONTRACT_ADMIN_PAT_FILE=~/.config/newapi-stg/pat-contract
 export NEWAPI_CONTRACT_SETTINGS_PAT_FILE=~/.config/newapi-stg/pat-settings
 export NEWAPI_CONTRACT_ADMIN_CREDS_FILE=~/.config/newapi-stg/root-credentials
-export WOOW_NEWAPI_PROXY_AUTH_CRON="$(kubectl -n paas-stg-system get secret paas-stg-newapi-proxy-client -o jsonpath='{.data.cron}' | base64 -d)"
-export WOOW_NEWAPI_PROXY_AUTH_WEB="$(kubectl -n paas-stg-system get secret paas-stg-newapi-proxy-client -o jsonpath='{.data.web}' | base64 -d)"
+# 兩把簽章金鑰只進變數：先在這個 shell 定義 docs/OPERATIONS.md〈輪替：簽章金鑰〉的 cur()
+# （不讓 kubectl 格式化 Secret：-o jsonpath 出錯會把整個 Secret 印出來；讀不到或格式不對就停）
+WOOW_NEWAPI_PROXY_AUTH_CRON=$(cur paas-stg-system paas-stg-newapi-proxy-client cron) &&
+  WOOW_NEWAPI_PROXY_AUTH_WEB=$(cur paas-stg-system paas-stg-newapi-proxy-client web) &&
+  export WOOW_NEWAPI_PROXY_AUTH_CRON WOOW_NEWAPI_PROXY_AUTH_WEB
 export NEWAPI_CONTRACT_PAID_MODEL=<最便宜的付費模型>
 export NEWAPI_CONTRACT_RECORD_DIR=tests/contract/fixtures      # 順便把 live 回應錄成 fixture（去敏後才寫檔）
 ```

@@ -71,7 +71,7 @@
 
 每天比對「WOOW 內容經轉換後」與「Apporo 現況」，每一處差異歸成三類之一。
 
-先定義「**提供中**」：Apporo 任何一個渠道路由這個模型，**不論渠道是否啟用**。渠道被上游錯誤自動停用（`AutomaticDisableChannelEnabled`，例如渠道 1、4 的金鑰月預算用完）或被手動停用時，它的模型仍算提供中：rc.44 會自己重新啟用，顧客之後就用新價格付錢。狀態目錄另外記住過去 `served_history_days`（30）天內提供過的模型。
+先定義「**提供中**」：Apporo 任何一個渠道路由這個模型，**不論渠道是否啟用**。渠道被上游錯誤自動停用（`AutomaticDisableChannelEnabled`：上游回 401，或錯誤訊息含 rc.44 的停用關鍵字，例如渠道 1、4 共用的金鑰在 LiteLLM 被停用或撤銷）或被手動停用時，它的模型仍算提供中：渠道隨時可能再被啟用，顧客之後就用新價格付錢。**rc.44 不會自己重新啟用**：只有渠道測試會把被自動停用、這次測試成功的渠道打開，而兩邊都沒開定時渠道測試（OPERATIONS〈已知限制〉），所以要有人在後台手動啟用。狀態目錄另外記住過去 `served_history_days`（30）天內提供過的模型。
 
 | 類別 | 什麼變更 | 怎麼處理 |
 |---|---|---|
@@ -142,11 +142,11 @@
 | `prices: Apporo runs New API B (WOOW A): N built-in tool price(s) not divided by 30` | Apporo 先升版：它的內建工具價表有 WOOW 的表沒有的 key，這些工具在 Apporo 以內建美元價計費（約規則的 30 倍），同步寫不到（只能寫 WOOW 有的 key）。先升 WOOW，或把 Apporo 退回 WOOW 的映像 |
 | `fixed-audio-price: model …` | 路由中有 rc.44 以固定美元價計音訊輸入的 Gemini 模型名 |
 
-另外：同步 PAT 到期前 14 天是 `action`；Secret 沒有 `woowtech.io/expires-at` 或讀不到是 `info`；狀態目錄沒有提供紀錄（見上）是 `info`。
+另外：同步 PAT 到期前 14 天是 `action`（只有 `daily` 跑時才會發，每日排程裝好之前沒有；Apporo 這把是 2027-05-17 到期）；Secret 沒有 `woowtech.io/expires-at` 或讀不到是 `info`；狀態目錄沒有提供紀錄（見上）是 `info`。
 
 ## 平台定價檢查
 
-Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試點方案 `litellm-three-providers-20261025-v1`）在價目不合時會讓整個 AI 模型頁進維護。工具在寫入前，用資料庫內容推算平台讀到的 `/api/pricing`，跑同一套檢查。推算時**把停用的渠道也當成啟用**（它隨時會被 rc.44 重新啟用）。
+Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試點方案 `litellm-three-providers-20261025-v1`）在價目不合時會讓整個 AI 模型頁進維護。工具在寫入前，用資料庫內容推算平台讀到的 `/api/pricing`，跑同一套檢查。推算時**把停用的渠道也當成啟用**（它隨時可能再被啟用，見〈每日同步的分類〉）。
 
 - 預設用工具內建的移植版（照 18.0.2.0.16 的 `normalize_pricing`）。
 - `--platform-pricing-module <llm_pricing.py>` 改用平台本身的模組（例如 Apporo 映像 vendor 進去的那一份）。
@@ -165,7 +165,7 @@ Apporo 平台（`woow_paas_platform` 的 `services/llm_pricing.py`，付費試�
 | Secret | key | 用途 |
 |---|---|---|
 | `newapi-upstream-keys` | `api`、`paid` | Apporo 專用的兩把 LiteLLM 金鑰：`api` 給渠道 1、4，`paid` 給渠道 3。工具讀進記憶體，只用 sha256 前 16 碼和渠道比對，從不印出 |
-| `newapi-sync-pat` | `token`；annotation `woowtech.io/expires-at`、`woowtech.io/hint`、`woowtech.io/scopes` | 同步用的 root PAT，權限只有 `option:write`、`channel:write`、`channel:sensitive_write`，180 天。到期前 14 天開始告警 |
+| `newapi-sync-pat` | `token`；annotation `woowtech.io/expires-at`、`woowtech.io/hint`、`woowtech.io/scopes` | 同步用的 root PAT，權限只有 `option:write`、`channel:write`、`channel:sensitive_write`，180 天。`daily` 在到期前 14 天開始告警（每日排程裝好之前不會跑，到期日要另外記下來，APPORO-K3S.md〈AP／OP 到期日〉） |
 | `newapi-root-credentials` | `username`、`password`（APPORO-K3S.md 也存 `url`） | 只在 root 還沒綁 2FA 時用（`replay --auth password`、`mint-sync-pat`）。每日同步的身分**讀不到**它 |
 
 建立 Secret 一律用 `kubectl create`（不要 `apply`，值會被複製進 annotation）。
@@ -208,8 +208,22 @@ $S apply                                                  # 用 PAT：0 auto，�
 
 ```bash
 umask 077; d=~/.config/apporo-newapi-sync
-kubectl -n new-api-apporo get secret apporo-newapi-sync-token -o jsonpath='{.data.token}' | base64 -d > "$d/token"
-kubectl -n new-api-apporo get secret apporo-newapi-sync-token -o jsonpath='{.data.ca\.crt}' | base64 -d > "$d/ca.crt"
+# token 與 ca.crt 直接寫成 0600 檔，值不經過終端機。kubectl 只輸出 JSON（不用 -o jsonpath：
+# template 出錯會把整個 Secret 印出來）；Secret 或 key 不在、空值都停下，訊息裡沒有值。
+kubectl -n new-api-apporo get secret apporo-newapi-sync-token -o json 2>/dev/null | python3 -c '
+import base64, json, os, sys
+try:
+    data = json.load(sys.stdin)["data"]
+    values = {name: base64.b64decode(data[name], validate=True) for name in ("token", "ca.crt")}
+except Exception:
+    sys.exit("apporo-newapi-sync-token: Secret or key missing, or not base64 (value not shown)")
+empty = [name for name, value in values.items() if not value]
+if empty:
+    sys.exit("apporo-newapi-sync-token: " + ", ".join(empty) + " empty (value not shown)")
+for name, value in values.items():
+    fd = os.open(os.path.join(sys.argv[1], name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(value)' "$d"
 cat > "$d/kubeconfig" <<EOF
 apiVersion: v1
 kind: Config
@@ -313,7 +327,8 @@ Omnigent runner 閒置會關掉 Claude，但 systemd timer 不受影響。這個
 - 只支援 `SEED_IMAGES` 裡的版本（目前只有 rc.44）。加入新版本之前要重新驗證：價目表的儲存格式（Go JSON）、渠道 API（`PUT /api/channel/` 清欄位的規則、`channelHasSensitiveChanges`）、內建計費公式清單（`RC44_BUILTIN_EXPR_MODELS`）、Gemini 音訊固定價、內建工具價表與違規扣費預設（`tests/apporo_sync/rc44_price_tables.py <原始碼> <版本>`）、`/api/status` 的 `version` 欄位。任何一條改了，就要先改程式再加版本（見〈映像〉）。`NEWAPI_VERSION`（設定檔的 `newapi_version`）只標示設定檔格式依據的版本，不決定支援哪些版本。
 - rc.44 的 `PUT /api/channel/` 無法把欄位清成 null，也無法把一般字串欄位（名稱、模型清單……）清成空字串；這類變更只告警，要在管理介面手動改。
 - 設定列沒有刪除 API：WOOW 刪掉的設定列，Apporo 端只會告警。
-- 渠道 1、4 共用的那把金鑰若被 LiteLLM 停用（月預算用完），渠道會被 New API 自動停用；同步不改渠道狀態，只告警（它的模型仍算提供中，漲價照樣暫停）。
+- 渠道 1、4 共用的那把金鑰若在 LiteLLM 被停用或撤銷（上游回 401），渠道會被 New API 自動停用，而且不會自己恢復；同步不改渠道狀態，只告警（它的模型仍算提供中，漲價照樣暫停）。月預算用完則不會停用渠道：WOOW 的 LiteLLM 這時回 429（設定 `budget_exceeded_status_code: 429`），不在 rc.44 的停用條件裡，渠道 1、4 的模型會一直失敗到預算重置。
+- Apporo 那兩把 LiteLLM 金鑰只開了固定的模型清單。同步會把 WOOW 渠道新增的模型自動寫進 Apporo 的渠道（〈每日同步的分類〉），但不會改金鑰：WOOW 新增或改名模型後，Apporo 會照價列出，客戶呼叫時卻被 LiteLLM 拒絕（403「not available for this API key」：只有那個模型失敗，不在 rc.44 的停用條件裡，渠道不會被停用）。所以 WOOW 每次改模型，都要另外在 LiteLLM 改 Apporo 的兩把金鑰；打開每日同步的 apply 模式之前，要先決定是讓同步遇到新模型時暫停並告警，還是一併更新金鑰。
 - 30 天提供紀錄只在狀態目錄裡；目錄遺失時，之前下架的模型重新上架不會被暫停（見〈每日同步的分類〉）。狀態目錄要和 cluster1 的家目錄一起備份。`served_history_days` 不能小於 30（設定檔與程式都擋）。
 - 計費公式與 Gemini 音訊輸入的固定美元價沒有 ÷30 的轉換（見〈30:1 規則〉）。
 - 工具價「是否影響提供中的模型」是用路由中的模型名比對 key 前綴。rc.44 計價時用的「計費模型名」可能是去掉思考後綴（`-thinking` 等）的名稱；前綴比較短於基本名稱時兩者結果相同，WOOW 現在的 key 都不受影響。
