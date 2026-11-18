@@ -1,0 +1,11 @@
+# Daily at 10:30 Asia/Taipei (template; see apporo-newapi-sync.service).
+[Unit]
+Description=Daily Apporo New API content sync
+
+[Timer]
+OnCalendar=*-*-* 10:30:00 Asia/Taipei
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
