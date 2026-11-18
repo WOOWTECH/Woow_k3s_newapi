@@ -199,7 +199,7 @@ NEWAPI_ROOT_USER=<root 名稱> NEWAPI_PUBLIC_URL=https://newapi.apporo.ai \
 
 ## 打開 proxy
 
-`deploy/apporo-k3s.yaml` 一開始是休眠的（`proxy.enabled: false`），和 WOOW NA-05 一樣：先休眠，等 Secret、身分、到期日都齊了，再用一個審過的 PR 打開。
+`deploy/apporo-k3s.yaml` 一開始是休眠的（`proxy.enabled: false`），和 WOOW NA-05 一樣：先休眠，等 Secret、身分、到期日都齊了，再用一個審過的 PR 打開。2026-11-18 已由啟用 PR #47 打開，`helm test` 通過；這一節留作紀錄。
 
 - 前提：〈安裝〉第 1–8 步做完。`newapi-proxy-registry`、`newapi-proxy-hmac`、`newapi-proxy-pats` 都在，`newapi-secrets` 是 chart 第一次安裝時產生的那一份。
 - 啟用 PR 只改兩件事：`proxy.enabled: true`，以及 `proxy.apExpiresAt`／`opExpiresAt`（〈AP／OP 到期日〉）。測試要求兩個到期日都是 10 位數的 unix 秒；`""` 只在休眠時可以。

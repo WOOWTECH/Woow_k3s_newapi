@@ -539,7 +539,7 @@ Job 耗時及鎖等待；retention 期間 `/v1/chat/completions` 正常；新舊
 - `/v1/messages/count_tokens` 回 404。
 - 每個模型都要先設價格（倍率），否則請求被拒。
 - 兌換碼、儲值、邀請返利要先在後台確認「金流合規條款」才能開。
-- **渠道被自動停用後不會自己恢復。** rc.44 遇到上游回 401、錯誤訊息含 7 句內建停用關鍵字之一等情況會停用渠道（`AutomaticDisableChannelEnabled`；正式站、stg、Apporo 都沒有改停用條件），只有渠道測試會把它打開：被自動停用、這次測試成功，而且 `AutomaticEnableChannelEnabled` 開著（`service/channel.go` `ShouldEnableChannel`、`controller/channel-test.go`）。定時測試要 `monitor_setting.auto_test_channel_enabled` 或 master 的 `CHANNEL_TEST_FREQUENCY`，正式站、stg、Apporo 都沒有（2026-11-18 唯讀核對）。所以修好原因之後，要在後台把那個渠道改回啟用。停用時 rc.44 會通知 root（`NotifyRootUser`，預設是寄信），但三套都沒設 SMTP，信寄不出去：渠道停了要靠用量或客戶回報才會發現。
+- **渠道被自動停用後不會自己恢復。** rc.44 遇到上游回 401、錯誤訊息含 7 句內建停用關鍵字之一等情況會停用渠道（`AutomaticDisableChannelEnabled`；正式站、stg、Apporo 都沒有改停用條件），只有渠道測試會把它打開：被自動停用、這次測試成功，而且 `AutomaticEnableChannelEnabled` 開著（`service/channel.go` `ShouldEnableChannel`、`controller/channel-test.go`）。定時測試要 `monitor_setting.auto_test_channel_enabled`，或 master 的 `CHANNEL_TEST_FREQUENCY`／`CHANNEL_TEST_ENABLED`，正式站、stg、Apporo 都沒有（2026-11-18 唯讀核對）。所以修好原因之後，要在後台把那個渠道改回啟用。停用時 rc.44 會通知 root（`NotifyRootUser`，預設是寄信），但三套都沒設 SMTP，信寄不出去：渠道停了要靠用量或客戶回報才會發現。
 
 ## 渠道、分組與價格（2026-10-16 實測配置）
 
