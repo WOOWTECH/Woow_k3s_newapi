@@ -129,6 +129,15 @@ class Session:
             self.sid = None
 
 
+def display_name(label):
+    """new-api rc.44 rejects a display name over 20 characters (User.DisplayName max=20).
+    WOOW's labels fit the long form; a longer label such as 'apporo' gets the short one."""
+    for name in (f"PaaS service ({label})", f"PaaS svc ({label})", f"svc ({label})"):
+        if len(name) <= 20:
+            return name
+    return f"svc ({label})"[:20]
+
+
 def secret_annotation(namespace, secret, key):
     """One annotation value of the Secret (never printed by this script)."""
     path = "{.metadata.annotations.woowtech\\.io/" + key + "}"
@@ -195,7 +204,7 @@ def main():
             pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(48))
             p = root.proof("admin.user.create", {"role": 10})
             d = root.req("POST", "/api/user/", {
-                "username": a.svc_user, "password": pw, "display_name": f"PaaS service ({a.label})", "role": 10,
+                "username": a.svc_user, "password": pw, "display_name": display_name(a.label), "role": 10,
                 "admin_permissions": {"channel": {"read": False, "operate": False, "write": False}}}, proof=p)
             if not d.get("success"):
                 raise SystemExit(f"create {a.svc_user} failed: {d.get('message')}")
